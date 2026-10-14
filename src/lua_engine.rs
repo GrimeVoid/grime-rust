@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use crate::cancellation::{attach_lua_cancellation_hook, PipelineCanceller};
 use crate::config::GrimeConfig;
-use crate::distrobox::{get_default_box_name, get_distrobox_containers};
 use crate::event_bus::{dispatch_event_to_lua, register_event_bus_api, EventBus};
 use crate::fs_ops::{copy_recursive, delete_safe, get_latest_mtime, is_newer, move_safe};
 use crate::payload::{extract_payload, PipelinePayload};
 use crate::pipeline::PipelineStep;
+
 use crate::process::{capture_command, run_command, run_interactive, run_shell};
 use crate::state_bus::{register_state_bus_api, StateBus};
 
@@ -32,6 +32,100 @@ pub struct GrimeLuaEngine {
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
     canceller: PipelineCanceller,
+}
+
+pub fn lua_value_to_rmpv(val: &mlua::Value) -> Result<rmpv::Value, mlua::Error> {
+    match val {
+        mlua::Value::Nil => Ok(rmpv::Value::Nil),
+        mlua::Value::Boolean(b) => Ok(rmpv::Value::Boolean(*b)),
+        mlua::Value::Integer(i) => Ok(rmpv::Value::Integer((*i).into())),
+        mlua::Value::Number(n) => Ok(rmpv::Value::F64(*n)),
+        mlua::Value::String(s) => {
+            if let Ok(utf8) = s.to_str() {
+                Ok(rmpv::Value::String(rmpv::Utf8String::from(utf8.as_ref())))
+            } else {
+                Ok(rmpv::Value::Binary(s.as_bytes().to_vec()))
+            }
+        }
+        mlua::Value::Table(tbl) => {
+            let len = tbl.raw_len();
+            let mut is_array = len > 0;
+            if is_array {
+                for i in 1..=len {
+                    if tbl.get::<mlua::Value>(i).is_err() {
+                        is_array = false;
+                        break;
+                    }
+                }
+            }
+            if is_array {
+                let mut arr = Vec::with_capacity(len);
+                for i in 1..=len {
+                    let item: mlua::Value = tbl.get(i)?;
+                    arr.push(lua_value_to_rmpv(&item)?);
+                }
+                Ok(rmpv::Value::Array(arr))
+            } else {
+                let mut map = Vec::new();
+                for pair in tbl.pairs::<mlua::Value, mlua::Value>() {
+                    let (k, v) = pair?;
+                    map.push((lua_value_to_rmpv(&k)?, lua_value_to_rmpv(&v)?));
+                }
+                Ok(rmpv::Value::Map(map))
+            }
+        }
+        mlua::Value::UserData(ud) => {
+            if let Ok(p) = ud.borrow::<PipelinePayload>() {
+                Ok(rmpv::Value::Binary(p.as_slice().to_vec()))
+            } else {
+                Ok(rmpv::Value::Nil)
+            }
+        }
+        _ => Ok(rmpv::Value::Nil),
+    }
+}
+
+pub fn rmpv_to_lua_value(lua: &mlua::Lua, val: rmpv::Value) -> Result<mlua::Value, mlua::Error> {
+    match val {
+        rmpv::Value::Nil => Ok(mlua::Value::Nil),
+        rmpv::Value::Boolean(b) => Ok(mlua::Value::Boolean(b)),
+        rmpv::Value::Integer(i) => {
+            if let Some(n) = i.as_i64() {
+                Ok(mlua::Value::Integer(n))
+            } else if let Some(u) = i.as_u64() {
+                Ok(mlua::Value::Integer(u as i64))
+            } else {
+                Ok(mlua::Value::Integer(0))
+            }
+        }
+        rmpv::Value::F32(f) => Ok(mlua::Value::Number(f as f64)),
+        rmpv::Value::F64(f) => Ok(mlua::Value::Number(f)),
+        rmpv::Value::String(s) => {
+            if let Some(utf8) = s.as_str() {
+                Ok(mlua::Value::String(lua.create_string(utf8)?))
+            } else {
+                Ok(mlua::Value::String(lua.create_string(s.into_bytes())?))
+            }
+        }
+        rmpv::Value::Binary(bytes) => Ok(mlua::Value::String(lua.create_string(&bytes)?)),
+        rmpv::Value::Array(arr) => {
+            let tbl = lua.create_table()?;
+            for (idx, item) in arr.into_iter().enumerate() {
+                tbl.set(idx + 1, rmpv_to_lua_value(lua, item)?)?;
+            }
+            Ok(mlua::Value::Table(tbl))
+        }
+        rmpv::Value::Map(map) => {
+            let tbl = lua.create_table()?;
+            for (k, v) in map {
+                let l_k = rmpv_to_lua_value(lua, k)?;
+                let l_v = rmpv_to_lua_value(lua, v)?;
+                tbl.set(l_k, l_v)?;
+            }
+            Ok(mlua::Value::Table(tbl))
+        }
+        rmpv::Value::Ext(_, bytes) => Ok(mlua::Value::String(lua.create_string(&bytes)?)),
+    }
 }
 
 impl GrimeLuaEngine {
@@ -344,35 +438,41 @@ impl GrimeLuaEngine {
         )?;
         grime_tbl.set("config", cfg_tbl)?;
 
-        // grime.distrobox
-        let dbox_tbl = lua.create_table()?;
-        dbox_tbl.set(
-            "list",
-            lua.create_function(|lua, ()| {
-                let list = get_distrobox_containers();
-                let tbl = lua.create_table()?;
-                for (idx, c) in list.into_iter().enumerate() {
-                    let item = lua.create_table()?;
-                    item.set("id", c.id)?;
-                    item.set("name", c.name)?;
-                    item.set("status", c.status)?;
-                    item.set("image", c.image)?;
-                    tbl.set(idx + 1, item)?;
-                }
-                Ok(tbl)
+        // grime.msgpack
+        let msgpack_tbl = lua.create_table()?;
+        msgpack_tbl.set(
+            "encode",
+            lua.create_function(|_lua, val: Value| {
+                let rmpv_val = lua_value_to_rmpv(&val)?;
+                let mut buf = Vec::new();
+                rmpv::encode::write_value(&mut buf, &rmpv_val)
+                    .map_err(|e| mlua::Error::runtime(format!("MsgPack encode error: {}", e)))?;
+                Ok(PipelinePayload::from_vec(buf))
             })?,
         )?;
 
-        let def_box_cfg = cfg.get("distrobox_default", None);
-        dbox_tbl.set(
-            "default_box",
-            lua.create_function(move |_, ()| {
-                let list = get_distrobox_containers();
-                let def = get_default_box_name(&list, if def_box_cfg.is_empty() { None } else { Some(&def_box_cfg) });
-                Ok(def)
+        msgpack_tbl.set(
+            "decode",
+            lua.create_function(|lua, val: Value| {
+                let bytes = match val {
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::UserData(ud) => {
+                        if let Ok(p) = ud.borrow::<PipelinePayload>() {
+                            p.as_slice().to_vec()
+                        } else {
+                            return Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования"));
+                        }
+                    }
+                    _ => return Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования")),
+                };
+
+                let mut cursor = std::io::Cursor::new(bytes);
+                let rmpv_val = rmpv::decode::read_value(&mut cursor)
+                    .map_err(|e| mlua::Error::runtime(format!("MsgPack decode error: {}", e)))?;
+                rmpv_to_lua_value(lua, rmpv_val)
             })?,
         )?;
-        grime_tbl.set("distrobox", dbox_tbl)?;
+        grime_tbl.set("msgpack", msgpack_tbl)?;
 
         // grime.ui
         let ui_tbl = lua.create_table()?;
@@ -764,4 +864,31 @@ mod tests {
         let received: String = lua.load("return _test_received").eval().expect("received");
         assert_eq!(received, "hello event");
     }
+
+    #[test]
+    fn test_lua_msgpack_encode_decode() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            local orig = {
+                name = "grime",
+                version = 2,
+                nested = { active = true, tags = { "fast", "reliable" } }
+            }
+            local encoded = grime.msgpack.encode(orig)
+            local decoded = grime.msgpack.decode(encoded)
+
+            assert(decoded.name == "grime")
+            assert(decoded.version == 2)
+            assert(decoded.nested.active == true)
+            assert(decoded.nested.tags[1] == "fast")
+            assert(decoded.nested.tags[2] == "reliable")
+            return decoded.name
+        "#;
+
+        let name: String = lua.load(script).eval().expect("msgpack eval");
+        assert_eq!(name, "grime");
+    }
 }
+

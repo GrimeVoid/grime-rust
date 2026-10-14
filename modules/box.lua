@@ -10,23 +10,129 @@ local ACTIONS = {
     create = "create", new = "create", init = "create",
     stop = "stop",
     rm = "rm", delete = "rm", remove = "rm", del = "rm",
+    keepalive = "keepalive", idle = "keepalive",
 }
 
+--- Получение списка контейнеров Distrobox без захардкоженного ядра Rust
 local function get_containers()
-    if grime and grime.distrobox then
-        return grime.distrobox.list()
+    if not (grime and grime.process) then
+        return {}
     end
-    return {}
+
+    local res = grime.process.capture({ "distrobox", "list", "--no-color" })
+    if res.code ~= 0 or not res.stdout or res.stdout == "" then
+        return {}
+    end
+
+    local containers = {}
+    local lines = {}
+    for line in res.stdout:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+    end
+
+    for i = 2, #lines do
+        local line = lines[i]:match("^%s*(.-)%s*$")
+        if line ~= "" then
+            local parts = {}
+            for part in line:gmatch("[^|]+") do
+                table.insert(parts, part:match("^%s*(.-)%s*$"))
+            end
+            if #parts >= 3 and parts[1] ~= "ID" then
+                table.insert(containers, {
+                    id = parts[1],
+                    name = parts[2],
+                    status = parts[3],
+                    image = parts[4] or "",
+                })
+            end
+        end
+    end
+    return containers
 end
 
+--- Определение дефолтного контейнера
 local function get_default_box(containers)
-    if grime and grime.distrobox then
-        return grime.distrobox.default_box()
+    if not containers or #containers == 0 then
+        return nil
     end
-    if containers and #containers > 0 then
-        return containers[1].name
+
+    local cfg_def = nil
+    if grime and grime.config then
+        cfg_def = grime.config.get("distrobox_default")
     end
-    return nil
+
+    if cfg_def and cfg_def ~= "" then
+        for _, c in ipairs(containers) do
+            if c.name == cfg_def then
+                return c.name
+            end
+        end
+    end
+
+    for _, c in ipairs(containers) do
+        local st = string.lower(c.status or "")
+        if st:find("up") or st:find("running") then
+            return c.name
+        end
+    end
+
+    return containers[1].name
+end
+
+--- Управление жизненным циклом: запуск контейнера при необходимости и фиксация активности в bus
+local function ensure_box_running(box_name)
+    local containers = get_containers()
+    local is_running = false
+    for _, c in ipairs(containers) do
+        if c.name == box_name then
+            local st = string.lower(c.status or "")
+            if st:find("up") or st:find("running") then
+                is_running = true
+                break
+            end
+        end
+    end
+
+    if not is_running then
+        ctx.log(string.format("Запуск окружения Distrobox/Podman '%s'...", box_name))
+        local res = grime.process.capture({ "podman", "start", box_name })
+        if res.code ~= 0 then
+            grime.process.run({ "distrobox", "enter", box_name, "--", "true" })
+        end
+    end
+
+    -- Фиксация отметки времени последней активности в grime.bus
+    if grime and grime.bus then
+        local now = os.time()
+        grime.bus.set("box." .. box_name .. ".last_active", now)
+        grime.bus.set("box." .. box_name .. ".status", "running")
+        grime.bus.set("box.last_active", now)
+        grime.bus.set("box.current", box_name)
+    end
+end
+
+--- Контроль времени простоя (Idle Keep-Alive) силами модуля
+local function check_idle_keepalive(box_name)
+    if not (grime and grime.bus) then return end
+
+    local last_active = grime.bus.get("box." .. box_name .. ".last_active")
+    if not last_active then return end
+
+    local idle_limit = 300 -- 5 минут по умолчанию
+    if grime.config then
+        local cfg_limit = tonumber(grime.config.get("box_idle_timeout"))
+        if cfg_limit and cfg_limit > 0 then
+            idle_limit = cfg_limit
+        end
+    end
+
+    local now = os.time()
+    local elapsed = now - last_active
+    if elapsed > idle_limit then
+        ctx.log(string.format("Контейнер '%s' простаивает более %d сек (%d сек). Гашение контейнера...", box_name, idle_limit, elapsed))
+        grime.process.run({ "distrobox", "stop", box_name, "-Y" })
+        grime.bus.set("box." .. box_name .. ".status", "stopped")
+    end
 end
 
 local function handle_list(containers, target_box)
@@ -58,9 +164,13 @@ local function handle_list(containers, target_box)
 end
 
 local function handle_enter(box_name, target_dir)
+    ensure_box_running(box_name)
     ctx.log(string.format("Вход в контейнер '%s' (директория: %s)...", box_name, target_dir))
     local cmd = { "distrobox", "enter", box_name }
     local ret = ctx.run_process(cmd, target_dir)
+    if grime and grime.bus then
+        grime.bus.set("box." .. box_name .. ".last_active", os.time())
+    end
     ctx.module_return(target_dir)
     if ret ~= 0 then
         ctx.fail(string.format("Сессия в '%s' завершилась с кодом %d", box_name, ret))
@@ -68,6 +178,7 @@ local function handle_enter(box_name, target_dir)
 end
 
 local function handle_run(box_name, target_dir, command_tokens)
+    ensure_box_running(box_name)
     local cmd_str = "grime project run"
     if command_tokens and #command_tokens > 0 then
         cmd_str = table.concat(command_tokens, " ")
@@ -79,6 +190,9 @@ local function handle_run(box_name, target_dir, command_tokens)
     local cmd = { "distrobox", "enter", box_name, "--", "bash", "-c", inner }
 
     local ret = ctx.run_process(cmd, target_dir)
+    if grime and grime.bus then
+        grime.bus.set("box." .. box_name .. ".last_active", os.time())
+    end
     ctx.module_return(target_dir)
     if ret ~= 0 then
         ctx.fail(string.format("Команда в контейнере '%s' завершилась с кодом %d", box_name, ret))
@@ -86,6 +200,7 @@ local function handle_run(box_name, target_dir, command_tokens)
 end
 
 local function handle_export(box_name, target_dir, tokens)
+    ensure_box_running(box_name)
     if not tokens or #tokens == 0 then
         ctx.log("Использование экспорта из контейнера:")
         ctx.log("  grime box [box_name] export bin <binary_path>")
@@ -106,6 +221,9 @@ local function handle_export(box_name, target_dir, tokens)
     ctx.log(string.format("Экспорт %s '%s' из [%s]...", exp_type, target_item, box_name))
 
     local ret = ctx.run_process(cmd, target_dir)
+    if grime and grime.bus then
+        grime.bus.set("box." .. box_name .. ".last_active", os.time())
+    end
     ctx.module_return(target_dir)
     if ret ~= 0 then
         ctx.fail("Экспорт завершился с кодом " .. tostring(ret))
@@ -134,6 +252,10 @@ local function handle_stop(box_name, target_dir)
     ctx.log("Остановка контейнера '" .. box_name .. "'...")
     local cmd = { "distrobox", "stop", box_name, "-Y" }
     local ret = ctx.run_process(cmd, target_dir)
+    if grime and grime.bus then
+        grime.bus.set("box." .. box_name .. ".status", "stopped")
+        grime.bus.set("box." .. box_name .. ".last_active", 0)
+    end
     ctx.module_return(target_dir)
     if ret ~= 0 then
         ctx.fail("Остановка завершилась с ошибкой " .. tostring(ret))
@@ -144,6 +266,9 @@ local function handle_rm(box_name, target_dir)
     ctx.log("Удаление контейнера '" .. box_name .. "'...")
     local cmd = { "distrobox", "rm", box_name, "-f" }
     local ret = ctx.run_process(cmd, target_dir)
+    if grime and grime.bus then
+        grime.bus.set("box." .. box_name .. ".status", "deleted")
+    end
     ctx.module_return(target_dir)
     if ret ~= 0 then
         ctx.fail("Удаление завершилось с ошибкой " .. tostring(ret))
@@ -209,7 +334,19 @@ function main()
         handle_stop(box_name, target_dir)
     elseif action == "rm" then
         handle_rm(box_name, target_dir)
+    elseif action == "keepalive" then
+        check_idle_keepalive(box_name)
+        ctx.module_return(target_dir)
     else
         ctx.fail("Неизвестное действие: " .. action)
+    end
+end
+
+function cleanup()
+    if grime and grime.bus then
+        local cur_box = grime.bus.get("box.current")
+        if cur_box then
+            check_idle_keepalive(cur_box)
+        end
     end
 end

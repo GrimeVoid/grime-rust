@@ -12,54 +12,10 @@ pub struct ParsedPipeline {
     pub steps: Vec<PipelineStep>,
     pub work_path: Option<PathBuf>,
     pub force: bool,
+    pub detach: bool,
 }
 
 pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
-pub const ENV_MODULES: &[&str] = &["box", "nix"];
-
-pub const BOX_STANDALONE_ACTIONS: &[&str] = &[
-    "list", "ls", "status", "ps", "create", "new", "init", "stop", "rm", "delete", "remove",
-    "del", "export", "exp",
-];
-
-pub const NIX_STANDALONE_ACTIONS: &[&str] = &[
-    "list",
-    "ls",
-    "flake",
-    "f",
-    "gc",
-    "clean",
-    "cleanup",
-    "garbage-collect",
-    "optimise",
-    "optimize",
-    "opt",
-    "dedup",
-    "check",
-    "test",
-    "validate",
-    "init",
-    "create",
-    "new",
-    "make",
-    "add",
-    "append",
-    "in",
-    "rm",
-    "remove",
-    "del",
-    "delete",
-    "install",
-    "i",
-    "profile-install",
-    "get",
-    "uninstall",
-    "un",
-    "remove-profile",
-    "rm-profile",
-    "erase",
-    "help",
-];
 
 pub fn canonical_module_name(name: &str) -> String {
     let lower = name.to_lowercase();
@@ -76,44 +32,22 @@ pub fn is_host_step(name: &str) -> bool {
     HOST_ALIASES.contains(&lower.as_str())
 }
 
-pub fn is_env_wrapper_step(mod_name: &str, mod_args: &[String], has_subsequent_steps: bool) -> bool {
-    let canon = canonical_module_name(mod_name);
-    if !ENV_MODULES.contains(&canon.as_str()) || !has_subsequent_steps {
-        return false;
-    }
-
-    let args_lower: Vec<String> = mod_args.iter().map(|a| a.to_lowercase()).collect();
-
-    if canon == "box" {
-        for a in &args_lower {
-            if BOX_STANDALONE_ACTIONS.contains(&a.as_str()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    if canon == "nix" {
-        for a in &args_lower {
-            if NIX_STANDALONE_ACTIONS.contains(&a.as_str()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    false
-}
-
 pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
     let mut args: Vec<String> = raw_args.to_vec();
 
-    // 1. Извлечение флага --force / -f
+    // 1. Извлечение флагов --force / -f и --detach / -d
     let mut force = false;
     if let Some(pos) = args.iter().position(|a| a == "--force" || a == "-f") {
         force = true;
         args.remove(pos);
     }
+
+    let mut detach = false;
+    if let Some(pos) = args.iter().position(|a| a == "--detach" || a == "-d") {
+        detach = true;
+        args.remove(pos);
+    }
+
 
     let path_flags: HashSet<&str> = ["-p", "-path", "--path"].into_iter().collect();
     let arg_flags: HashSet<&str> = [
@@ -145,6 +79,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             steps: Vec::new(),
             work_path,
             force,
+            detach,
         };
     }
 
@@ -164,6 +99,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
                     steps: Vec::new(),
                     work_path,
                     force,
+                    detach,
                 };
             }
         }
@@ -264,6 +200,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         steps,
         work_path,
         force,
+        detach,
     }
 }
 
@@ -302,6 +239,7 @@ mod tests {
         assert_eq!(res.steps[0].module, "cpp");
         assert_eq!(res.steps[0].args, vec!["create"]);
         assert_eq!(res.force, false);
+        assert_eq!(res.detach, false);
         assert_eq!(res.work_path, None);
     }
 
@@ -321,6 +259,7 @@ mod tests {
         assert_eq!(res.steps[0].args, vec!["MyGame"]);
         assert_eq!(res.steps[1].module, "cmd");
         assert_eq!(res.steps[1].args, vec!["git", "status"]);
+        assert_eq!(res.detach, false);
     }
 
     #[test]
@@ -334,6 +273,7 @@ mod tests {
         ];
         let res = parse_pipeline_args(&args);
         assert_eq!(res.force, true);
+        assert_eq!(res.detach, false);
         assert_eq!(res.work_path, Some(PathBuf::from("/home/user/dev")));
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "project");
@@ -341,18 +281,28 @@ mod tests {
     }
 
     #[test]
-    fn test_env_wrapper_tail() {
-        let step = PipelineStep {
-            module: "box".to_string(),
-            args: vec!["fedora-box".to_string()],
-        };
-        assert!(is_env_wrapper_step(&step.module, &step.args, true));
+    fn test_detach_flag_parsing() {
+        let args = vec![
+            "-d".to_string(),
+            "aider".to_string(),
+            "--message".to_string(),
+            "test".to_string(),
+        ];
+        let res = parse_pipeline_args(&args);
+        assert_eq!(res.detach, true);
+        assert_eq!(res.steps.len(), 1);
+        assert_eq!(res.steps[0].module, "aider");
+        assert_eq!(res.steps[0].args, vec!["--message", "test"]);
 
-        let standalone_step = PipelineStep {
-            module: "box".to_string(),
-            args: vec!["list".to_string()],
-        };
-        assert!(!is_env_wrapper_step(&standalone_step.module, &standalone_step.args, true));
+        let args_long = vec![
+            "--detach".to_string(),
+            "cmd".to_string(),
+            "make".to_string(),
+        ];
+        let res_long = parse_pipeline_args(&args_long);
+        assert_eq!(res_long.detach, true);
+        assert_eq!(res_long.steps.len(), 1);
+        assert_eq!(res_long.steps[0].module, "cmd");
     }
 
     #[test]

@@ -74,9 +74,65 @@ function BaseAdapter:get_target(root)
     return nil
 end
 
+function BaseAdapter:apply_template(root, ctx)
+    local tpl_dir = ctx.templates_root() .. "/" .. self.name
+    if not ctx.exists(tpl_dir) then
+        return false
+    end
+
+    local proj_name = root:match("([^/\\]+)$") or "app"
+    local snake_name = proj_name:lower():gsub("[%s%-]", "_")
+    local kebab_name = proj_name:lower():gsub("[%s_]", "-")
+    local lower_name = proj_name:lower()
+    local upper_name = proj_name:upper()
+
+    -- Рекурсивно копируем файлы из директории шаблона в root
+    ctx.copy(tpl_dir, root)
+    ctx.log(string.format("Шаблон %s развернут из %s", self.name, tpl_dir))
+
+    -- Подстановка переменных во всех текстовых файлах
+    local function substitute_file(filepath)
+        local f = io.open(filepath, "r")
+        if not f then return end
+        local content = f:read("*all")
+        f:close()
+        if not content then return end
+
+        local new_content = content
+        new_content = new_content:gsub("{{PROJECT_NAME}}", proj_name)
+        new_content = new_content:gsub("{{PROJECT_NAME_LOWER}}", lower_name)
+        new_content = new_content:gsub("{{PROJECT_NAME_UPPER}}", upper_name)
+        new_content = new_content:gsub("{{PROJECT_NAME_SNAKE}}", snake_name)
+        new_content = new_content:gsub("{{PROJECT_NAME_KEBAB}}", kebab_name)
+
+        if new_content ~= content then
+            local wf = io.open(filepath, "w")
+            if wf then
+                wf:write(new_content)
+                wf:close()
+            end
+        end
+    end
+
+    local p = io.popen("find \"" .. root .. "\" -type f 2>/dev/null")
+    if p then
+        for file in p:lines() do
+            if not file:find("/%.git/") and not file:find("/build/") and not file:find("/target/") then
+                substitute_file(file)
+            end
+        end
+        p:close()
+    end
+
+    return true
+end
+
 function BaseAdapter:init_project(root, ctx)
     ctx.mkdir_p(root .. "/" .. self.src_dir)
-    self:create_default_files(root, ctx)
+    local template_applied = self:apply_template(root, ctx)
+    if not template_applied then
+        self:create_default_files(root, ctx)
+    end
 end
 
 function BaseAdapter:create_default_files(root, ctx)

@@ -10,12 +10,23 @@ use tokio::sync::RwLock;
 
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::parse_pipeline_args;
+use crate::supervisor::{TaskStatus, TaskSupervisor};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ClientRequest {
-    pub cwd: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
+pub enum ClientMessage {
+    Run {
+        cwd: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        detach: bool,
+    },
+    Ping,
+    TaskStatus {
+        task_id: String,
+    },
+    KillTask {
+        task_id: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -24,6 +35,8 @@ pub struct DaemonResponse {
     pub exit_code: i32,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub detached: bool,
+    pub task_id: Option<String>,
 }
 
 pub fn get_socket_path() -> PathBuf {
@@ -52,7 +65,7 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
 
     let listener = UnixListener::bind(&sock_path)?;
     println!(
-        "{} Демон grimed запущен на сокете: {}",
+        "{} Демон grimed запущен на сокете: {} (Протокол: MessagePack)",
         "[grimed]".green().bold(),
         sock_path.display()
     );
@@ -62,8 +75,10 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
         config_path,
     )?));
 
+    let supervisor = Arc::new(TaskSupervisor::default());
+
     // Настройка Hot-Reload через notify
-    let mod_dir_to_watch = modules_dir.unwrap_or_else(|| PathBuf::from("modules"));
+    let mod_dir_to_watch = modules_dir.clone().unwrap_or_else(|| PathBuf::from("modules"));
     if mod_dir_to_watch.exists() {
         let orch_reload = orchestrator.clone();
         let watch_dir = mod_dir_to_watch.clone();
@@ -112,11 +127,17 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
         });
     }
 
+    let conf_path_buf = config_path.map(|p| p.to_path_buf());
+
     // Обработка входящих соединений
     loop {
         match listener.accept().await {
             Ok((mut socket, _)) => {
                 let orch = orchestrator.clone();
+                let sup = supervisor.clone();
+                let m_dir = modules_dir.clone();
+                let c_path = conf_path_buf.clone();
+
                 tokio::spawn(async move {
                     let mut len_buf = [0u8; 4];
                     if socket.read_exact(&mut len_buf).await.is_err() {
@@ -128,39 +149,118 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                         return;
                     }
 
-                    let req: ClientRequest = match serde_json::from_slice(&payload) {
-                        Ok(r) => r,
+                    // Десериализация MessagePack
+                    let msg: ClientMessage = match rmp_serde::from_slice(&payload) {
+                        Ok(m) => m,
                         Err(e) => {
                             let resp = DaemonResponse {
                                 success: false,
                                 exit_code: 1,
                                 result: None,
-                                error: Some(format!("Ошибка парсинга запроса: {}", e)),
+                                error: Some(format!("Ошибка парсинга MessagePack: {}", e)),
+                                detached: false,
+                                task_id: None,
                             };
-                            let _ = send_response(&mut socket, &resp).await;
+                            let _ = send_msgpack_response(&mut socket, &resp).await;
                             return;
                         }
                     };
 
-                    let parsed = parse_pipeline_args(&req.args);
-                    let orch_lock = orch.read().await;
+                    match msg {
+                        ClientMessage::Run { args, detach, .. } => {
+                            let parsed = parse_pipeline_args(&args);
 
-                    let resp = match orch_lock.run_pipeline(&parsed).await {
-                        Ok(res) => DaemonResponse {
-                            success: true,
-                            exit_code: 0,
-                            result: res,
-                            error: None,
-                        },
-                        Err(err) => DaemonResponse {
-                            success: false,
-                            exit_code: 1,
-                            result: None,
-                            error: Some(err),
-                        },
-                    };
+                            if detach || parsed.detach {
+                                // Запуск открепленной задачи в супервизоре с Heartbeat
+                                let task_id = sup
+                                    .spawn_detached_pipeline(parsed, m_dir, c_path)
+                                    .await;
 
-                    let _ = send_response(&mut socket, &resp).await;
+                                let resp = DaemonResponse {
+                                    success: true,
+                                    exit_code: 0,
+                                    result: Some(format!("Задача успешно откреплена (Task ID: {})", task_id)),
+                                    error: None,
+                                    detached: true,
+                                    task_id: Some(task_id),
+                                };
+                                let _ = send_msgpack_response(&mut socket, &resp).await;
+                            } else {
+                                // Сервисное выполнение через демон
+                                let orch_lock = orch.read().await;
+                                let resp = match orch_lock.run_pipeline(&parsed).await {
+                                    Ok(res) => DaemonResponse {
+                                        success: true,
+                                        exit_code: 0,
+                                        result: res,
+                                        error: None,
+                                        detached: false,
+                                        task_id: None,
+                                    },
+                                    Err(err) => DaemonResponse {
+                                        success: false,
+                                        exit_code: 1,
+                                        result: None,
+                                        error: Some(err),
+                                        detached: false,
+                                        task_id: None,
+                                    },
+                                };
+                                let _ = send_msgpack_response(&mut socket, &resp).await;
+                            }
+                        }
+                        ClientMessage::Ping => {
+                            let resp = DaemonResponse {
+                                success: true,
+                                exit_code: 0,
+                                result: Some("pong".to_string()),
+                                error: None,
+                                detached: false,
+                                task_id: None,
+                            };
+                            let _ = send_msgpack_response(&mut socket, &resp).await;
+                        }
+                        ClientMessage::TaskStatus { task_id } => {
+                            let status = sup.get_task_status(&task_id).await;
+                            let status_str = match status {
+                                Some(TaskStatus::Running) => "running",
+                                Some(TaskStatus::Succeeded) => "succeeded",
+                                Some(TaskStatus::Failed(ref e)) => e.as_str(),
+                                Some(TaskStatus::TerminatedByTimeout) => "terminated_by_timeout",
+                                Some(TaskStatus::Cancelled) => "cancelled",
+                                None => "not_found",
+                            };
+                            let resp = DaemonResponse {
+                                success: status.is_some(),
+                                exit_code: 0,
+                                result: Some(status_str.to_string()),
+                                error: None,
+                                detached: false,
+                                task_id: Some(task_id),
+                            };
+                            let _ = send_msgpack_response(&mut socket, &resp).await;
+                        }
+                        ClientMessage::KillTask { task_id } => {
+                            let killed = sup.kill_task(&task_id).await;
+                            let resp = DaemonResponse {
+                                success: killed,
+                                exit_code: if killed { 0 } else { 1 },
+                                result: if killed {
+                                    Some(format!("Задача '{}' остановлена", task_id))
+                                } else {
+                                    None
+                                },
+                                error: if killed {
+                                    None
+                                } else {
+                                    Some(format!("Задача '{}' не найдена", task_id))
+                                },
+                                detached: false,
+                                task_id: Some(task_id),
+                            };
+                            let _ = send_msgpack_response(&mut socket, &resp).await;
+                        }
+                    }
                 });
             }
             Err(e) => {
@@ -170,8 +270,12 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
     }
 }
 
-async fn send_response(socket: &mut tokio::net::UnixStream, resp: &DaemonResponse) -> Result<(), std::io::Error> {
-    let bytes = serde_json::to_vec(resp)?;
+async fn send_msgpack_response(
+    socket: &mut tokio::net::UnixStream,
+    resp: &DaemonResponse,
+) -> Result<(), std::io::Error> {
+    let bytes = rmp_serde::to_vec_named(resp)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let len = (bytes.len() as u32).to_be_bytes();
     socket.write_all(&len).await?;
     socket.write_all(&bytes).await?;

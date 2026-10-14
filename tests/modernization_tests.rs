@@ -433,3 +433,73 @@ async fn test_no_helper_lua_native_execution() {
     assert_eq!(res.unwrap().unwrap(), "native_ok");
 }
 
+#[tokio::test]
+async fn test_long_pipeline_multistep_chain() {
+    let temp = TestTempDir::new("grime_long_pipeline_chain");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("step1.lua"),
+        r#"
+        function main()
+            grime.ctx.success("alpha")
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("step2.lua"),
+        r#"
+        function main()
+            local inp = grime.ctx.input or grime.ctx.pipeline_input
+            assert(inp == "alpha", "step2 expected alpha, got: " .. tostring(inp))
+            grime.ctx.success(inp .. ":beta")
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("step3.lua"),
+        r#"
+        function main()
+            local inp = grime.ctx.input or grime.ctx.pipeline_input
+            assert(inp == "alpha:beta", "step3 expected alpha:beta, got: " .. tostring(inp))
+            grime.ctx.success(inp .. ":gamma")
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("step4.lua"),
+        r#"
+        function main()
+            local inp = grime.ctx.input or grime.ctx.pipeline_input
+            assert(inp == "alpha:beta:gamma", "step4 expected alpha:beta:gamma, got: " .. tostring(inp))
+            grime.ctx.success(inp .. ":delta")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&[
+        "step1".to_string(),
+        "->".to_string(),
+        "step2".to_string(),
+        "->".to_string(),
+        "step3".to_string(),
+        "->".to_string(),
+        "step4".to_string(),
+    ]);
+
+    assert_eq!(parsed.steps.len(), 4);
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_ok(), "Длинный конвейер завершился ошибкой: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "alpha:beta:gamma:delta");
+}
+
+

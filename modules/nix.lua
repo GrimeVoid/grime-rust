@@ -337,7 +337,8 @@ function main()
         end
     end
 
-    local target_dir = ctx.normalize_path(ctx.target_dir)
+    local raw_target = ctx.input or ctx.pipeline_input or ctx.target_dir
+    local target_dir = ctx.normalize_path(raw_target)
     local cls = classifier.new({
         actions = ACTIONS,
         default_action = "init",
@@ -384,6 +385,9 @@ function main()
         handle_enter(target_dir, parsed.flags.pure)
     elseif action == "run" then
         handle_run(target_dir, command_tokens, parsed.flags.pure)
+        if ctx.has_next_step then
+            ctx.module_return(target_dir)
+        end
     elseif action == "install" then
         handle_install(command_tokens)
     elseif action == "uninstall" then

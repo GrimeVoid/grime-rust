@@ -183,6 +183,11 @@ local function handle_run(box_name, target_dir, command_tokens)
     local cmd_str = "grime project run"
     if command_tokens and #command_tokens > 0 then
         cmd_str = table.concat(command_tokens, " ")
+    elseif ctx.input or ctx.pipeline_input then
+        local inp = ctx.input or ctx.pipeline_input
+        if type(inp) == "string" and #inp > 0 then
+            cmd_str = inp
+        end
     end
 
     ctx.log(string.format("Запуск в [%s]: %s (директория: %s)", box_name, cmd_str, target_dir))

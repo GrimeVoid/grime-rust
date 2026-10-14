@@ -216,7 +216,7 @@ end
 
 --- Выполнение цепочки приложений через разделитель '->' (App Chaining)
 local function run_chain(apps_root, segments)
-    local cur_payload = ctx.pipeline_input or ""
+    local cur_payload = ctx.input or ctx.pipeline_input or ""
     local last_output = cur_payload
 
     for idx, seg in ipairs(segments) do
@@ -527,7 +527,11 @@ function main()
         local rargs = {}
         for i = 2, #filtered do table.insert(rargs, filtered[i]) end
         local code = run_app(name, m, dir, rargs, is_detach)
-        if code ~= 0 then ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code)) end
+        if code ~= 0 then
+            ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code))
+        else
+            ctx.success(dir)
+        end
     end
 end
 

@@ -69,7 +69,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
     .into_iter()
     .collect();
     let mod_flags: HashSet<&str> = ["-mod", "--mod"].into_iter().collect();
-    let separators: HashSet<&str> = ["--", ":"].into_iter().collect();
+    let separators: HashSet<&str> = ["--", ":", "->", "|"].into_iter().collect();
 
     // 2. Извлечение рабочего пути (-p / --path)
     let mut work_path: Option<PathBuf> = None;
@@ -398,5 +398,27 @@ mod tests {
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "project");
         assert_eq!(res.steps[0].args, vec!["build"]);
+    }
+
+    #[test]
+    fn test_long_pipeline_arrow_chain() {
+        let args = vec![
+            "pkg".to_string(), "list".to_string(),
+            "->".to_string(),
+            "cmd".to_string(), "grep".to_string(), "git".to_string(),
+            "->".to_string(),
+            "host".to_string(),
+            "->".to_string(),
+            "aider".to_string(), "-m".to_string(), "review".to_string(),
+        ];
+        let res = parse_pipeline_args(&args);
+        assert_eq!(res.steps.len(), 4);
+        assert_eq!(res.steps[0].module, "pkg");
+        assert_eq!(res.steps[0].args, vec!["list"]);
+        assert_eq!(res.steps[1].module, "cmd");
+        assert_eq!(res.steps[1].args, vec!["grep", "git"]);
+        assert_eq!(res.steps[2].module, "host");
+        assert_eq!(res.steps[3].module, "aider");
+        assert_eq!(res.steps[3].args, vec!["-m", "review"]);
     }
 }

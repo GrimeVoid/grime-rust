@@ -376,7 +376,7 @@ function main()
             return
         end
         ctx.log("Сборка успешно завершена!")
-        if return_path_requested then
+        if ctx.has_next_step or return_path_requested then
             local target = adapter:get_target(project_dir)
             ctx.module_return(target or project_dir)
         end
@@ -397,7 +397,7 @@ function main()
         end
 
         adapter:run(project_dir, extra_args, ctx)
-        if return_path_requested then
+        if ctx.has_next_step or return_path_requested then
             ctx.module_return(project_dir)
         end
     elseif action == "delete" then
@@ -407,7 +407,7 @@ function main()
         end
         ctx.delete(project_dir)
         ctx.log(string.format("Проект (%s) успешно удален: %s", lang, project_dir))
-        if return_path_requested then
+        if ctx.has_next_step or return_path_requested then
             ctx.module_return(project_dir)
         end
     elseif action == "clear" then
@@ -417,7 +417,7 @@ function main()
         ctx.mkdir_p(project_dir)
         adapter:init_project(project_dir, ctx)
         ctx.log(string.format("Проект (%s) сброшен к заводским настройкам: %s", lang, project_dir))
-        if return_path_requested then
+        if ctx.has_next_step or return_path_requested then
             ctx.module_return(project_dir)
         end
     else

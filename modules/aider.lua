@@ -517,8 +517,9 @@ function main()
     end
 
     -- 1. Проверяем входные данные из конвейера
-    if ctx.pipeline_input then
-        local raw = ctx.pipeline_input:match("^%s*(.-)%s*$")
+    local pipe_in = ctx.input or ctx.pipeline_input
+    if pipe_in then
+        local raw = pipe_in:match("^%s*(.-)%s*$")
         if ctx.is_dir(raw) then
             target_dir = raw
         elseif ctx.exists(raw) then

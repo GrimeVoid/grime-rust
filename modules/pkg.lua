@@ -13,13 +13,22 @@ local MANAGERS = {
     pacman = "pacman", dnf = "dnf", apt = "apt", flatpak = "flatpak",
     nix = "nix", distrobox = "distrobox", dbox = "distrobox", box = "distrobox",
     cargo = "cargo", pipx = "pipx",
+    app = "apps", apps = "apps",
 }
+
+local function get_apps_root()
+    local root = (ctx.paths and ctx.paths.apps)
+        or (ctx.get_path and ctx.get_path("apps"))
+        or (ctx.apps_root and ctx.apps_root())
+        or ((os.getenv("HOME") or "") .. "/.config/grime/apps")
+    return ctx.normalize_path(root)
+end
 
 local function handle_list(selected_managers, show_all)
     io.stderr:write("\n📦 Обзор установленных пакетов и менеджеров ПО:\n")
     io.stderr:write(string.rep("─", 65) .. "\n")
 
-    local managers = (#selected_managers > 0) and selected_managers or { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx" }
+    local managers = (#selected_managers > 0) and selected_managers or { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx", "apps" }
 
     for _, mgr in ipairs(managers) do
         local count = 0
@@ -60,10 +69,38 @@ local function handle_list(selected_managers, show_all)
                 end
             end
         elseif mgr == "distrobox" then
-            local containers = grime.distrobox.list()
-            count = #containers
-            for i = 1, math.min(count, 5) do
-                table.insert(preview, containers[i].name)
+            local res = ctx.capture({ "distrobox", "list", "--no-color" })
+            if res.code == 0 and res.stdout then
+                local lines = {}
+                for line in res.stdout:gmatch("[^\r\n]+") do table.insert(lines, line) end
+                for i = 2, #lines do
+                    local line = lines[i]:match("^%s*(.-)%s*$")
+                    if line ~= "" then
+                        local parts = {}
+                        for part in line:gmatch("[^|]+") do
+                            table.insert(parts, part:match("^%s*(.-)%s*$"))
+                        end
+                        if #parts >= 2 and parts[1] ~= "ID" then
+                            count = count + 1
+                            if count <= 5 then table.insert(preview, parts[2]) end
+                        end
+                    end
+                end
+            end
+        elseif mgr == "apps" or mgr == "app" then
+            local apps_root = get_apps_root()
+            if ctx.exists(apps_root) then
+                local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
+                if p then
+                    for l in p:lines() do
+                        local item = l:match("^%s*(.-)%s*$")
+                        if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+                            count = count + 1
+                            if count <= 5 then table.insert(preview, item) end
+                        end
+                    end
+                    p:close()
+                end
             end
         elseif mgr == "nix" then
             local res = ctx.capture({ "nix", "profile", "list" })
@@ -138,15 +175,67 @@ local function handle_install(manager, packages)
     end
 end
 
-local function handle_run(packages, command_tokens)
+local function handle_run(manager, packages, command_tokens)
     if not packages or #packages == 0 then
-        ctx.fail("Укажите имя пакета для запуска через Nix")
+        ctx.fail("Укажите имя пакета или приложения для запуска")
         return
     end
 
-    local pkg = packages[1]
+    local target_name = packages[1]
+    local apps_root = get_apps_root()
+    local app_dir = apps_root .. "/" .. target_name
+    local is_app = (manager == "apps" or manager == "app") or (ctx.exists(app_dir) and ctx.is_dir(app_dir))
+
+    if is_app then
+        if not ctx.exists(app_dir) then
+            ctx.fail(string.format("Приложение '%s' не найдено в %s", target_name, apps_root))
+            return
+        end
+
+        local run_args = {}
+        for i = 2, #packages do
+            table.insert(run_args, packages[i])
+        end
+        for _, ct in ipairs(command_tokens or {}) do
+            table.insert(run_args, ct)
+        end
+
+        -- Запуск приложения через модуль app
+        local ok, app_mod = pcall(require, "app")
+        if ok and type(app_mod) == "table" and app_mod.run_app and app_mod.load_manifest then
+            local m, err = app_mod.load_manifest(app_dir, target_name)
+            if not m then
+                ctx.fail(err or ("Не удалось загрузить манифест приложения: " .. target_name))
+                return
+            end
+            local ret = app_mod.run_app(target_name, m, app_dir, run_args, false)
+            if ret ~= 0 then
+                ctx.fail(string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret))
+            end
+        else
+            local proc = { "grime", "app", target_name }
+            for _, a in ipairs(run_args) do
+                table.insert(proc, a)
+            end
+            local ret = ctx.run_process(proc)
+            if ret ~= 0 then
+                ctx.fail(string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret))
+            end
+        end
+        return
+    end
+
+    -- Стандартный запуск через Nix для обычных пакетов
+    local pkg = target_name
     local cmd = { "nix-shell", "-p", pkg, "--run" }
-    local inner = (#command_tokens > 0) and table.concat(command_tokens, " ") or pkg
+    local inner_tokens = {}
+    for i = 2, #packages do
+        table.insert(inner_tokens, packages[i])
+    end
+    for _, ct in ipairs(command_tokens or {}) do
+        table.insert(inner_tokens, ct)
+    end
+    local inner = (#inner_tokens > 0) and table.concat(inner_tokens, " ") or pkg
     table.insert(cmd, inner)
 
     ctx.log(string.format("Изолированный запуск [%s]: %s...", pkg, inner))
@@ -193,7 +282,8 @@ function main()
         local mgr = managers[1] or "pacman"
         handle_install(mgr, rest_tokens)
     elseif action == "run" then
-        handle_run(rest_tokens, parsed.command_tokens)
+        local mgr = managers[1]
+        handle_run(mgr, rest_tokens, parsed.command_tokens)
     elseif action == "init" then
         require("nix")
     else

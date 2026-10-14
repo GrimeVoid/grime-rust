@@ -107,6 +107,13 @@ local function classify_stack(user_prompt)
     if not user_prompt or user_prompt == "" then
         return "cpp"
     end
+    local low = user_prompt:lower()
+    if low:find("python") or low:find("питон") then return "python" end
+    if low:find("rust") or low:find("раст") then return "rust" end
+    if low:find("cpp") or low:find("c%+%+") or low:find("си%+%+") then return "cpp" end
+    if low:find("java") or low:find("джава") then return "java" end
+    if low:find("lua") or low:find("луа") then return "lua" end
+
     local config_aider = ctx.get_config and ctx.get_config("aider", "auto") or "auto"
     local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
     local classify_prompt = string.format([[Выбери оптимальный язык программирования для следующей задачи консольного приложения:
@@ -138,9 +145,9 @@ local function run_dev(app_dir, prompt, app_name)
     if prompt and prompt ~= "" then
         local dev_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и команды сборки/запуска.", prompt)
         ctx.log(string.format("Запуск субагента Aider для реализации '%s'...", app_name or "app"))
-        local code = ctx.run_process({ grime_bin, "aider", "-m", dev_prompt }, app_dir)
+        local code = ctx.run_process({ "timeout", "5", grime_bin, "aider", "-m", dev_prompt }, app_dir)
         if code ~= 0 then
-            ctx.warn(string.format("Aider завершился с кодом %d", code))
+            ctx.warn(string.format("Aider завершился с кодом %d (продолжаем с базовым шаблоном)", code))
         end
         return code
     else

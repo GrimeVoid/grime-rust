@@ -60,8 +60,54 @@ local function to_cmd_str(cmd)
     return table.concat(q, " ")
 end
 
+local function generate_flake_nix(app_name, pkgs)
+    local pkg_lines = {}
+    for _, p in ipairs(pkgs) do
+        table.insert(pkg_lines, "              " .. p)
+    end
+    return string.format([[{
+  description = "Dev environment for %s";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  };
+
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+    in
+    {
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            buildInputs = with pkgs; [
+%s
+            ];
+          };
+        });
+    };
+}
+]], app_name, table.concat(pkg_lines, "\n"))
+end
+
 local function exec_cmd(m, cmd, dir, env)
-    if m.nix then
+    local app_dir = dir or (ctx.paths and ctx.paths.apps)
+    local has_flake = app_dir and (ctx.is_file(app_dir .. "/flake.nix") or ctx.exists(app_dir .. "/flake.nix"))
+    local has_shell_nix = app_dir and (ctx.is_file(app_dir .. "/shell.nix") or ctx.exists(app_dir .. "/shell.nix"))
+
+    if has_flake then
+        local cmd_str = to_cmd_str(cmd)
+        local proc = { "nix", "develop", "--command", "sh", "-c", cmd_str }
+        return ctx.run_process(proc, dir, env)
+    elseif has_shell_nix then
+        local cmd_str = to_cmd_str(cmd)
+        local proc = { "nix-shell", "shell.nix", "--run", cmd_str }
+        return ctx.run_process(proc, dir, env)
+    elseif m.nix then
         local pkgs = type(m.nix) == "table" and m.nix or {}
         if type(m.nix) == "string" then for p in m.nix:gmatch("%S+") do table.insert(pkgs, p) end end
         local proc = { "nix-shell" }
@@ -124,7 +170,11 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
         local log = app_dir .. "/app.log"
         ctx.log(string.format("Запуск '%s' в фоновом режиме...", app_name))
         local cmd_str = to_cmd_str(cmd_tokens)
-        if m.nix then
+        if ctx.is_file(app_dir .. "/flake.nix") or ctx.exists(app_dir .. "/flake.nix") then
+            cmd_str = string.format("nix develop --command sh -c %q", cmd_str)
+        elseif ctx.is_file(app_dir .. "/shell.nix") or ctx.exists(app_dir .. "/shell.nix") then
+            cmd_str = string.format("nix-shell shell.nix --run %q", cmd_str)
+        elseif m.nix then
             local pkgs = type(m.nix) == "table" and table.concat(m.nix, " ") or tostring(m.nix)
             cmd_str = string.format("nix-shell -p %s --run %q", pkgs, cmd_str)
         elseif m.box and m.box ~= "" then
@@ -164,7 +214,11 @@ local function run_chain(apps_root, segments)
         for i = 2, #seg do table.insert(rargs, seg[i]) end
         local cmd_tokens = resolve_cmd_tokens(m, rargs)
         local cmd_str = to_cmd_str(cmd_tokens)
-        if m.nix then
+        if ctx.is_file(dir .. "/flake.nix") or ctx.exists(dir .. "/flake.nix") then
+            cmd_str = string.format("nix develop --command sh -c %q", cmd_str)
+        elseif ctx.is_file(dir .. "/shell.nix") or ctx.exists(dir .. "/shell.nix") then
+            cmd_str = string.format("nix-shell shell.nix --run %q", cmd_str)
+        elseif m.nix then
             local pkgs = type(m.nix) == "table" and table.concat(m.nix, " ") or tostring(m.nix)
             cmd_str = string.format("nix-shell -p %s --run %q", pkgs, cmd_str)
         elseif m.box and m.box ~= "" then
@@ -233,7 +287,11 @@ local function list_apps(apps_root)
             local st_col = (sc == "built" or sc == "ready") and (ANSI.GREEN .. slabel .. ANSI.RESET)
                 or (sc == "needs_rebuild" and (ANSI.YELLOW .. slabel .. ANSI.RESET) or (ANSI.RED .. slabel .. ANSI.RESET))
             local env_label = "host"
-            if m.nix then
+            if ctx.exists(app_dir .. "/flake.nix") then
+                env_label = ANSI.PURPLE .. "nix:flake" .. ANSI.RESET
+            elseif ctx.exists(app_dir .. "/shell.nix") then
+                env_label = ANSI.PURPLE .. "nix:shell.nix" .. ANSI.RESET
+            elseif m.nix then
                 local pstr = type(m.nix) == "table" and table.concat(m.nix, ", ") or tostring(m.nix)
                 env_label = ANSI.PURPLE .. "nix:[" .. pstr .. "]" .. ANSI.RESET
             elseif m.box and m.box ~= "" then
@@ -293,7 +351,20 @@ local function new_app(apps_root, args)
             f:close()
         end
     end
+
+    local flake_path = app_dir .. "/flake.nix"
+    if not ctx.is_file(flake_path) then
+        local m = load_manifest(app_dir, app_name)
+        local pkgs = (m and m.nix and (type(m.nix) == "table" and m.nix or { m.nix })) or DEFAULT_NIX[lang] or { lang }
+        local f = io.open(flake_path, "w")
+        if f then
+            f:write(generate_flake_nix(app_name, pkgs))
+            f:close()
+        end
+    end
+
     if not ctx.exists(app_dir .. "/.git") then ctx.capture({ "git", "init" }, app_dir) end
+    ctx.capture({ "git", "add", "flake.nix" }, app_dir)
 
     aider.run_dev(app_dir, user_prompt, app_name)
     ctx.log(string.format("✓ Приложение '%s' создано в %s\nДля запуска выполните: grime app %s", app_name, app_dir, app_name))
@@ -346,3 +417,15 @@ function main()
         end
     end
 end
+
+return {
+    main = main,
+    get_apps_root = get_apps_root,
+    load_manifest = load_manifest,
+    check_artifact_status = check_artifact_status,
+    build_app = build_app,
+    run_app = run_app,
+    list_apps = list_apps,
+    rm_app = rm_app,
+    new_app = new_app,
+}

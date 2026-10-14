@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.sock
+.aider*
+/result
+/result-*
+/dist/
+

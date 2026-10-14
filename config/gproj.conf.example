@@ -1,0 +1,6 @@
+# Конфигурация путей Grime (шаблон)
+# Скопируйте этот файл в gproj.conf и укажите ваши локальные пути:
+
+templates=templates
+projects=/path/to/your/projects/directory
+aider=auto

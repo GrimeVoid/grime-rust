@@ -1,0 +1,126 @@
+local BaseAdapter = {}
+BaseAdapter.__index = BaseAdapter
+
+function BaseAdapter.new(opts)
+    opts = opts or {}
+    local self = setmetatable({}, BaseAdapter)
+    self.name = opts.name or ""
+    self.aliases = opts.aliases or {}
+    self.src_dir = opts.src_dir or "src"
+    self.required_binaries = opts.required_binaries or {}
+    self.extensions = opts.extensions or {}
+    self.build_files = opts.build_files or {}
+    self.entry_files = opts.entry_files or {}
+    return self
+end
+
+function BaseAdapter:detect(root)
+    if not (grime and grime.fs and grime.fs.exists(root)) then
+        return false
+    end
+
+    -- 1. Проверка файлов сборки
+    for _, bf in ipairs(self.build_files) do
+        local p = root .. "/" .. bf
+        if grime.fs.exists(p) then
+            return true
+        end
+    end
+
+    -- 2. Проверка точек входа
+    for _, ef in ipairs(self.entry_files) do
+        if grime.fs.exists(root .. "/" .. ef) or grime.fs.exists(root .. "/" .. self.src_dir .. "/" .. ef) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function BaseAdapter:get_nix_packages(root)
+    return self.required_binaries
+end
+
+function BaseAdapter:get_target(root)
+    -- 1. build/<root_name>
+    local root_name = root:match("([^/\\]+)$") or "app"
+    local build_target = root .. "/build/" .. root_name
+    if grime.fs.exists(build_target) then
+        return build_target
+    end
+
+    -- 2. target/debug/<root_name>
+    local cargo_target = root .. "/target/debug/" .. root_name
+    if grime.fs.exists(cargo_target) then
+        return cargo_target
+    end
+
+    -- 3. root/<root_name> или root/main
+    if grime.fs.exists(root .. "/" .. root_name) then
+        return root .. "/" .. root_name
+    end
+    if grime.fs.exists(root .. "/main") then
+        return root .. "/main"
+    end
+
+    -- 4. Точки входа
+    for _, ef in ipairs(self.entry_files) do
+        local p_src = root .. "/" .. self.src_dir .. "/" .. ef
+        if grime.fs.exists(p_src) then return p_src end
+        local p_root = root .. "/" .. ef
+        if grime.fs.exists(p_root) then return p_root end
+    end
+
+    return nil
+end
+
+function BaseAdapter:init_project(root, ctx)
+    ctx.mkdir_p(root .. "/" .. self.src_dir)
+    self:create_default_files(root, ctx)
+end
+
+function BaseAdapter:create_default_files(root, ctx)
+    -- Переопределяется в конкретном адаптере
+end
+
+function BaseAdapter:build(root, ctx)
+    ctx.log("Сборка для языка " .. self.name .. " не требует действий или не переопределена.")
+    return true
+end
+
+function BaseAdapter:get_run_command(root, extra_args)
+    local target = self:get_target(root)
+    if not target then
+        return nil
+    end
+
+    local cmd = { target }
+    if extra_args then
+        for _, a in ipairs(extra_args) do
+            table.insert(cmd, a)
+        end
+    end
+    return cmd
+end
+
+function BaseAdapter:run(root, extra_args, ctx)
+    local cmd = self:get_run_command(root, extra_args)
+    if not cmd then
+        ctx.log("Ошибка: исполняемый файл или точка входа для " .. self.name .. " не найдена в " .. root .. "!")
+        return 1
+    end
+
+    ctx.log("Запуск: " .. table.concat(cmd, " "))
+    return ctx.run_process(cmd, root)
+end
+
+function BaseAdapter:needs_rebuild(root, ctx)
+    local target = self:get_target(root)
+    if not target then
+        return true
+    end
+    local src_path = root .. "/" .. self.src_dir
+    return ctx.needs_rebuild(src_path, target)
+end
+
+return BaseAdapter

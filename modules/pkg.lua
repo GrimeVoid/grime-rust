@@ -7,6 +7,7 @@ local ACTIONS = {
     install = "install", i = "install", ["in"] = "install", add = "install", get = "install",
     run = "run", r = "run", ["try"] = "run",
     init = "init", shell = "init", sh = "init", new = "init",
+    help = "help",
 }
 
 local MANAGERS = {
@@ -25,14 +26,15 @@ local function get_apps_root()
 end
 
 local function handle_list(selected_managers, show_all)
-    io.stderr:write("\n📦 Обзор установленных пакетов и менеджеров ПО:\n")
-    io.stderr:write(string.rep("─", 65) .. "\n")
+    io.stdout:write("\n📦 Обзор установленных пакетов и менеджеров ПО:\n")
+    io.stdout:write(string.rep("─", 75) .. "\n")
 
     local managers = (#selected_managers > 0) and selected_managers or { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx", "apps" }
 
     for _, mgr in ipairs(managers) do
         local count = 0
         local preview = {}
+        local display_label = mgr
 
         if mgr == "pacman" then
             local res = ctx.capture({ "pacman", "-Qe" })
@@ -69,6 +71,7 @@ local function handle_list(selected_managers, show_all)
                 end
             end
         elseif mgr == "distrobox" then
+            local target_box = nil
             local res = ctx.capture({ "distrobox", "list", "--no-color" })
             if res.code == 0 and res.stdout then
                 local lines = {}
@@ -80,12 +83,36 @@ local function handle_list(selected_managers, show_all)
                         for part in line:gmatch("[^|]+") do
                             table.insert(parts, part:match("^%s*(.-)%s*$"))
                         end
-                        if #parts >= 2 and parts[1] ~= "ID" then
-                            count = count + 1
-                            if count <= 5 then table.insert(preview, parts[2]) end
+                        if #parts >= 3 and parts[1] ~= "ID" then
+                            local bname = parts[2]
+                            local bstatus = parts[3]
+                            if not target_box then
+                                target_box = bname
+                            end
+                            if bstatus:match("Up") or bname == "fedora-box" then
+                                target_box = bname
+                                break
+                            end
                         end
                     end
                 end
+            end
+
+            if target_box then
+                display_label = string.format("distrobox (%s)", target_box)
+                local qcmd = 'rpm -qa --qf "%{NAME}\\n" 2>/dev/null || pacman -Qq 2>/dev/null || dpkg-query -f "${Package}\\n" -W 2>/dev/null'
+                local dres = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", qcmd })
+                if dres.code == 0 and dres.stdout and dres.stdout ~= "" then
+                    for line in dres.stdout:gmatch("[^\r\n]+") do
+                        local pkg = line:match("^%s*(.-)%s*$")
+                        if pkg ~= "" then
+                            count = count + 1
+                            if count <= 5 then table.insert(preview, pkg) end
+                        end
+                    end
+                end
+            else
+                display_label = "distrobox"
             end
         elseif mgr == "apps" or mgr == "app" then
             local apps_root = get_apps_root()
@@ -119,9 +146,10 @@ local function handle_list(selected_managers, show_all)
 
         local preview_str = table.concat(preview, ", ")
         if count > 5 then preview_str = preview_str .. "..." end
-        io.stderr:write(string.format("%-14s : %4d пакетов [%s]\n", mgr, count, preview_str))
+        io.stdout:write(string.format("%-24s : %5d пакетов [%s]\n", display_label, count, preview_str))
     end
-    io.stderr:write(string.rep("─", 65) .. "\n\n")
+    io.stdout:write(string.rep("─", 75) .. "\n")
+    io.stdout:write("\27[90mДля подробной справки используйте: grime pkg --help\27[0m\n\n")
 end
 
 local function handle_install(manager, packages)
@@ -245,7 +273,53 @@ local function handle_run(manager, packages, command_tokens)
     end
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime Pkg%s — Унифицированное управление пакетами хоста, контейнеров и окружений
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime pkg [команда] [менеджер] [пакеты...]
+
+%sКОМАНДЫ:%s
+    %slist, ls, show%s        Обзор установленных пакетов во всех или выбранных менеджерах (по умолчанию)
+                         grime pkg list [pacman|nix|distrobox|flatpak|cargo|pipx|apps...]
+    %sinstall, i, add%s       Установка пакетов через выбранный менеджер
+                         grime pkg install pacman <пакеты...>
+                         grime pkg install nix <пакеты...>
+                         grime pkg install distrobox <box> <пакеты...>
+    %srun, r%s                Изолированный запуск приложения или пакета
+                         grime pkg run <пакет_или_приложение> [аргументы...]
+    %shelp, -h, --help%s      Показать эту справку
+
+%sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ:%s
+    pacman, nix, distrobox, flatpak, cargo, pipx, apps
+
+%sПРИМЕРЫ:%s
+    grime pkg                               # Быстрый обзор всех пакетов системы
+    grime pkg list distrobox nix            # Просмотр пакетов в Distrobox и Nix
+    grime pkg install cargo ripgrep         # Установка через cargo
+    grime pkg run htop                      # Изолированный запуск через nix-shell
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
 function main()
+    for _, a in ipairs(ctx.args or {}) do
+        if a == "--help" or a == "-h" or a == "help" then
+            print_help()
+            return
+        end
+    end
+
     local cls = classifier.new({
         actions = ACTIONS,
         default_action = "list",
@@ -254,6 +328,11 @@ function main()
 
     local parsed = cls:parse(ctx.args)
     local action = parsed.action or "list"
+
+    if action == "help" then
+        print_help()
+        return
+    end
 
     local managers = {}
     local rest_tokens = {}
@@ -277,7 +356,9 @@ function main()
 
     if action == "list" then
         handle_list(managers, parsed.flags.all)
-        ctx.module_return(ctx.target_dir)
+        if ctx.has_next_step then
+            ctx.module_return(ctx.target_dir)
+        end
     elseif action == "install" then
         local mgr = managers[1] or "pacman"
         handle_install(mgr, rest_tokens)

@@ -265,7 +265,78 @@ local function handle_check(target_dir)
     end
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime Nix%s — Управление Nix-окружениями разработки и профилями
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime nix [команда] [аргументы/пакеты...]
+
+%sКОМАНДЫ:%s
+    %sinit, create, new%s      Создать shell.nix для проекта (с автоопределением зависимостей)
+                          grime nix init [пакеты...] [--force]
+    %sflake%s                  Создать flake.nix для проекта
+                          grime nix flake [пакеты...] [--force]
+    %senter, shell, sh%s      Войти в изолированный devShell (nix develop / nix-shell)
+                          grime nix enter [--pure]
+    %srun, exec%s             Выполнить команду в Nix-окружении
+                          grime nix run <команда...> [--pure]
+    %sinstall, i%s            Установить пакеты в профиль пользователя Nix
+                          grime nix install <пакеты...>
+    %suninstall%s              Удалить пакеты из профиля пользователя Nix
+                          grime nix uninstall <пакеты...>
+    %sgc, clean%s              Очистить неиспользуемые пути в Nix store (garbage collector)
+                          grime nix gc
+    %soptimise, opt%s          Дедупликация жестких ссылок в Nix store
+                          grime nix optimise
+    %scheck, validate%s        Проверить валидность конфигурации flake.nix или shell.nix
+                          grime nix check
+    %shelp, -h, --help%s       Показать эту справку
+
+%sФЛАГИ:%s
+    %s--force, -f%s           Перезаписать существующий файл shell.nix / flake.nix
+    %s--pure%s                Изолированный запуск без переменных хоста
+
+%sПРИМЕРЫ:%s
+    grime nix init cmake ninja gcc          # Создание shell.nix для C++ проекта
+    grime nix enter                         # Вход в devShell
+    grime nix run -- ninja build            # Сборка внутри devShell
+    grime nix gc                            # Очистка мусора Nix store
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
 function main()
+    local raw_args = ctx.args or {}
+    if #raw_args == 0 then
+        print_help()
+        return
+    end
+
+    for _, a in ipairs(raw_args) do
+        if a == "--help" or a == "-h" or a == "help" then
+            print_help()
+            return
+        end
+    end
+
     local target_dir = ctx.normalize_path(ctx.target_dir)
     local cls = classifier.new({
         actions = ACTIONS,
@@ -280,6 +351,12 @@ function main()
 
     local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "init"
+
+    if action == "help" then
+        print_help()
+        return
+    end
+
     if parsed.flags.flake and action == "init" then
         action = "flake"
     end
@@ -291,10 +368,14 @@ function main()
 
     if action == "init" then
         handle_init(target_dir, command_tokens, parsed.flags.force)
-        ctx.module_return(target_dir)
+        if ctx.has_next_step then
+            ctx.module_return(target_dir)
+        end
     elseif action == "flake" then
         handle_flake(target_dir, command_tokens, parsed.flags.force)
-        ctx.module_return(target_dir)
+        if ctx.has_next_step then
+            ctx.module_return(target_dir)
+        end
     elseif action == "gc" then
         handle_gc()
     elseif action == "optimise" then

@@ -127,7 +127,7 @@ local function classify_stack(user_prompt)
 
 Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
     ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
-    local cres = ctx.capture({ aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
+    local cres = ctx.capture({ "timeout", "5", aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
     if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
         local out_l = cres.stdout:lower()
         for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
@@ -392,13 +392,65 @@ local function parse_aider_tags(output, working_dir)
     return nil
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime Aider%s — AI-ассистент парного программирования и генерации кода
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime aider [путь_или_проект] [файлы...] [промпт...]
+    grime aider [опции] -m "сообщение"
+    grime aider --app <имя> [--lang <язык>] [промпт...]
+    grime <модуль_с_контекстом> : aider [файлы...] [промпт...]
+
+%sРЕЖИМЫ РАБОТЫ:%s
+    %sИнтерактивный%s         grime aider [проект] [файлы...]
+    %sHeadless (-m)%s         grime aider "Добавь тесты для функции парсинга"
+    %sСоздание приложения%s   grime aider --app MyTool --lang rust "CLI утилита"
+    %sКонвейерный%s           grime project MyProj path : aider "Рефакторинг CMake"
+
+%sФЛАГИ:%s
+    %s--app <name>%s          Создание и скаффолдинг приложения Grime App
+    %s-l, --lang <lang>%s     Язык шаблона (cpp, rust, python, java, lua)
+    %s-m, --message <msg>%s   Сообщение / промпт для неинтерактивного режима
+    %s--model <model>%s       Модель LLM (например, claude-3-5-sonnet, gpt-4o)
+    %shelp, -h, --help%s      Показать эту справку
+
+%sИНТЕГРАЦИЯ С ШИНОЙ GRIME:%s
+    Aider автоматически поддерживает теги в выводе:
+    • <grime_bus key="..." type="json">...</grime_bus> — запись в шину состояния
+    • <grime_spawn module="...">...</grime_spawn>       — вызов других модулей
+    • <next_agent_prompt>...</next_agent_prompt>       — передача следующему шагу
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
 function main()
-    local target_dir = nil
-    local incoming_pipeline_text = nil
     local raw_cli_args = {}
-    for _, a in ipairs(ctx.args) do
+    for _, a in ipairs(ctx.args or {}) do
         table.insert(raw_cli_args, a)
     end
+
+    if (#raw_cli_args == 0 and not ctx.pipeline_input) or raw_cli_args[1] == "--help" or raw_cli_args[1] == "-h" or raw_cli_args[1] == "help" then
+        print_help()
+        return
+    end
+
+    local target_dir = nil
+    local incoming_pipeline_text = nil
 
     -- 0. Проверка режима создания приложения (--app <app_name> [--lang <lang>])
     local is_app_mode = false
@@ -720,7 +772,7 @@ function main()
 
             if ctx.has_next_step and extracted and extracted ~= "" then
                 ctx.module_return(extracted)
-            elseif target_dir then
+            elseif ctx.has_next_step and target_dir then
                 ctx.module_return(target_dir)
             else
                 ctx.module_return(nil)
@@ -735,7 +787,7 @@ function main()
                 ctx.log(string.format("✓ Приложение '%s' настроено в %s", app_name, app_dir))
                 ctx.log(string.format("Для запуска выполните: grime app %s", app_name))
             end
-            if target_dir then
+            if ctx.has_next_step and target_dir then
                 ctx.module_return(target_dir)
             else
                 ctx.module_return(nil)

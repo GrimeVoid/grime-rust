@@ -11,6 +11,7 @@ local ACTIONS = {
     stop = "stop",
     rm = "rm", delete = "rm", remove = "rm", del = "rm",
     keepalive = "keepalive", idle = "keepalive",
+    help = "help",
 }
 
 --- Получение списка контейнеров Distrobox без захардкоженного ядра Rust
@@ -143,10 +144,10 @@ local function handle_list(containers, target_box)
     end
 
     local def_name = get_default_box(containers)
-    io.stderr:write("\n📦 Контейнеры Distrobox:\n")
-    io.stderr:write(string.rep("─", 76) .. "\n")
-    io.stderr:write(string.format("%-20s %-22s %-25s %s\n", "ИМЯ (NAME)", "СТАТУС (STATUS)", "ОБРАЗ (IMAGE)", "ДЕФОЛТ"))
-    io.stderr:write(string.rep("─", 76) .. "\n")
+    io.stdout:write("\n📦 Контейнеры Distrobox:\n")
+    io.stdout:write(string.rep("─", 76) .. "\n")
+    io.stdout:write(string.format("%-20s %-22s %-25s %s\n", "ИМЯ (NAME)", "СТАТУС (STATUS)", "ОБРАЗ (IMAGE)", "ДЕФОЛТ"))
+    io.stdout:write(string.rep("─", 76) .. "\n")
 
     for _, c in ipairs(containers) do
         local name = c.name or ""
@@ -158,9 +159,10 @@ local function handle_list(containers, target_box)
             image = "..." .. string.sub(image, -21)
         end
 
-        io.stderr:write(string.format("%-20s %-22s %-25s %s\n", name, status, image, is_def))
+        io.stdout:write(string.format("%-20s %-22s %-25s %s\n", name, status, image, is_def))
     end
-    io.stderr:write(string.rep("─", 76) .. "\n\n")
+    io.stdout:write(string.rep("─", 76) .. "\n")
+    io.stdout:write("\27[90mДля подробной справки используйте: grime box --help\27[0m\n\n")
 end
 
 local function handle_enter(box_name, target_dir)
@@ -275,7 +277,60 @@ local function handle_rm(box_name, target_dir)
     end
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime Box%s — Управление контейнерами Distrobox и запуск задач
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime box [команда] [имя_контейнера] [-- аргументы_или_команда...]
+
+%sКОМАНДЫ:%s
+    %slist, ls, status%s      Список доступных контейнеров Distrobox (по умолчанию)
+                         grime box list
+    %senter, shell, sh%s      Интерактивный вход в контейнер
+                         grime box enter [контейнер]
+    %srun, exec%s             Выполнение команды внутри контейнера
+                         grime box run <контейнер> -- <команда...>
+                         grime box [контейнер] <команда...>
+    %screate, new%s           Создать новый контейнер Distrobox
+                         grime box create <имя> [--image <образ>]
+    %sstop%s                  Остановить работающий контейнер
+                         grime box stop <имя>
+    %srm, delete%s            Удалить контейнер Distrobox
+                         grime box rm <имя>
+    %sexport%s                Экспорт бинарника или desktop-файла из контейнера на хост
+                         grime box export <имя> --app <бинарник>
+    %shelp, -h, --help%s      Показать эту справку
+
+%sПРИМЕРЫ:%s
+    grime box                               # Обзор статуса всех контейнеров
+    grime box enter fedora-box              # Вход в контейнер
+    grime box run fedora-box gcc --version  # Выполнение команды в контейнере
+    grime box create mybox                  # Создание нового контейнера
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
 function main()
+    for _, a in ipairs(ctx.args or {}) do
+        if a == "--help" or a == "-h" or a == "help" then
+            print_help()
+            return
+        end
+    end
+
     local target_dir = ctx.target_dir
     local containers = get_containers()
 
@@ -292,6 +347,12 @@ function main()
 
     local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "list"
+
+    if action == "help" then
+        print_help()
+        return
+    end
+
     local specified_box = parsed.categories.box
     local command_tokens = parsed.args
     for _, tok in ipairs(parsed.command_tokens) do
@@ -300,7 +361,9 @@ function main()
 
     if action == "list" then
         handle_list(containers, specified_box)
-        ctx.module_return(target_dir)
+        if ctx.has_next_step then
+            ctx.module_return(target_dir)
+        end
         return
     end
 

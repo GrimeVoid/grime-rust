@@ -370,51 +370,135 @@ local function new_app(apps_root, args)
     ctx.log(string.format("✓ Приложение '%s' создано в %s\nДля запуска выполните: grime app %s", app_name, app_dir, app_name))
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime App%s — Управление и запуск приложений и изолированных инструментов
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime app [команда] [аргументы...]
+    grime app <имя_приложения> [аргументы...]
+
+%sКОМАНДЫ:%s
+    %slist, ls%s              Показать список установленных приложений (по умолчанию)
+    %snew, create, init%s     Создать новое приложение
+                         grime app new <имя> [--lang <язык>] [описание...]
+    %srun, start, exec%s      Запустить приложение (с автосборкой)
+                         grime app run <имя> [аргументы...]
+                         grime app <имя> [аргументы...]
+    %sbuild%s                 Собрать приложение
+                         grime app build <имя>
+    %srm, remove, delete%s    Удалить приложение
+                         grime app rm <имя>
+    %shelp, -h, --help%s      Показать эту справку
+
+%sФЛАГИ:%s
+    %s-d, --detach%s          Запуск приложения в фоновом режиме (демонизация, лог в app.log)
+    %s-l, --lang%s            Язык/стек проекта при создании (cpp, rust, python, java, lua)
+
+%sЦЕПОЧКИ ПРИЛОЖЕНИЙ (App Chaining):%s
+    grime app App1 -> App2 -> App3
+    grime app run Producer -> Consumer
+
+%sПРИМЕРЫ:%s
+    grime app new MyTool --lang rust "CLI утилита для обработки JSON"
+    grime app run MyTool input.json
+    grime app MyTool --verbose
+    grime app run MyServer --detach
+]],
+    ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.YELLOW, ANSI.RESET,
+    ANSI.YELLOW, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET
+    ))
+end
+
 function main()
     local apps_root = get_apps_root()
     local is_detach, filtered = false, {}
+    local wants_help = false
     for _, a in ipairs(ctx.args or {}) do
-        if a == "--detach" or a == "-d" then is_detach = true else table.insert(filtered, a) end
+        if a == "--detach" or a == "-d" then
+            is_detach = true
+        elseif a == "--help" or a == "-h" or a == "help" then
+            wants_help = true
+        else
+            table.insert(filtered, a)
+        end
+    end
+
+    if wants_help then
+        print_help()
+        return
     end
 
     local subcmd = filtered[1]
-    if not subcmd or subcmd == "list" or subcmd == "ls" then list_apps(apps_root)
-    elseif subcmd == "new" or subcmd == "create" or subcmd == "init" then new_app(apps_root, filtered)
+    if not subcmd or subcmd == "list" or subcmd == "ls" then
+        list_apps(apps_root)
+        print("\27[90mДля подробной справки используйте: grime app --help\27[0m\n")
+        return
+    elseif subcmd == "new" or subcmd == "create" or subcmd == "init" then
+        new_app(apps_root, filtered)
+        return
     elseif subcmd == "build" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app build <app_name>"); return end
         local dir = apps_root .. "/" .. filtered[2]
         local m, err = load_manifest(dir, filtered[2])
         if not m then ctx.fail(err or "Манифест не найден"); return end
         build_app(filtered[2], m, dir)
+        return
     elseif subcmd == "rm" or subcmd == "remove" or subcmd == "delete" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app rm <app_name>"); return end
         rm_app(apps_root, filtered[2])
-    else
-        -- Проверка на цепочку приложений (App Chaining через '->')
-        local segments = {}
-        local cur_seg = {}
-        for _, tok in ipairs(filtered) do
-            if tok == "->" then
-                if #cur_seg > 0 then table.insert(segments, cur_seg); cur_seg = {} end
-            else
-                table.insert(cur_seg, tok)
-            end
-        end
-        if #cur_seg > 0 then table.insert(segments, cur_seg) end
+        return
+    end
 
-        if #segments > 1 then
-            local code = run_chain(apps_root, segments)
-            if code ~= 0 then ctx.fail(string.format("Цепочка приложений завершилась с ошибкой (код %d)", code)) end
-        else
-            local name, dir = subcmd, apps_root .. "/" .. subcmd
-            if not ctx.exists(dir) then ctx.fail(string.format("Приложение '%s' не найдено в %s.\nИспользуйте 'grime app new %s' для создания.", name, apps_root, name)); return end
-            local m, err = load_manifest(dir, name)
-            if not m then ctx.fail(err); return end
-            local rargs = {}
-            for i = 2, #filtered do table.insert(rargs, filtered[i]) end
-            local code = run_app(name, m, dir, rargs, is_detach)
-            if code ~= 0 then ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code)) end
+    -- Обработка подкоманд запуска (run, start, exec)
+    if subcmd == "run" or subcmd == "start" or subcmd == "exec" then
+        table.remove(filtered, 1)
+        if #filtered == 0 then
+            ctx.fail(string.format("Укажите имя приложения: grime app %s <app_name> [аргументы...]", subcmd))
+            return
         end
+    end
+
+    -- Проверка на цепочку приложений (App Chaining через '->')
+    local segments = {}
+    local cur_seg = {}
+    for _, tok in ipairs(filtered) do
+        if tok == "->" then
+            if #cur_seg > 0 then table.insert(segments, cur_seg); cur_seg = {} end
+        else
+            table.insert(cur_seg, tok)
+        end
+    end
+    if #cur_seg > 0 then table.insert(segments, cur_seg) end
+
+    if #segments > 1 then
+        local code = run_chain(apps_root, segments)
+        if code ~= 0 then ctx.fail(string.format("Цепочка приложений завершилась с ошибкой (код %d)", code)) end
+    else
+        local name = filtered[1]
+        local dir = apps_root .. "/" .. name
+        if not ctx.exists(dir) then
+            ctx.fail(string.format("Приложение '%s' не найдено в %s.\nИспользуйте 'grime app new %s' для создания.", name, apps_root, name))
+            return
+        end
+        local m, err = load_manifest(dir, name)
+        if not m then ctx.fail(err); return end
+        local rargs = {}
+        for i = 2, #filtered do table.insert(rargs, filtered[i]) end
+        local code = run_app(name, m, dir, rargs, is_detach)
+        if code ~= 0 then ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code)) end
     end
 end
 

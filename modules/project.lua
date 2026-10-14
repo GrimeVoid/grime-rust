@@ -245,7 +245,69 @@ local function resolve_project_context(parsed)
     return action, default_dir, default_lang, extra_args
 end
 
+local function print_help()
+    print(string.format([[
+%s%sGrime Project%s — Управление проектами по языкам разработки
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime project <команда> [язык] [имя_проекта] [аргументы...]
+    grime project [язык] [имя_проекта] <команда>
+
+%sКОМАНДЫ:%s
+    %sinit, new, create%s      Создать новый проект по шаблону
+                          grime project init cpp MyGame
+                          grime project init rust Tool
+    %sbuild, b, compile%s      Сборка проекта
+                          grime project build MyGame
+    %srun, r, start%s          Запуск проекта (с автосборкой при изменениях)
+                          grime project run MyGame [аргументы...]
+    %sdelete, rm%s             Удалить проект
+                          grime project rm MyGame
+    %sclear, clean, reset%s    Сбросить проект к чистому шаблону
+                          grime project clear MyGame
+    %srename, mv%s             Переименовать проект
+                          grime project rename OldName NewName
+    %spath, -p%s               Получить путь к директории проекта (для конвейеров)
+                          grime project path MyGame
+    %shelp, -h, --help%s       Показать эту справку
+
+%sПОДДЕРЖИВАЕМЫЕ ЯЗЫКИ:%s
+    cpp (C++), rust (Rust), python (Python), java (Java)
+
+%sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
+    grime project MyGame path : cmd nvim CMakeLists.txt
+    grime project MyTool path : aider "Добавь тесты для парсера"
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
 function main()
+    local raw_args = ctx.args or {}
+    if #raw_args == 0 then
+        print_help()
+        return
+    end
+
+    for _, a in ipairs(raw_args) do
+        if a == "--help" or a == "-h" or a == "help" then
+            print_help()
+            return
+        end
+    end
+
     local projects_root = get_projects_root()
 
     local cls = classifier.new({
@@ -260,6 +322,11 @@ function main()
     })
 
     local parsed = cls:parse(ctx.args, ctx.target_dir)
+
+    if parsed.flags.help or parsed.action == "help" then
+        print_help()
+        return
+    end
     local return_path_requested = parsed.flags.path_requested
 
     if parsed.action == "rename" then

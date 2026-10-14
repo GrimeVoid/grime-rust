@@ -178,6 +178,13 @@ helper.ctx = setmetatable({}, {
             return function(...)
                 return helper.join(...)
             end
+        elseif k == "json" then
+            return {
+                decode = helper.json_decode,
+                encode = helper.json_encode,
+            }
+        elseif k == "to_snake_case" then
+            return helper.to_snake_case
         end
         return c[k]
     end
@@ -212,4 +219,46 @@ function helper.join(...)
     return helper.normalize_path(res)
 end
 
+function helper.to_snake_case(str)
+    if not str then return "" end
+    local s = str:gsub("([a-z0-9])([A-Z])", "%1_%2")
+    s = s:gsub("[%s%-]+", "_")
+    return s:lower()
+end
+
+function helper.json_decode(str)
+    if not str or str == "" then return nil end
+    if grime and grime.json and grime.json.decode then
+        local ok, res = pcall(grime.json.decode, str)
+        if ok then return res end
+    end
+    -- Базовый fallback для чисел, boolean, строк и null
+    local trimmed = str:match("^%s*(.-)%s*$")
+    if trimmed == "true" then return true end
+    if trimmed == "false" then return false end
+    if trimmed == "null" then return nil end
+    local num = tonumber(trimmed)
+    if num ~= nil then return num end
+    if (trimmed:sub(1, 1) == '"' and trimmed:sub(-1) == '"') or (trimmed:sub(1, 1) == "'" and trimmed:sub(-1) == "'") then
+        return trimmed:sub(2, -2)
+    end
+    return trimmed
+end
+
+function helper.json_encode(val)
+    if grime and grime.json and grime.json.encode then
+        local ok, res = pcall(grime.json.encode, val)
+        if ok then return res end
+    end
+    if type(val) == "string" then
+        return string.format("%q", val)
+    elseif type(val) == "number" or type(val) == "boolean" then
+        return tostring(val)
+    elseif val == nil then
+        return "null"
+    end
+    return tostring(val)
+end
+
 return helper
+

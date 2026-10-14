@@ -497,6 +497,27 @@ impl GrimeLuaEngine {
         )?;
         grime_tbl.set("msgpack", msgpack_tbl)?;
 
+        // grime.json
+        let json_tbl = lua.create_table()?;
+        json_tbl.set(
+            "decode",
+            lua.create_function(|lua, s: String| {
+                let val: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| mlua::Error::runtime(format!("JSON decode error: {}", e)))?;
+                crate::state_bus::json_to_lua(lua, &val)
+            })?,
+        )?;
+        json_tbl.set(
+            "encode",
+            lua.create_function(|_, val: Value| {
+                let json_val = crate::state_bus::lua_to_json(val)?;
+                let s = serde_json::to_string(&json_val)
+                    .map_err(|e| mlua::Error::runtime(format!("JSON encode error: {}", e)))?;
+                Ok(s)
+            })?,
+        )?;
+        grime_tbl.set("json", json_tbl)?;
+
         // grime.ui
         let ui_tbl = lua.create_table()?;
         ui_tbl.set(
@@ -968,6 +989,24 @@ mod tests {
 
         let apps_path: String = lua.load(script).eval().expect("paths registry eval");
         assert!(!apps_path.is_empty());
+    }
+
+    #[test]
+    fn test_lua_json_encode_decode() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            local encoded = grime.json.encode({ name = "GrimeApp", score = 42, active = true })
+            local decoded = grime.json.decode(encoded)
+            assert(decoded.name == "GrimeApp")
+            assert(decoded.score == 42)
+            assert(decoded.active == true)
+            return true
+        "#;
+
+        let res: bool = lua.load(script).eval().expect("json encode/decode eval");
+        assert!(res);
     }
 }
 

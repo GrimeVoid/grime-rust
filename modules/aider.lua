@@ -1,6 +1,40 @@
 local helper = require("helper")
 local ctx = helper.ctx
 
+local GRIME_CONVENTIONS = [[
+
+[GRIME AGENT CONVENTIONS]:
+1. Для сохранения структурированных данных или состояния в шину Grime используйте тег:
+<grime_bus key="pipeline.<key>" type="json">
+{"field": "value"}
+</grime_bus>
+(Допустимые пространства имен: 'pipeline.*', 'modules.<name>.*').
+
+2. Для порождения субагента Grime (вызова другого модуля) используйте тег:
+<grime_spawn module="<module_name>" cwd="<optional_cwd>">
+инструкция или аргументы для модуля
+</grime_spawn>
+
+3. Для передачи промпта следующему шагу конвейера:
+<next_agent_prompt>
+инструкция для следующего агента
+</next_agent_prompt>
+]]
+
+--- Проверка, является ли директория частью Git-репозитория
+local function is_git_repo(dir)
+    if not dir or dir == "" then return false end
+    if ctx.exists(dir .. "/.git") then
+        return true
+    end
+    local res = ctx.capture({ "git", "-C", dir, "rev-parse", "--is-inside-work-tree" })
+    if res.code == 0 and res.stdout and res.stdout:match("true") then
+        return true
+    end
+    return false
+end
+
+--- Разрешение пути или проекта по имени
 local function resolve_dir_or_project(arg)
     if not arg or arg == "" or arg:match("^%-") then
         return nil
@@ -21,7 +55,7 @@ local function resolve_dir_or_project(arg)
     end
     projects_root = ctx.normalize_path(projects_root)
     if projects_root and ctx.exists(projects_root) then
-        for _, lang in ipairs({ "cpp", "python", "rust", "java", "C++" }) do
+        for _, lang in ipairs({ "cpp", "python", "rust", "java", "lua", "C++" }) do
             local cand = projects_root .. "/" .. lang .. "/" .. arg
             if ctx.is_dir(cand) then
                 return cand
@@ -36,17 +70,35 @@ local function resolve_dir_or_project(arg)
     return nil
 end
 
-local function replace_in_file(path, pattern, replacement)
-    if not ctx.is_file(path) then return end
-    local f = io.open(path, "r")
-    if not f then return end
-    local content = f:read("*a")
-    f:close()
-    local updated = content:gsub(pattern, replacement)
-    local f_out = io.open(path, "w")
-    if f_out then
-        f_out:write(updated)
-        f_out:close()
+--- Рекурсивная замена плейсхолдеров в директории
+local function replace_placeholders_in_dir(dir, replacements)
+    local p = io.popen(string.format("find %q -type f 2>/dev/null", dir))
+    if p then
+        for raw_line in p:lines() do
+            local file_path = raw_line:match("^%s*(.-)%s*$")
+            if file_path ~= "" and ctx.is_file(file_path) then
+                local f = io.open(file_path, "r")
+                if f then
+                    local content = f:read("*a")
+                    f:close()
+                    local changed = false
+                    for placeholder, val in pairs(replacements) do
+                        if content:find(placeholder, 1, true) then
+                            content = content:gsub(placeholder, val)
+                            changed = true
+                        end
+                    end
+                    if changed then
+                        local f_out = io.open(file_path, "w")
+                        if f_out then
+                            f_out:write(content)
+                            f_out:close()
+                        end
+                    end
+                end
+            end
+        end
+        p:close()
     end
 end
 
@@ -96,53 +148,23 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
         ctx.mkdir_p(app_dir .. "/src")
     end
 
-    -- Адаптация шаблона под имя приложения
-    if lang == "cpp" then
-        local cmake = app_dir .. "/CMakeLists.txt"
-        if ctx.is_file(cmake) then
-            replace_in_file(cmake, "project%s*%b()", "project(" .. app_name .. ")")
-            replace_in_file(cmake, "add_executable%s*%b()", "add_executable(" .. app_name .. " src/main.cpp)")
-        else
-            local f = io.open(cmake, "w")
-            if f then
-                f:write(string.format([[cmake_minimum_required(VERSION 3.20)
-project(%s)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-file(GLOB_RECURSE SOURCES "src/*.cpp")
-add_executable(%s ${SOURCES})
-]], app_name, app_name))
-                f:close()
-            end
-        end
-        local main_cpp = app_dir .. "/src/main.cpp"
-        if not ctx.is_file(main_cpp) then
-            local f = io.open(main_cpp, "w")
-            if f then
-                f:write([[#include <iostream>
+    local desc = (prompt and prompt ~= "") and prompt or ("Grime application " .. app_name)
+    desc = desc:gsub("\n", " "):gsub('"', '\\"')
 
-int main() {
-    std::cout << "Application started!" << std::endl;
-    return 0;
-}
-]])
-                f:close()
-            end
-        end
-    elseif lang == "rust" then
-        local cargo_toml = app_dir .. "/Cargo.toml"
-        if ctx.is_file(cargo_toml) then
-            replace_in_file(cargo_toml, 'name%s*=%s*"[^"]*"', 'name = "' .. app_name:lower() .. '"')
-        end
-    end
+    -- Плейсхолдеры для замены
+    local snake_name = helper.to_snake_case(app_name)
+    local replacements = {
+        ["{{PROJECT_NAME}}"] = app_name,
+        ["{{PROJECT_NAME_LOWER}}"] = app_name:lower(),
+        ["{{PROJECT_NAME_UPPER}}"] = app_name:upper(),
+        ["{{PROJECT_NAME_SNAKE}}"] = snake_name,
+        ["{{PROJECT_DESCRIPTION}}"] = desc,
+    }
+    replace_placeholders_in_dir(app_dir, replacements)
 
-    -- Генерация манифеста app.lua
+    -- Генерация манифеста app.lua при необходимости
     local manifest_path = app_dir .. "/app.lua"
     if not ctx.is_file(manifest_path) then
-        local desc = (prompt and prompt ~= "") and prompt or "Grime Application"
-        -- Экранируем переносы строк для строки манифеста
-        desc = desc:gsub("\n", " "):gsub('"', '\\"')
-
         local m_content = ""
         if lang == "cpp" then
             m_content = string.format([[return {
@@ -157,7 +179,6 @@ int main() {
 }
 ]], app_name, desc, app_name, app_name)
         elseif lang == "rust" then
-            local pkg_name = app_name:lower()
             m_content = string.format([[return {
     name = %q,
     description = "%s",
@@ -168,7 +189,7 @@ int main() {
     box = nil,
     detached = false,
 }
-]], app_name, desc, pkg_name, pkg_name)
+]], app_name, desc, snake_name, snake_name)
         elseif lang == "python" then
             m_content = string.format([[return {
     name = %q,
@@ -192,6 +213,17 @@ int main() {
     detached = false,
 }
 ]], app_name, desc, app_name, app_name)
+        elseif lang == "lua" then
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = "lua",
+    artifact = "src/main.lua",
+    run = "lua src/main.lua",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc)
         else
             m_content = string.format([[return {
     name = %q,
@@ -212,6 +244,98 @@ int main() {
             ctx.log("Сгенерирован манифест app.lua")
         end
     end
+
+    -- Инициализируем Git-репозиторий в папке приложения, если он еще не инициализирован
+    if not is_git_repo(app_dir) then
+        ctx.capture({ "git", "init" }, app_dir)
+    end
+end
+
+--- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn> и <next_agent_prompt>
+local function parse_aider_tags(output, working_dir)
+    if not output or output == "" then
+        return nil
+    end
+
+    -- 1. Обработка тегов <grime_bus key="..." [type="json"]>...</grime_bus>
+    for open_tag, content in output:gmatch("<grime_bus(.-)>(.-)</grime_bus>") do
+        local key = open_tag:match('key%s*=%s*"([^"]+)"') or open_tag:match("key%s*=%s*'([^']+)'")
+        local b_type = open_tag:match('type%s*=%s*"([^"]+)"') or open_tag:match("type%s*=%s*'([^']+)'")
+        if key and key ~= "" then
+            local raw_val = content:match("^%s*(.-)%s*$")
+            local val = raw_val
+            if b_type == "json" or raw_val:match("^[%[{]") then
+                local decoded = helper.json_decode(raw_val)
+                if decoded ~= nil then
+                    val = decoded
+                end
+            end
+            if grime and grime.bus and grime.bus.set then
+                local ok, err = pcall(function() grime.bus.set(key, val) end)
+                if ok then
+                    ctx.log(string.format("Шина grime.bus: сохранено значение по ключу '%s'", key))
+                else
+                    ctx.warn(string.format("Ошибка сохранения в grime.bus по ключу '%s': %s", key, tostring(err)))
+                end
+            end
+        end
+    end
+
+    -- 2. Обработка тегов <grime_spawn module="..." [cwd="..."]>...</grime_spawn>
+    local grime_bin = os.getenv("GRIME_BIN")
+    if not grime_bin or grime_bin == "" then
+        local home = os.getenv("HOME") or ""
+        local local_bin = home .. "/.local/bin/grime"
+        if ctx.exists(local_bin) then
+            grime_bin = local_bin
+        else
+            grime_bin = "grime"
+        end
+    end
+
+    for open_tag, spawn_content in output:gmatch("<grime_spawn(.-)>(.-)</grime_spawn>") do
+        local target_mod = open_tag:match('module%s*=%s*"([^"]+)"') or open_tag:match("module%s*=%s*'([^']+)'")
+        local target_cwd = open_tag:match('cwd%s*=%s*"([^"]+)"') or open_tag:match("cwd%s*=%s*'([^']+)'")
+        target_cwd = target_cwd or working_dir
+
+        local prompt = spawn_content:match("^%s*(.-)%s*$")
+        if target_mod and target_mod ~= "" then
+            target_cwd = ctx.normalize_path(target_cwd)
+            ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
+
+            local spawn_cmd = { grime_bin, target_mod }
+            if prompt ~= "" then
+                if target_mod == "aider" then
+                    table.insert(spawn_cmd, "-m")
+                    table.insert(spawn_cmd, prompt)
+                else
+                    for tok in prompt:gmatch("%S+") do
+                        table.insert(spawn_cmd, tok)
+                    end
+                end
+            end
+
+            local sres = ctx.capture(spawn_cmd, target_cwd)
+            if sres.code == 0 then
+                ctx.log(string.format("✓ Субагент '%s' успешно завершил работу.", target_mod))
+                if sres.stdout and sres.stdout ~= "" then
+                    parse_aider_tags(sres.stdout, target_cwd)
+                end
+            else
+                ctx.warn(string.format("Субагент '%s' завершился с кодом %d: %s", target_mod, sres.code, sres.stderr))
+            end
+        end
+    end
+
+    -- 3. Извлечение мастер-промпта следующего шага
+    local next_prompt = output:match("<next_agent_prompt>(.-)</next_agent_prompt>")
+    if next_prompt then
+        local extracted = next_prompt:match("^%s*(.-)%s*$")
+        ctx.log("Извлечен мастер-промпт для следующего шага конвейера (<next_agent_prompt>).")
+        return extracted
+    end
+
+    return nil
 end
 
 function main()
@@ -270,13 +394,22 @@ function main()
         end
         local user_prompt = table.concat(collected_prompt, " ")
 
-        -- Этап 1: Классификация стека
+        -- Классификация стека при необходимости
         local final_lang = app_lang
         if not final_lang or final_lang == "" then
             if user_prompt ~= "" then
                 local config_aider = ctx.get_config("aider", "auto")
                 local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
-                local classify_prompt = string.format("Классифицируй задачу консольного приложения:\n%s\nКакой стек лучше использовать? Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua.", user_prompt)
+                local classify_prompt = string.format([[Выбери оптимальный язык программирования для следующей задачи консольного приложения:
+"%s"
+
+Допустимые варианты: cpp, rust, python, java, lua.
+Критерии выбора:
+1. Ноль внешних зависимостей (zero external dependencies).
+2. Максимальная скорость исполнения и производительность.
+3. Минимальный вес артефакта и потребление ресурсов.
+
+Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
                 ctx.log("Определение стека приложения через Aider/LLM...")
                 local cres = ctx.capture({ aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
                 if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
@@ -295,11 +428,8 @@ function main()
         end
 
         ctx.log(string.format("Выбран стек технологий для приложения '%s': %s", app_name, final_lang))
-
-        -- Этап 2: Скаффолдинг
         scaffold_app(app_dir, app_name, final_lang, user_prompt)
 
-        -- Этап 3: Подготовка к вызову Aider
         if user_prompt ~= "" then
             local master_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и параметры сборки/запуска.", user_prompt)
             remaining_args = { "-m", master_prompt }
@@ -463,7 +593,17 @@ function main()
         end
     end
 
-    -- 5. Prompt Chaining: если есть следующий шаг
+    -- Добавление системных конвенций Grime (<grime_bus>, <grime_spawn>, <next_agent_prompt>)
+    if is_headless then
+        for i, a in ipairs(remaining_args) do
+            if a == "-m" and remaining_args[i + 1] then
+                remaining_args[i + 1] = remaining_args[i + 1] .. GRIME_CONVENTIONS
+                break
+            end
+        end
+    end
+
+    -- 5. Prompt Chaining: если есть следующий шаг в конвейере Grime
     if is_headless and ctx.has_next_step then
         local chain_instruction = "\n\n[СИСТЕМНОЕ ТРЕБОВАНИЕ GRIME]: Сформируйте мастер-промпт для следующего шага и ОБЯЗАТЕЛЬНО оберните его в тег:\n<next_agent_prompt>\nинструкция\n</next_agent_prompt>"
         for i, a in ipairs(remaining_args) do
@@ -478,11 +618,23 @@ function main()
     local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
     local aider_cmd = { aider_bin }
 
-    if target_dir and ctx.exists(target_dir) then
-        ctx.log("Запуск Aider внутри проекта: " .. working_dir)
-    else
-        table.insert(aider_cmd, "--no-git")
-        ctx.log("Запуск Aider в автономном режиме (--no-git вне проекта)")
+    -- 6. Проверка наличия Git-репозитория в целевой рабочей директории
+    local has_explicit_git_flag = false
+    for _, a in ipairs(remaining_args) do
+        if a == "--no-git" or a == "--git" then
+            has_explicit_git_flag = true
+            break
+        end
+    end
+
+    if not has_explicit_git_flag then
+        local in_git = is_git_repo(working_dir)
+        if in_git then
+            ctx.log("Обнаружен Git-репозиторий в " .. working_dir .. " -> запуск со стандартным контролем версий Git")
+        else
+            table.insert(aider_cmd, "--no-git")
+            ctx.log("Git-репозиторий отсутствует в " .. working_dir .. " -> добавлен флаг --no-git")
+        end
     end
 
     if is_headless then
@@ -509,7 +661,7 @@ function main()
             end
         end
         if not has_explicit then
-            local candidates = { "src/main.py", "src/main.cpp", "src/Main.java", "src/main.rs", "main.py", "app.lua" }
+            local candidates = { "src/main.py", "src/main.cpp", "src/Main.java", "src/main.rs", "src/main.lua", "main.py", "main.lua", "app.lua" }
             for _, c in ipairs(candidates) do
                 if ctx.exists(working_dir .. "/" .. c) then
                     table.insert(aider_cmd, c)
@@ -531,12 +683,9 @@ function main()
         io.stderr:write(cleaned_stderr)
 
         if res.code == 0 then
-            local extracted = nil
-            local match = res.stdout:match("<next_agent_prompt>(.-)</next_agent_prompt>")
-            if match then
-                extracted = match:match("^%s*(.-)%s*$")
-                ctx.log("Извлечен мастер-промпт для следующего шага конвейера (<next_agent_prompt>).")
-            else
+            -- Парсинг тегов взаимодействия Grime (<grime_bus>, <grime_spawn>, <next_agent_prompt>)
+            local extracted = parse_aider_tags(res.stdout, working_dir)
+            if not extracted or extracted == "" then
                 extracted = res.stdout:match("^%s*(.-)%s*$")
             end
 

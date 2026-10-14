@@ -17,6 +17,29 @@ local MANAGERS = {
     app = "apps", apps = "apps",
 }
 
+local MANAGER_BINARIES = {
+    pacman = "pacman",
+    flatpak = "flatpak",
+    nix = "nix",
+    distrobox = "distrobox",
+    cargo = "cargo",
+    pipx = "pipx",
+    dnf = "dnf",
+    apt = "apt",
+}
+
+local binary_cache = {}
+local function has_binary(bin)
+    if not bin or bin == "" then return false end
+    if binary_cache[bin] ~= nil then
+        return binary_cache[bin]
+    end
+    local res = ctx.capture({ "which", bin })
+    local exists = (res.code == 0 and res.stdout and res.stdout:match("%S") ~= nil) or false
+    binary_cache[bin] = exists
+    return exists
+end
+
 local function get_apps_root()
     local root = (ctx.paths and ctx.paths.apps)
         or (ctx.get_path and ctx.get_path("apps"))
@@ -29,125 +52,143 @@ local function handle_list(selected_managers, show_all)
     io.stdout:write("\n📦 Обзор установленных пакетов и менеджеров ПО:\n")
     io.stdout:write(string.rep("─", 75) .. "\n")
 
-    local managers = (#selected_managers > 0) and selected_managers or { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx", "apps" }
+    local is_explicit = (#selected_managers > 0)
+    local managers = is_explicit and selected_managers or { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx", "apps" }
 
+    local printed = 0
     for _, mgr in ipairs(managers) do
+        local bin = MANAGER_BINARIES[mgr]
+        local bin_available = true
+        if bin then
+            bin_available = has_binary(bin)
+        end
+
         local count = 0
         local preview = {}
         local display_label = mgr
 
-        if mgr == "pacman" then
-            local res = ctx.capture({ "pacman", "-Qe" })
-            if res.code == 0 then
-                for line in res.stdout:gmatch("[^\r\n]+") do
-                    count = count + 1
-                    if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
-                end
-            end
-        elseif mgr == "flatpak" then
-            local res = ctx.capture({ "flatpak", "list", "--app" })
-            if res.code == 0 then
-                for line in res.stdout:gmatch("[^\r\n]+") do
-                    count = count + 1
-                    if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
-                end
-            end
-        elseif mgr == "cargo" then
-            local res = ctx.capture({ "cargo", "install", "--list" })
-            if res.code == 0 then
-                for line in res.stdout:gmatch("[^\r\n]+") do
-                    if not line:match("^%s") and line:match(":") then
+        if bin_available then
+            if mgr == "pacman" then
+                local res = ctx.capture({ "pacman", "-Qe" })
+                if res.code == 0 then
+                    for line in res.stdout:gmatch("[^\r\n]+") do
                         count = count + 1
                         if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
                     end
                 end
-            end
-        elseif mgr == "pipx" then
-            local res = ctx.capture({ "pipx", "list", "--short" })
-            if res.code == 0 then
-                for line in res.stdout:gmatch("[^\r\n]+") do
-                    count = count + 1
-                    if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
-                end
-            end
-        elseif mgr == "distrobox" then
-            local target_box = nil
-            local res = ctx.capture({ "distrobox", "list", "--no-color" })
-            if res.code == 0 and res.stdout then
-                local lines = {}
-                for line in res.stdout:gmatch("[^\r\n]+") do table.insert(lines, line) end
-                for i = 2, #lines do
-                    local line = lines[i]:match("^%s*(.-)%s*$")
-                    if line ~= "" then
-                        local parts = {}
-                        for part in line:gmatch("[^|]+") do
-                            table.insert(parts, part:match("^%s*(.-)%s*$"))
-                        end
-                        if #parts >= 3 and parts[1] ~= "ID" then
-                            local bname = parts[2]
-                            local bstatus = parts[3]
-                            if not target_box then
-                                target_box = bname
-                            end
-                            if bstatus:match("Up") or bname == "fedora-box" then
-                                target_box = bname
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-
-            if target_box then
-                display_label = string.format("distrobox (%s)", target_box)
-                local qcmd = 'rpm -qa --qf "%{NAME}\\n" 2>/dev/null || pacman -Qq 2>/dev/null || dpkg-query -f "${Package}\\n" -W 2>/dev/null'
-                local dres = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", qcmd })
-                if dres.code == 0 and dres.stdout and dres.stdout ~= "" then
-                    for line in dres.stdout:gmatch("[^\r\n]+") do
-                        local pkg = line:match("^%s*(.-)%s*$")
-                        if pkg ~= "" then
-                            count = count + 1
-                            if count <= 5 then table.insert(preview, pkg) end
-                        end
-                    end
-                end
-            else
-                display_label = "distrobox"
-            end
-        elseif mgr == "apps" or mgr == "app" then
-            local apps_root = get_apps_root()
-            if ctx.exists(apps_root) then
-                local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
-                if p then
-                    for l in p:lines() do
-                        local item = l:match("^%s*(.-)%s*$")
-                        if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
-                            count = count + 1
-                            if count <= 5 then table.insert(preview, item) end
-                        end
-                    end
-                    p:close()
-                end
-            end
-        elseif mgr == "nix" then
-            local res = ctx.capture({ "nix", "profile", "list" })
-            if res.code == 0 then
-                for line in res.stdout:gmatch("[^\r\n]+") do
-                    if line:find("packages%.") or line:find("legacyPackages%.") then
+            elseif mgr == "flatpak" then
+                local res = ctx.capture({ "flatpak", "list", "--app" })
+                if res.code == 0 then
+                    for line in res.stdout:gmatch("[^\r\n]+") do
                         count = count + 1
-                        if count <= 5 then
-                            local pkg = line:match("packages%S+%.(%S+)") or line:match("legacyPackages%S+%.(%S+)") or line:match("(%S+)$")
-                            table.insert(preview, pkg)
+                        if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
+                    end
+                end
+            elseif mgr == "cargo" then
+                local res = ctx.capture({ "cargo", "install", "--list" })
+                if res.code == 0 then
+                    for line in res.stdout:gmatch("[^\r\n]+") do
+                        if not line:match("^%s") and line:match(":") then
+                            count = count + 1
+                            if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
+                        end
+                    end
+                end
+            elseif mgr == "pipx" then
+                local res = ctx.capture({ "pipx", "list", "--short" })
+                if res.code == 0 then
+                    for line in res.stdout:gmatch("[^\r\n]+") do
+                        count = count + 1
+                        if count <= 5 then table.insert(preview, line:match("^(%S+)")) end
+                    end
+                end
+            elseif mgr == "distrobox" then
+                local target_box = nil
+                local res = ctx.capture({ "distrobox", "list", "--no-color" })
+                if res.code == 0 and res.stdout then
+                    local lines = {}
+                    for line in res.stdout:gmatch("[^\r\n]+") do table.insert(lines, line) end
+                    for i = 2, #lines do
+                        local line = lines[i]:match("^%s*(.-)%s*$")
+                        if line ~= "" then
+                            local parts = {}
+                            for part in line:gmatch("[^|]+") do
+                                table.insert(parts, part:match("^%s*(.-)%s*$"))
+                            end
+                            if #parts >= 3 and parts[1] ~= "ID" then
+                                local bname = parts[2]
+                                local bstatus = parts[3]
+                                if not target_box then
+                                    target_box = bname
+                                end
+                                if bstatus:match("Up") or bname == "fedora-box" then
+                                    target_box = bname
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if target_box then
+                    display_label = string.format("distrobox (%s)", target_box)
+                    local qcmd = 'rpm -qa --qf "%{NAME}\\n" 2>/dev/null || pacman -Qq 2>/dev/null || dpkg-query -f "${Package}\\n" -W 2>/dev/null'
+                    local dres = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", qcmd })
+                    if dres.code == 0 and dres.stdout and dres.stdout ~= "" then
+                        for line in dres.stdout:gmatch("[^\r\n]+") do
+                            local pkg = line:match("^%s*(.-)%s*$")
+                            if pkg ~= "" then
+                                count = count + 1
+                                if count <= 5 then table.insert(preview, pkg) end
+                            end
+                        end
+                    end
+                else
+                    display_label = "distrobox"
+                end
+            elseif mgr == "apps" or mgr == "app" then
+                local apps_root = get_apps_root()
+                if ctx.exists(apps_root) then
+                    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
+                    if p then
+                        for l in p:lines() do
+                            local item = l:match("^%s*(.-)%s*$")
+                            if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+                                count = count + 1
+                                if count <= 5 then table.insert(preview, item) end
+                            end
+                        end
+                        p:close()
+                    end
+                end
+            elseif mgr == "nix" then
+                local res = ctx.capture({ "nix", "profile", "list" })
+                if res.code == 0 then
+                    for line in res.stdout:gmatch("[^\r\n]+") do
+                        if line:find("packages%.") or line:find("legacyPackages%.") then
+                            count = count + 1
+                            if count <= 5 then
+                                local pkg = line:match("packages%S+%.(%S+)") or line:match("legacyPackages%S+%.(%S+)") or line:match("(%S+)$")
+                                table.insert(preview, pkg)
+                            end
                         end
                     end
                 end
             end
         end
 
-        local preview_str = table.concat(preview, ", ")
-        if count > 5 then preview_str = preview_str .. "..." end
-        io.stdout:write(string.format("%-24s : %5d пакетов [%s]\n", display_label, count, preview_str))
+        if count > 0 or is_explicit or show_all then
+            local preview_str = table.concat(preview, ", ")
+            if count > 5 then preview_str = preview_str .. "..." end
+            io.stdout:write(string.format("%-24s : %5d пакетов [%s]\n", display_label, count, preview_str))
+            printed = printed + 1
+        end
     end
+
+    if printed == 0 then
+        io.stdout:write("  Пакеты не найдены\n")
+    end
+
     io.stdout:write(string.rep("─", 75) .. "\n")
     io.stdout:write("\27[90mДля подробной справки используйте: grime pkg --help\27[0m\n\n")
 end

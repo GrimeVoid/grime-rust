@@ -20,11 +20,17 @@ pub fn run_command(
         return 0;
     }
 
+    let effective_cwd = if cwd.exists() && cwd.is_dir() {
+        cwd
+    } else {
+        Path::new(".")
+    };
+
     let mut command = Command::new(&cmd[0]);
     if cmd.len() > 1 {
         command.args(&cmd[1..]);
     }
-    command.current_dir(cwd);
+    command.current_dir(effective_cwd);
 
     if let Some(envs) = env {
         command.envs(envs);
@@ -45,9 +51,15 @@ pub fn run_shell(
     cwd: &Path,
     env: Option<&HashMap<String, String>>,
 ) -> i32 {
+    let effective_cwd = if cwd.exists() && cwd.is_dir() {
+        cwd
+    } else {
+        Path::new(".")
+    };
+
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd_str);
-    command.current_dir(cwd);
+    command.current_dir(effective_cwd);
 
     if let Some(envs) = env {
         command.envs(envs);
@@ -77,11 +89,17 @@ pub fn capture_command(
         };
     }
 
+    let effective_cwd = if cwd.exists() && cwd.is_dir() {
+        cwd
+    } else {
+        Path::new(".")
+    };
+
     let mut command = Command::new(&cmd[0]);
     if cmd.len() > 1 {
         command.args(&cmd[1..]);
     }
-    command.current_dir(cwd);
+    command.current_dir(effective_cwd);
     if let Some(envs) = env {
         command.envs(envs);
     }

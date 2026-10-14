@@ -79,7 +79,7 @@ function main()
         table.insert(cmd, a)
     end
 
-    local check_which = ctx.capture("which " .. program)
+    local check_which = ctx.capture("command -v " .. program)
     if check_which.code ~= 0 then
         if ctx.exists(base_dir .. "/shell.nix") then
             local flat_sub = {}

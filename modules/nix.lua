@@ -337,7 +337,10 @@ function main()
         end
     end
 
-    local raw_target = ctx.input or ctx.pipeline_input or ctx.target_dir
+    local raw_target = ctx.target_dir
+    if not raw_target or #raw_target == 0 or not ctx.is_dir(raw_target) then
+        raw_target = "."
+    end
     local target_dir = ctx.normalize_path(raw_target)
     local cls = argparse.new({
         actions = ACTIONS,

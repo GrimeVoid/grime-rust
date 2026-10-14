@@ -2,6 +2,8 @@ local ctx = grime.ctx
 local BaseAdapter = require("languages.base")
 local aider = require("aider")
 local box = require("box")
+local git = require("git")
+local log = require("log")
 
 local DEFAULT_NIX = {
     cpp = { "cmake", "ninja", "gcc" },
@@ -424,11 +426,171 @@ local function new_app(apps_root, args)
         end
     end
 
-    if not ctx.exists(app_dir .. "/.git") then ctx.capture({ "git", "init" }, app_dir) end
-    ctx.capture({ "git", "add", "flake.nix" }, app_dir)
+    if not ctx.exists(app_dir .. "/.git") then
+        git.init(app_dir)
+    end
+    git.commit(app_dir, "init: flake scaffold", true)
+    log.info(string.format("Создано приложение '%s' с инициализацией Git и flake scaffold", app_name), "app")
 
     aider.run_dev(app_dir, user_prompt, app_name)
     ctx.log(string.format("✓ Приложение '%s' создано в %s\nДля запуска выполните: grime app %s", app_name, app_dir, app_name))
+end
+
+local function commit_app(apps_root, raw_name, msg_param)
+    if not raw_name or raw_name == "" then
+        ctx.fail("Укажите имя приложения: grime app commit <app_name> [сообщение]")
+        return
+    end
+    local app_name = resolve_app_name(apps_root, raw_name)
+    local app_dir = apps_root .. "/" .. app_name
+    if not ctx.exists(app_dir) then
+        ctx.fail(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
+        return
+    end
+
+    local msg = msg_param
+    if not msg or #msg == 0 then
+        msg = ctx.input or ctx.pipeline_input
+    end
+    if not msg or #msg == 0 then
+        msg = "update: " .. app_name .. " source and configuration"
+    end
+
+    local res, err = git.commit(app_dir, msg, true)
+    if not res then
+        log.error(string.format("Ошибка коммита для приложения '%s': %s", app_name, tostring(err)), "app")
+        ctx.fail(err or "Не удалось закоммитить изменения")
+        return
+    end
+
+    if res.no_changes then
+        grime.ui.warn(string.format("В приложении '%s' нет изменений для фиксации.", app_name))
+        ctx.success(res.message)
+    else
+        log.info(string.format("Зафиксирован коммит [%s] для приложения '%s': %s", res.hash, app_name, msg), "app")
+        grime.ui.success(string.format("Изменения приложения '%s' успешно зафиксированы [%s]: %s", app_name, res.hash, msg))
+        ctx.success(res.hash)
+    end
+end
+
+local function log_app(apps_root, raw_name, limit_param)
+    if not raw_name or raw_name == "" then
+        ctx.fail("Укажите имя приложения: grime app log <app_name> [n]")
+        return
+    end
+    local app_name = resolve_app_name(apps_root, raw_name)
+    local app_dir = apps_root .. "/" .. app_name
+    if not ctx.exists(app_dir) then
+        ctx.fail(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
+        return
+    end
+
+    local limit = tonumber(limit_param) or 10
+    local commits, err = git.log(app_dir, limit)
+    if not commits then
+        ctx.fail(err or "Не удалось получить историю коммитов")
+        return
+    end
+
+    if #commits == 0 then
+        grime.ui.log(string.format("История коммитов приложения '%s' пуста.", app_name))
+        ctx.success("0 commits")
+        return
+    end
+
+    local rows = {}
+    for _, c in ipairs(commits) do
+        table.insert(rows, { c.hash, c.author, c.date, c.message })
+    end
+
+    print(string.format("\n%sИстория изменений приложения %s%s%s:%s", ANSI.BOLD, ANSI.GREEN, app_name, ANSI.BOLD, ANSI.RESET))
+    grime.ui.print_table(rows, { "Хеш", "Автор", "Дата", "Сообщение" })
+    print()
+
+    if ctx.has_next_step then
+        local lines = {}
+        for _, c in ipairs(commits) do
+            table.insert(lines, string.format("%s %s", c.hash, c.message))
+        end
+        ctx.success(table.concat(lines, "\n"))
+    else
+        ctx.success(tostring(#commits))
+    end
+end
+
+local function diff_app(apps_root, raw_name, file_param)
+    if not raw_name or raw_name == "" then
+        ctx.fail("Укажите имя приложения: grime app diff <app_name> [файл]")
+        return
+    end
+    local app_name = resolve_app_name(apps_root, raw_name)
+    local app_dir = apps_root .. "/" .. app_name
+    if not ctx.exists(app_dir) then
+        ctx.fail(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
+        return
+    end
+
+    local out, err = git.diff(app_dir, file_param)
+    if not out then
+        ctx.fail(err or "Не удалось получить diff")
+        return
+    end
+
+    if #grime.str.trim(out) == 0 then
+        grime.ui.log(string.format("В приложении '%s' нет незафиксированных изменений.", app_name))
+        ctx.success("")
+    else
+        print(string.format("\n%sИзменения в приложении %s%s%s:%s\n", ANSI.BOLD, ANSI.YELLOW, app_name, ANSI.BOLD, ANSI.RESET))
+        print(out)
+        ctx.success(out)
+    end
+end
+
+local function status_app(apps_root, raw_name)
+    if not raw_name or raw_name == "" then
+        ctx.fail("Укажите имя приложения: grime app status <app_name>")
+        return
+    end
+    local app_name = resolve_app_name(apps_root, raw_name)
+    local app_dir = apps_root .. "/" .. app_name
+    if not ctx.exists(app_dir) then
+        ctx.fail(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
+        return
+    end
+
+    local st, err = git.status(app_dir)
+    if not st then
+        ctx.fail(err or "Не удалось получить статус репозитория")
+        return
+    end
+
+    print(string.format("\n%sПриложение:%s %s%s%s", ANSI.BOLD, ANSI.RESET, ANSI.GREEN, app_name, ANSI.RESET))
+    print(string.format("%sПуть:%s %s", ANSI.BOLD, ANSI.RESET, app_dir))
+    print(string.format("%sВетка:%s %s", ANSI.BOLD, ANSI.RESET, st.branch))
+
+    if st.is_clean then
+        grime.ui.success("Рабочее дерево приложения чисто (нет изменений)")
+    else
+        if #st.staged > 0 then
+            print(string.format("\n%sИндексированные изменения (%d):%s", ANSI.GREEN, #st.staged, ANSI.RESET))
+            for _, f in ipairs(st.staged) do print(string.format("  [%s] %s", f.flag, f.file)) end
+        end
+        if #st.modified > 0 then
+            print(string.format("\n%sИзмененные файлы (%d):%s", ANSI.YELLOW, #st.modified, ANSI.RESET))
+            for _, f in ipairs(st.modified) do print(string.format("  [%s] %s", f.flag, f.file)) end
+        end
+        if #st.untracked > 0 then
+            print(string.format("\n%sНеотслеживаемые файлы (%d):%s", ANSI.RED, #st.untracked, ANSI.RESET))
+            for _, f in ipairs(st.untracked) do print(string.format("  [?] %s", f)) end
+        end
+        print()
+    end
+
+    if ctx.has_next_step then
+        ctx.success(string.format("%s: staged=%d, modified=%d, untracked=%d", app_name, #st.staged, #st.modified, #st.untracked))
+    else
+        ctx.success(st.branch)
+    end
 end
 
 local function print_help()
@@ -448,6 +610,14 @@ local function print_help()
                          grime app <имя> [аргументы...]
     %sbuild%s                 Собрать приложение
                          grime app build <имя>
+    %scommit%s                Зафиксировать изменения приложения в Git
+                         grime app commit <имя> [сообщение]
+    %slog%s                   История изменений приложения
+                         grime app log <имя> [n]
+    %sdiff%s                  Незафиксированные изменения приложения
+                         grime app diff <имя> [файл]
+    %sstatus%s                Статус репозитория приложения
+                         grime app status <имя>
     %srm, remove, delete%s    Удалить приложение
                          grime app rm <имя>
     %shelp, -h, --help%s      Показать эту справку
@@ -463,12 +633,18 @@ local function print_help()
 %sПРИМЕРЫ:%s
     grime app new MyTool --lang rust "CLI утилита для обработки JSON"
     grime app run MyTool input.json
-    grime app MyTool --verbose
+    grime app commit MyTool "fix: исправление парсера"
+    grime app log MyTool 5
+    grime app status MyTool
     grime app run MyServer --detach
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
@@ -518,6 +694,24 @@ function main()
         local m, err = load_manifest(dir, app_name)
         if not m then ctx.fail(err or "Манифест не найден"); return end
         build_app(app_name, m, dir)
+        return
+    elseif subcmd == "commit" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app commit <app_name> [сообщение]"); return end
+        local msg_tokens = {}
+        for i = 3, #filtered do table.insert(msg_tokens, filtered[i]) end
+        commit_app(apps_root, filtered[2], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
+        return
+    elseif subcmd == "log" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app log <app_name> [n]"); return end
+        log_app(apps_root, filtered[2], filtered[3])
+        return
+    elseif subcmd == "diff" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app diff <app_name> [файл]"); return end
+        diff_app(apps_root, filtered[2], filtered[3])
+        return
+    elseif subcmd == "status" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app status <app_name>"); return end
+        status_app(apps_root, filtered[2])
         return
     elseif subcmd == "rm" or subcmd == "remove" or subcmd == "delete" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app rm <app_name>"); return end
@@ -582,4 +776,8 @@ return {
     list_apps = list_apps,
     rm_app = rm_app,
     new_app = new_app,
+    commit_app = commit_app,
+    log_app = log_app,
+    diff_app = diff_app,
+    status_app = status_app,
 }

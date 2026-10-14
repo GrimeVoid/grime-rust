@@ -1,4 +1,4 @@
-local classifier = require("classifier")
+local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
 local ACTIONS = {
@@ -878,7 +878,7 @@ function main()
         end
     end
 
-    local cls = classifier.new({
+    local cls = argparse.new({
         actions = ACTIONS,
         default_action = "list",
         flags = { all = { "-a", "--all", "--deps" } },

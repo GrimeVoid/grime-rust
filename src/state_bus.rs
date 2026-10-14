@@ -36,28 +36,12 @@ impl StateBus {
         let parts: Vec<&str> = key.split('.').collect();
         if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
             return Err(format!(
-                "Некорректный ключ '{}': ключ должен иметь префикс пространства имен (например, 'pipeline.foo' или 'modules.cmd.bar')",
+                "Некорректный ключ '{}': ключ должен иметь префикс пространства имен (например, 'pipeline.foo', 'log.history' или 'modules.cmd.bar')",
                 key
             ));
         }
 
-        match parts[0] {
-            "system" | "env" | "pipeline" | "app" | "box" | "host" | "test" | "user" => Ok(()),
-            "modules" => {
-                if parts.len() < 3 {
-                    Err(format!(
-                        "Некорректный ключ '{}': в пространстве 'modules' требуется указать имя модуля, например: 'modules.pkg.cache'",
-                        key
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            other => Err(format!(
-                "Неизвестное пространство имен '{}'. Допустимые: 'system', 'env', 'pipeline', 'app', 'box', 'host', 'test', 'user', 'modules.<name>'",
-                other
-            )),
-        }
+        Ok(())
     }
 
     /// Инициализация стандартных системных параметров и окружения.
@@ -298,6 +282,7 @@ pub fn register_state_bus_api(lua: &Lua, bus: Arc<StateBus>) -> Result<(), mlua:
         })?,
     )?;
 
+    bus_tbl.set("state", bus_tbl.clone())?;
     grime.set("bus", bus_tbl)?;
     Ok(())
 }
@@ -312,10 +297,16 @@ mod tests {
         assert!(StateBus::validate_namespace("system.version").is_ok());
         assert!(StateBus::validate_namespace("env.HOME").is_ok());
         assert!(StateBus::validate_namespace("modules.cmd.last_code").is_ok());
+        assert!(StateBus::validate_namespace("log.history").is_ok());
+        assert!(StateBus::validate_namespace("log.latest").is_ok());
+        assert!(StateBus::validate_namespace("git.branch").is_ok());
+        assert!(StateBus::validate_namespace("session.user").is_ok());
+        assert!(StateBus::validate_namespace("custom.arbitrary_module").is_ok());
 
         assert!(StateBus::validate_namespace("invalid_no_namespace").is_err());
-        assert!(StateBus::validate_namespace("unknown.key").is_err());
-        assert!(StateBus::validate_namespace("modules.short").is_err());
+        assert!(StateBus::validate_namespace("").is_err());
+        assert!(StateBus::validate_namespace(".leading_dot").is_err());
+        assert!(StateBus::validate_namespace("trailing_dot.").is_err());
     }
 
     #[test]

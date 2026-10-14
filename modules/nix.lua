@@ -1,4 +1,4 @@
-local classifier = require("classifier")
+local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
 local ACTIONS = {
@@ -339,7 +339,7 @@ function main()
 
     local raw_target = ctx.input or ctx.pipeline_input or ctx.target_dir
     local target_dir = ctx.normalize_path(raw_target)
-    local cls = classifier.new({
+    local cls = argparse.new({
         actions = ACTIONS,
         default_action = "init",
         flags = {

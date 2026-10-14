@@ -1,25 +1,26 @@
-local classifier = {}
-classifier.__index = classifier
+-- Модуль парсинга аргументов командной строки и сопоставления флагов
+local argparse = {}
+argparse.__index = argparse
 
-function classifier.new(opts)
+function argparse.new(opts)
     opts = opts or {}
-    local self = setmetatable({}, classifier)
+    local self = setmetatable({}, argparse)
     self.actions = opts.actions or {}
     self.default_action = opts.default_action
-    self.flags = opts.flags or {} -- { flag_name = { "-f", "--force" } }
-    self.categories = opts.categories or {} -- { cat_name = { key = val } }
+    self.flags = opts.flags or {}
+    self.categories = opts.categories or {}
     self.detect_dir = opts.detect_dir or false
     self.fuzzy_threshold = opts.fuzzy_threshold or 0.75
     return self
 end
 
-function classifier:parse(args, default_target_dir)
+function argparse:parse(args, default_target_dir)
     args = args or {}
     local tokens_before = {}
     local command_tokens = {}
     local found_dash = false
 
-    for i, tok in ipairs(args) do
+    for _, tok in ipairs(args) do
         if not found_dash and tok == "--" then
             found_dash = true
         elseif found_dash then
@@ -60,7 +61,7 @@ function classifier:parse(args, default_target_dir)
             if flag_matched then break end
         end
 
-        -- 1.1. Нечёткое сопоставление флагов с высоким порогом (СТРОГО только для флагов, начинающихся с '-')
+        -- 1.1. Нечёткое сопоставление флагов
         if not flag_matched and tok:sub(1, 1) == "-" and tok ~= "--" then
             local best_flag_name = nil
             local best_score = 0.0
@@ -91,7 +92,7 @@ function classifier:parse(args, default_target_dir)
         end
 
         if not flag_matched then
-            -- 2. Проверка действий (первое найденное ключевое слово)
+            -- 2. Проверка действий
             if not action_found and self.actions[tok_lower] then
                 res_action = self.actions[tok_lower]
                 action_found = true
@@ -107,7 +108,7 @@ function classifier:parse(args, default_target_dir)
                 end
 
                 if not cat_matched then
-                    -- 4. Автоопределение директории (если токен - существующий путь, начинающийся с ./, ../, / или ~)
+                    -- 4. Автоопределение директории
                     local is_dir_candidate = false
                     if self.detect_dir and not res_target_dir then
                         if (tok:find("^[./~]") or tok:find("/")) and grime and grime.fs and grime.fs.exists(tok) then
@@ -135,4 +136,4 @@ function classifier:parse(args, default_target_dir)
     }
 end
 
-return classifier
+return argparse

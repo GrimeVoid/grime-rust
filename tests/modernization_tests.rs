@@ -302,13 +302,14 @@ async fn test_fuzzy_matching_entities_and_flags() {
     let mod_dir = temp.path().join("modules");
     fs::create_dir_all(&mod_dir).unwrap();
 
-    // Скопируем helper.lua и classifier.lua во временную директорию модулей
+    // Скопируем helper.lua и languages/argparse.lua во временную директорию модулей
     let repo_modules = Path::new("modules");
     if repo_modules.join("helper.lua").exists() {
         fs::copy(repo_modules.join("helper.lua"), mod_dir.join("helper.lua")).unwrap();
     }
-    if repo_modules.join("classifier.lua").exists() {
-        fs::copy(repo_modules.join("classifier.lua"), mod_dir.join("classifier.lua")).unwrap();
+    if repo_modules.join("languages/argparse.lua").exists() {
+        let _ = fs::create_dir_all(mod_dir.join("languages"));
+        fs::copy(repo_modules.join("languages/argparse.lua"), mod_dir.join("languages/argparse.lua")).unwrap();
     }
 
     // Тестовый модуль: test_fuzzy.lua
@@ -316,7 +317,7 @@ async fn test_fuzzy_matching_entities_and_flags() {
         mod_dir.join("test_fuzzy.lua"),
         r#"
         local helper = require("helper")
-        local classifier = require("classifier")
+        local argparse = require("languages.argparse")
         local ctx = helper.ctx
 
         function main()
@@ -357,16 +358,16 @@ async fn test_fuzzy_matching_entities_and_flags() {
             assert(helper.fuzzy_match_flag("git", flags, 0.75) == nil, "git is string")
             assert(helper.fuzzy_match_flag("MyGame", flags, 0.75) == nil, "MyGame is string")
 
-            -- 6. Проверка classifier c нечёткими флагами
-            local cls = classifier.new({
+            -- 6. Проверка argparse c нечёткими флагами
+            local cls = argparse.new({
                 flags = {
                     all = { "-a", "--all", "--deps" },
                     force = { "-f", "--force" }
                 }
             })
             local parsed = cls:parse({ "--al", "--forc", "my_package" })
-            assert(parsed.flags.all == true, "classifier flag all matched via --al")
-            assert(parsed.flags.force == true, "classifier flag force matched via --forc")
+            assert(parsed.flags.all == true, "argparse flag all matched via --al")
+            assert(parsed.flags.force == true, "argparse flag force matched via --forc")
             assert(#parsed.args == 1 and parsed.args[1] == "my_package", "my_package kept as positional arg")
 
             ctx.success("fuzzy_tests_passed")
@@ -392,11 +393,8 @@ async fn test_no_helper_lua_native_execution() {
     // Убеждаемся, что helper.lua физически отсутствует в тестовой директории
     assert!(!mod_dir.join("helper.lua").exists());
 
-    // Скопируем реальные модули cmd.lua и classifier.lua
+    // Скопируем реальный модуль cmd.lua
     let repo_modules = Path::new("modules");
-    if repo_modules.join("classifier.lua").exists() {
-        fs::copy(repo_modules.join("classifier.lua"), mod_dir.join("classifier.lua")).unwrap();
-    }
     if repo_modules.join("cmd.lua").exists() {
         fs::copy(repo_modules.join("cmd.lua"), mod_dir.join("cmd.lua")).unwrap();
     }

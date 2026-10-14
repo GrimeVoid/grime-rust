@@ -1,4 +1,4 @@
-local classifier = require("classifier")
+local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
 local ACTION_SYNONYMS = {
@@ -309,7 +309,7 @@ function main()
 
     local projects_root = get_projects_root()
 
-    local cls = classifier.new({
+    local cls = argparse.new({
         actions = ACTION_SYNONYMS,
         default_action = nil,
         flags = {

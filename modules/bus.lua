@@ -25,6 +25,36 @@ local function print_help()
     ))
 end
 
+local function get_state_file()
+    local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
+    if not ctx.exists(dir) then ctx.mkdir_p(dir) end
+    return dir .. "/state.json"
+end
+
+local function load_persisted_state()
+    local sfile = get_state_file()
+    if ctx.exists(sfile) then
+        local content = grime.fs.read(sfile)
+        if content and #content > 0 then
+            local ok, data = pcall(grime.json.decode, content)
+            if ok and type(data) == "table" then return data end
+        end
+    end
+    return {}
+end
+
+local function save_persisted_key(key, val)
+    if key:match("^pipeline%.") then return end
+    local data = load_persisted_state()
+    data[key] = val
+    local sfile = get_state_file()
+    local f = io.open(sfile, "w")
+    if f then
+        f:write(grime.json.encode(data))
+        f:close()
+    end
+end
+
 function main()
     local args = ctx.args or {}
     if #args == 0 then
@@ -50,6 +80,15 @@ function main()
             return
         end
         local ok, val = pcall(grime.bus.get, key)
+        if (not ok or val == nil) and not key:match("^pipeline%.") then
+            local persisted = load_persisted_state()
+            if persisted[key] ~= nil then
+                val = persisted[key]
+                pcall(grime.bus.set, key, val)
+                ok = true
+            end
+        end
+
         if not ok then
             ctx.fail("Не удалось прочитать ключ '" .. key .. "' из шины: " .. tostring(val))
             return
@@ -80,6 +119,7 @@ function main()
 
         local ok, err = pcall(grime.bus.set, key, val)
         if ok then
+            save_persisted_key(key, val)
             ctx.log(string.format("Установлено: %s = %s", key, tostring(val_str)))
             ctx.success(val_str)
         else
@@ -92,6 +132,13 @@ function main()
             return
         end
         local ok, exists = pcall(grime.bus.has, key)
+        if (not ok or not exists) and not key:match("^pipeline%.") then
+            local persisted = load_persisted_state()
+            if persisted[key] ~= nil then
+                exists = true
+                ok = true
+            end
+        end
         if not ok then
             ctx.fail("Не удалось проверить ключ '" .. key .. "' в шине: " .. tostring(exists))
             return

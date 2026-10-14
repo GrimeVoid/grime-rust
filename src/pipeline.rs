@@ -15,15 +15,39 @@ pub struct ParsedPipeline {
 }
 
 pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
-pub const STANDARD_MODULES: &[&str] = &[
-    "project", "pkg", "app", "box", "nix", "aider", "cmd", "host", "doctor", "bus", "daemon",
-    "classifier", "list",
-];
 
 const PATH_FLAGS: &[&str] = &["-p", "-path", "--path"];
 const ARG_FLAGS: &[&str] = &["-arg", "--args", "-c", "-com", "--com"];
 const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
 const SEPARATORS: &[&str] = &["--", ":", "->", "|"];
+
+/// Динамическое сканирование директорий модулей Grime на диске
+pub fn discover_available_modules() -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut search_dirs = Vec::new();
+    search_dirs.push(PathBuf::from("modules"));
+    if let Some(home) = crate::fs_ops::get_cached_home_dir() {
+        search_dirs.push(home.join(".config").join("grime").join("modules"));
+        search_dirs.push(home.join("dotfiles").join("grime").join("modules"));
+    }
+
+    for dir in search_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("lua") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let name = stem.to_string();
+                        if !modules.contains(&name) {
+                            modules.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    modules
+}
 
 pub fn canonical_module_name(name: &str) -> String {
     let lower = name.to_lowercase();
@@ -35,11 +59,14 @@ pub fn canonical_module_name(name: &str) -> String {
         _ => lower,
     };
 
-    if STANDARD_MODULES.contains(&alias_resolved.as_str()) {
+    let available = discover_available_modules();
+    let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+
+    if available_refs.contains(&alias_resolved.as_str()) {
         return alias_resolved;
     }
 
-    if let Some(matched) = crate::args::fuzzy_match_entity(&alias_resolved, STANDARD_MODULES, 0.75) {
+    if let Some(matched) = crate::args::fuzzy_match_entity(&alias_resolved, &available_refs, 0.75) {
         return matched.to_string();
     }
 

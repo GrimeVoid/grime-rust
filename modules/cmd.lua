@@ -79,6 +79,19 @@ function main()
         table.insert(cmd, a)
     end
 
+    local check_which = ctx.capture("which " .. program)
+    if check_which.code ~= 0 then
+        if ctx.exists(base_dir .. "/shell.nix") then
+            local flat_sub = {}
+            for _, t in ipairs(cmd) do table.insert(flat_sub, string.format("%q", t)) end
+            cmd = { "nix-shell", "--run", table.concat(flat_sub, " ") }
+        elseif ctx.exists(base_dir .. "/flake.nix") then
+            local flat_sub = {}
+            for _, t in ipairs(cmd) do table.insert(flat_sub, string.format("%q", t)) end
+            cmd = { "nix", "develop", "--command", "sh", "-c", table.concat(flat_sub, " ") }
+        end
+    end
+
     local is_interactive_target = (program == "nvim" or program == "vim" or program == "nano" or program == "yazi" or program == "fzf" or program == "aider")
     local should_stream = (input ~= nil and #input > 0) or ctx.has_next_step
 

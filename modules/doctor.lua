@@ -1,19 +1,34 @@
+-- Summary: Комплексная диагностика системного окружения, путей и журнала сбоев
+-- Описание: Проверка утилит, каталогов конфигурации, состояния логов и недавних ошибок системы
+
 local ctx = grime.ctx
+local log = require("log")
+
+local ANSI = {
+    BOLD = "\27[1m",
+    RESET = "\27[0m",
+    GREEN = "\27[32m",
+    YELLOW = "\27[33m",
+    RED = "\27[31m",
+    CYAN = "\27[36m",
+    DIM = "\27[90m",
+}
 
 local function print_help()
     print(string.format([[
-%s%sGrime Doctor%s — Диагностика системного окружения, путей и зависимостей Grime
+%s%sGrime Doctor%s — Диагностика системного окружения, путей, зависимостей и журнала сбоев
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime doctor [help|-h|--help]
 
 %sОПИСАНИЕ:%s
     Проверяет доступность ключевых утилит (git, nix, distrobox, aider, cargo),
-    корректность путей в реестре конфигурации и статус сервисов.
+    корректность путей в реестре конфигурации, статус журнала логов и
+    отображает недавние ошибки и сбои из централизованного хранилища StateBus.
 ]],
-    "\27[1m", "\27[32m", "\27[0m",
-    "\27[1m", "\27[0m",
-    "\27[1m", "\27[0m"
+    ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET
     ))
 end
 
@@ -25,7 +40,7 @@ function main()
         end
     end
 
-    grime.ui.log("Запуск диагностики окружения Grime Doctor...")
+    grime.ui.log("Запуск комплексной диагностики окружения Grime Doctor...")
 
     local checks = {
         { name = "git", category = "Инструменты" },
@@ -49,11 +64,16 @@ function main()
     end
 
     -- Проверка путей реестра
+    local cfg_dir = ctx.config_dir()
+    local log_dir = cfg_dir .. "/logs"
+    local log_file = log_dir .. "/grime.jsonl"
+
     local paths_to_check = {
-        { name = "Конфигурация", path = ctx.config_dir() },
+        { name = "Конфигурация", path = cfg_dir },
         { name = "Проекты", path = ctx.projects_root() },
         { name = "Шаблоны", path = ctx.templates_root() },
         { name = "Приложения", path = ctx.apps_root() },
+        { name = "Журнал логов", path = log_dir },
     }
 
     for _, p in ipairs(paths_to_check) do
@@ -62,15 +82,45 @@ function main()
         table.insert(rows, { "Каталог", p.name, status, p.path })
     end
 
-    -- Печать отчета через grime.ui.print_table
+    -- Печать отчета компонентов через grime.ui.print_table
     local headers = { "Категория", "Компонент", "Статус", "Путь" }
+    print()
     grime.ui.print_table(rows, headers)
+    print()
 
-    if all_ok then
-        grime.ui.success("Диагностика Grime Doctor завершена успешно: критические компоненты в порядке!")
-        ctx.success("doctor_ok")
+    -- Проверка состояния подсистемы логов и недавних ошибок
+    local recent_errors = log.get_errors(5)
+    local log_exists = ctx.exists(log_file)
+    local history = log.get_history(100)
+
+    print(string.format("%sСостояние подсистемы логирования и здоровья системы:%s", ANSI.BOLD, ANSI.RESET))
+    print(string.format("  • Файл логов: %s (%s)", log_file, log_exists and (ANSI.GREEN .. "Активен" .. ANSI.RESET) or (ANSI.YELLOW .. "Не создан" .. ANSI.RESET)))
+    print(string.format("  • Записей в истории: %d", #history))
+    print(string.format("  • Зафиксировано ошибок/сбоев: %s%d%s", #recent_errors > 0 and ANSI.RED or ANSI.GREEN, #recent_errors, ANSI.RESET))
+
+    if #recent_errors > 0 then
+        print(string.format("\n%sПоследние недавние сбои в системе (StateBus):%s", ANSI.RED .. ANSI.BOLD, ANSI.RESET))
+        for i, err_item in ipairs(recent_errors) do
+            local ts = err_item.timestamp or "-"
+            if #ts > 19 then ts = ts:sub(1, 19):gsub("T", " ") end
+            print(string.format("  %d. [%s] [%s] %s: %s", i, ts, err_item.level or "ERROR", err_item.source or "unknown", err_item.message or ""))
+        end
+        print()
     else
-        grime.ui.warn("Обнаружены отсутствующие компоненты. Рекомендуется установить недостающие утилиты.")
+        print(string.format("  • Недавние системные сбои: %sотсутствуют (система стабильна)%s\n", ANSI.GREEN, ANSI.RESET))
+    end
+
+    if all_ok and #recent_errors == 0 then
+        grime.ui.success("Диагностика Grime Doctor завершена: окружение и журнал ошибок в идеальном порядке!")
+        log.info("Диагностика Doctor завершена успешно: все компоненты в порядке", "doctor")
+        ctx.success("doctor_ok")
+    elseif all_ok and #recent_errors > 0 then
+        grime.ui.warn(string.format("Диагностика компонентов пройдена, но в журнале зафиксировано %d сбоев.", #recent_errors))
+        log.warn(string.format("Диагностика Doctor: обнаружены недавние сбои (%d)", #recent_errors), "doctor")
+        ctx.success("doctor_with_errors")
+    else
+        grime.ui.warn("Обнаружены отсутствующие критические компоненты. Рекомендуется установить недостающие утилиты.")
+        log.warn("Диагностика Doctor: отсутствуют критические компоненты", "doctor")
         ctx.success("doctor_warnings")
     end
 end

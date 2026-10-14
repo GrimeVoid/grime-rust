@@ -51,7 +51,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
 
     let path_flags: HashSet<&str> = ["-p", "-path", "--path"].into_iter().collect();
     let arg_flags: HashSet<&str> = [
-        "-a", "-arg", "--args", "-c", "-com", "--com",
+        "-arg", "--args", "-c", "-com", "--com",
     ]
     .into_iter()
     .collect();

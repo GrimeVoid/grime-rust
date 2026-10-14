@@ -180,10 +180,11 @@ local function resolve_manager(query)
 end
 
 -- Сбор пакетов: pacman
-local function get_pacman_packages()
+local function get_pacman_packages(all_mode)
     if not has_binary("pacman") then return nil, "pacman не установлен" end
-    local res = ctx.capture({ "pacman", "-Qe" })
-    if res.code ~= 0 then return nil, "Ошибка выполнения pacman -Qe" end
+    local q_flag = all_mode and "-Q" or "-Qe"
+    local res = ctx.capture({ "pacman", q_flag })
+    if res.code ~= 0 then return nil, "Ошибка выполнения pacman " .. q_flag end
     local list = {}
     for line in res.stdout:gmatch("[^\r\n]+") do
         local name, ver = line:match("^(%S+)%s+(%S+)")
@@ -195,9 +196,14 @@ local function get_pacman_packages()
 end
 
 -- Сбор пакетов: flatpak
-local function get_flatpak_packages()
+local function get_flatpak_packages(all_mode)
     if not has_binary("flatpak") then return nil, "flatpak не установлен" end
-    local res = ctx.capture({ "flatpak", "list", "--app", "--columns=name,application,version" })
+    local args = { "flatpak", "list" }
+    if not all_mode then
+        table.insert(args, "--app")
+    end
+    table.insert(args, "--columns=name,application,version")
+    local res = ctx.capture(args)
     if res.code ~= 0 then return nil, "Ошибка выполнения flatpak list" end
     local list = {}
     for line in res.stdout:gmatch("[^\r\n]+") do
@@ -217,43 +223,87 @@ local function get_flatpak_packages()
 end
 
 -- Сбор пакетов: nix
-local function get_nix_packages()
+local function get_nix_packages(all_mode)
     if not has_binary("nix") then return nil, "nix не установлен" end
-    local res = ctx.capture({ "nix", "profile", "list" })
-    if res.code ~= 0 then return nil, "Ошибка выполнения nix profile list" end
-    local list = {}
-    local current = nil
-    for line in res.stdout:gmatch("[^\r\n]+") do
-        local key, val = line:match("^([^:]+):%s*(.*)$")
-        if key and val then
-            key = key:match("^%s*(.-)%s*$")
-            val = val:match("^%s*(.-)%s*$")
-            if key == "Name" or key:match("^Index%s*%d+") then
-                if current and current.name then
-                    table.insert(list, current)
-                end
-                current = { name = val, version = "", details = "", path = "" }
-            elseif current then
-                if key == "Flake attribute" then
-                    current.details = val
-                    if not current.name or current.name == "" then
-                        current.name = val:match("packages%S+%.(%S+)") or val:match("legacyPackages%S+%.(%S+)") or val
+    if not all_mode then
+        local res = ctx.capture({ "nix", "profile", "list" })
+        if res.code ~= 0 then return nil, "Ошибка выполнения nix profile list" end
+        local list = {}
+        local current = nil
+        for line in res.stdout:gmatch("[^\r\n]+") do
+            local key, val = line:match("^([^:]+):%s*(.*)$")
+            if key and val then
+                key = key:match("^%s*(.-)%s*$")
+                val = val:match("^%s*(.-)%s*$")
+                if key == "Name" or key:match("^Index%s*%d+") then
+                    if current and current.name then
+                        table.insert(list, current)
                     end
-                elseif key == "Store paths" then
-                    current.path = val
-                    local v = val:match("%-(%d+%.?[%d%.%-_]*)") or val:match("%-(%d+)")
-                    if v then
-                        v = v:gsub("%-man$", ""):gsub("%-bin$", ""):gsub("%-+$", "")
-                        current.version = v
+                    current = { name = val, version = "", details = "", path = "" }
+                elseif current then
+                    if key == "Flake attribute" then
+                        current.details = val
+                        if not current.name or current.name == "" then
+                            current.name = val:match("packages%S+%.(%S+)") or val:match("legacyPackages%S+%.(%S+)") or val
+                        end
+                    elseif key == "Store paths" then
+                        current.path = val
+                        local v = val:match("%-(%d+%.?[%d%.%-_]*)") or val:match("%-(%d+)")
+                        if v then
+                            v = v:gsub("%-man$", ""):gsub("%-bin$", ""):gsub("%-+$", "")
+                            current.version = v
+                        end
                     end
                 end
             end
         end
+        if current and current.name then
+            table.insert(list, current)
+        end
+        return list
+    else
+        -- all_mode: все замыкания/зависимости профиля
+        local profile_path = (os.getenv("HOME") or "") .. "/.nix-profile"
+        local res = ctx.capture({ "nix", "path-info", "-r", profile_path })
+        if res.code ~= 0 or not res.stdout or res.stdout:match("%S") == nil then
+            res = ctx.capture({ "nix-store", "-qR", profile_path })
+        end
+        if res.code ~= 0 or not res.stdout then
+            return nil, "Ошибка получения зависимостей nix profile"
+        end
+        local list = {}
+        local seen = {}
+        for line in res.stdout:gmatch("[^\r\n]+") do
+            local p = line:match("^%s*(.-)%s*$")
+            if p ~= "" and not seen[p] then
+                seen[p] = true
+                local store_base = p:match("^/nix/store/[0-9a-z]+%-(.+)$") or p:match("^/nix/store/(.+)$") or p
+                local base_nosuffix, suffix = store_base:match("^(.-)%-(%a+)$")
+                local name, ver
+                if base_nosuffix then
+                    name, ver = base_nosuffix:match("^(.-)%-(%d+[%d%.%-_]*)$")
+                    if name and ver then
+                        ver = ver .. " (" .. suffix .. ")"
+                    end
+                end
+                if not name then
+                    name, ver = store_base:match("^(.-)%-(%d+[%d%.%-_]*)$")
+                end
+                if not name then
+                    name = store_base
+                    ver = ""
+                end
+                table.insert(list, {
+                    name = name,
+                    version = ver or "",
+                    details = "замыкание nix-profile",
+                    path = p
+                })
+            end
+        end
+        table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+        return list
     end
-    if current and current.name then
-        table.insert(list, current)
-    end
-    return list
 end
 
 -- Определение активного контейнера Distrobox
@@ -286,10 +336,22 @@ local function get_distrobox_target()
 end
 
 -- Сбор пакетов: distrobox
-local function get_distrobox_packages(box_name)
+local function get_distrobox_packages(box_name, all_mode)
     box_name = box_name or get_distrobox_target()
     if not box_name then return nil, "Контейнер distrobox не найден" end
-    local qcmd = 'rpm -qa --qf "%{NAME} %{VERSION}-%{RELEASE}\n" 2>/dev/null || pacman -Q 2>/dev/null || dpkg-query -f "${Package} ${Version}\n" -W 2>/dev/null'
+    local qcmd
+    if not all_mode then
+        -- По умолчанию: только установленные пользователем пакеты
+        qcmd = 'dnf -C repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null || ' ..
+               'dnf repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null || ' ..
+               'pacman -Qe 2>/dev/null || ' ..
+               '(apt-mark showmanual 2>/dev/null)'
+    else
+        -- Если флаг -a / --all: все установленные пакеты
+        qcmd = 'rpm -qa --qf "%{NAME} %{VERSION}-%{RELEASE}\n" 2>/dev/null || ' ..
+               'pacman -Q 2>/dev/null || ' ..
+               'dpkg-query -f "${Package} ${Version}\n" -W 2>/dev/null'
+    end
     local res = ctx.capture({ "distrobox", "enter", box_name, "--", "sh", "-c", qcmd })
     if res.code ~= 0 or not res.stdout then return nil, "Ошибка получения пакетов из " .. box_name end
     local list = {}
@@ -309,7 +371,7 @@ local function get_distrobox_packages(box_name)
 end
 
 -- Сбор пакетов: apps
-local function get_apps_packages()
+local function get_apps_packages(_all_mode)
     local apps_root = get_apps_root()
     if not ctx.exists(apps_root) then return {} end
     local list = {}
@@ -348,7 +410,7 @@ local function get_apps_packages()
 end
 
 -- Сбор пакетов: cargo
-local function get_cargo_packages()
+local function get_cargo_packages(_all_mode)
     if not has_binary("cargo") then return nil, "cargo не установлен" end
     local res = ctx.capture({ "cargo", "install", "--list" })
     if res.code ~= 0 then return nil, "Ошибка выполнения cargo install --list" end
@@ -366,7 +428,7 @@ local function get_cargo_packages()
 end
 
 -- Сбор пакетов: pipx
-local function get_pipx_packages()
+local function get_pipx_packages(_all_mode)
     if not has_binary("pipx") then return nil, "pipx не установлен" end
     local res = ctx.capture({ "pipx", "list", "--short" })
     if res.code ~= 0 then return nil, "Ошибка выполнения pipx list" end
@@ -381,28 +443,29 @@ local function get_pipx_packages()
 end
 
 -- Обобщенный диспетчер получения пакетов
-local function get_packages_for_manager(mgr)
+local function get_packages_for_manager(mgr, all_mode)
     if mgr == "pacman" then
-        return get_pacman_packages()
+        return get_pacman_packages(all_mode)
     elseif mgr == "flatpak" then
-        return get_flatpak_packages()
+        return get_flatpak_packages(all_mode)
     elseif mgr == "nix" then
-        return get_nix_packages()
+        return get_nix_packages(all_mode)
     elseif mgr == "distrobox" then
-        return get_distrobox_packages()
+        return get_distrobox_packages(nil, all_mode)
     elseif mgr == "apps" or mgr == "app" then
-        return get_apps_packages()
+        return get_apps_packages(all_mode)
     elseif mgr == "cargo" then
-        return get_cargo_packages()
+        return get_cargo_packages(all_mode)
     elseif mgr == "pipx" then
-        return get_pipx_packages()
+        return get_pipx_packages(all_mode)
     end
     return nil, "Неизвестный менеджер: " .. tostring(mgr)
 end
 
 -- 1. Сводная таблица активных пакетных менеджеров
-local function handle_summary()
-    io.stdout:write("\n\27[1m📦 Обзор активных пакетных менеджеров системы:\27[0m\n")
+local function handle_summary(all_mode)
+    local mode_badge = all_mode and "\27[33m[ВСЕ ПАКЕТЫ И ЗАВИСИМОСТИ]\27[0m" or "\27[32m[ПОЛЬЗОВАТЕЛЬСКИЕ]\27[0m"
+    io.stdout:write(string.format("\n\27[1m📦 Обзор активных пакетных менеджеров системы %s:\27[0m\n", mode_badge))
     io.stdout:write(string.rep("─", 80) .. "\n")
     io.stdout:write(string.format("  \27[1m%s %s %s %s\27[0m\n",
         pad_utf8("МЕНЕДЖЕР", 24),
@@ -431,7 +494,7 @@ local function handle_summary()
             status_raw = "Не установлен"
             status_color = "\27[90m"
         else
-            local pkgs, extra = get_packages_for_manager(mgr)
+            local pkgs, extra = get_packages_for_manager(mgr, all_mode)
             if pkgs then
                 active_count = active_count + 1
                 local count = #pkgs
@@ -463,14 +526,19 @@ local function handle_summary()
 
     io.stdout:write(string.rep("─", 80) .. "\n")
     io.stdout:write("\27[90mПодсказки:\27[0m\n")
-    io.stdout:write("  • Список пакетов менеджера : \27[36mgrime pkg <менеджер>\27[0m (например: \27[36mgrime pkg pacman\27[0m, \27[36mgrime pkg box\27[0m)\n")
-    io.stdout:write("  • Сквозной поиск пакета    : \27[36mgrime pkg <имя_пакета>\27[0m (например: \27[36mgrime pkg git\27[0m, \27[36mgrime pkg nvim\27[0m)\n")
-    io.stdout:write("  • Подробная справка        : \27[36mgrime pkg --help\27[0m\n\n")
+    if not all_mode then
+        io.stdout:write("  • Показать вообще все пакеты/зависимости : \27[36mgrime pkg -a\27[0m (или \27[36mgrime pkg --all\27[0m)\n")
+    else
+        io.stdout:write("  • Показать только пользовательские пакеты : \27[36mgrime pkg\27[0m\n")
+    end
+    io.stdout:write("  • Список пакетов менеджера               : \27[36mgrime pkg <менеджер> [-a]\27[0m (например: \27[36mgrime pkg pacman\27[0m, \27[36mgrime pkg box -a\27[0m)\n")
+    io.stdout:write("  • Сквозной поиск пакета                  : \27[36mgrime pkg <имя_пакета> [-a]\27[0m (например: \27[36mgrime pkg git\27[0m, \27[36mgrime pkg nvim -a\27[0m)\n")
+    io.stdout:write("  • Подробная справка                      : \27[36mgrime pkg --help\27[0m\n\n")
 end
 
 -- 2. Детальный список установленных пакетов для указанного менеджера
-local function handle_detailed_list(mgr, filter_tokens)
-    local pkgs, err = get_packages_for_manager(mgr)
+local function handle_detailed_list(mgr, filter_tokens, all_mode)
+    local pkgs, err = get_packages_for_manager(mgr, all_mode)
     if not pkgs then
         io.stdout:write(string.format("\n\27[31m❌ Не удалось получить пакеты для %s: %s\27[0m\n\n", mgr, tostring(err)))
         return
@@ -501,10 +569,11 @@ local function handle_detailed_list(mgr, filter_tokens)
     local count_total = #pkgs
     local count_matched = #display_pkgs
     local title_extra = ""
+    local mode_desc = all_mode and "все пакеты/зависимости" or "пользовательские"
     if filter_query and filter_query ~= "" then
-        title_extra = string.format(" [фильтр: '%s', найдено %d из %d]", filter_query, count_matched, count_total)
+        title_extra = string.format(" [%s, фильтр: '%s', найдено %d из %d]", mode_desc, filter_query, count_matched, count_total)
     else
-        title_extra = string.format(" [всего: %d пакетов]", count_total)
+        title_extra = string.format(" [%s, всего: %d]", mode_desc, count_total)
     end
 
     io.stdout:write(string.format("\n\27[1m📦 Пакетный менеджер: \27[32m%s\27[0m%s:\27[0m\n", mgr, title_extra))
@@ -536,18 +605,23 @@ local function handle_detailed_list(mgr, filter_tokens)
     end
 
     io.stdout:write(string.rep("─", 80) .. "\n")
-    io.stdout:write(string.format("\27[90mПоказано: %d пакетов. Для запуска: grime pkg run <имя>\27[0m\n\n", count_matched))
+    local hint_all = ""
+    if not all_mode then
+        hint_all = string.format(" Для отображения всех зависимостей: grime pkg %s -a.", mgr)
+    end
+    io.stdout:write(string.format("\27[90mПоказано: %d пакетов.%s Для запуска: grime pkg run <имя>\27[0m\n\n", count_matched, hint_all))
 end
 
 -- 3. Сквозной нечеткий поиск пакета по всем менеджерам
-local function handle_search(query_tokens)
+local function handle_search(query_tokens, all_mode)
     if not query_tokens or #query_tokens == 0 then
         ctx.fail("Укажите поисковый запрос (например: grime pkg search git)")
         return
     end
 
     local query = table.concat(query_tokens, " ")
-    io.stdout:write(string.format("\n\27[1m🔍 Сквозной нечеткий поиск пакета '\27[33m%s\27[0m\27[1m' по всем менеджерам:\27[0m\n", query))
+    local mode_label = all_mode and "\27[33m[ВСЕ ПАКЕТЫ И ЗАВИСИМОСТИ]\27[0m" or "\27[32m[ПОЛЬЗОВАТЕЛЬСКИЕ]\27[0m"
+    io.stdout:write(string.format("\n\27[1m🔍 Сквозной нечеткий поиск пакета '\27[33m%s\27[0m\27[1m' %s:\27[0m\n", query, mode_label))
     io.stdout:write(string.rep("─", 80) .. "\n")
 
     local managers = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
@@ -562,7 +636,7 @@ local function handle_search(query_tokens)
         end
 
         if is_installed then
-            local pkgs, extra = get_packages_for_manager(mgr)
+            local pkgs, extra = get_packages_for_manager(mgr, all_mode)
             if pkgs and #pkgs > 0 then
                 local matches = {}
                 for _, pkg in ipairs(pkgs) do
@@ -609,9 +683,17 @@ local function handle_search(query_tokens)
 
     io.stdout:write("\n" .. string.rep("─", 80) .. "\n")
     if total_found == 0 then
-        io.stdout:write(string.format("  \27[31m❌ Пакеты по запросу '%s' не найдены ни в одном из активных менеджеров.\27[0m\n\n", query))
+        io.stdout:write(string.format("  \27[31m❌ Пакеты по запросу '%s' не найдены ни в одном из активных менеджеров.\27[0m\n", query))
+        if not all_mode then
+            io.stdout:write(string.format("  \27[90mПопробуйте повторить поиск со всеми пакетами и зависимостями: grime pkg %s -a\27[0m\n", query))
+        end
+        io.stdout:write("\n")
     else
-        io.stdout:write(string.format("\27[32m✔ Найдено совпадений: %d в %d менеджерах.\27[0m\n\n", total_found, managers_found))
+        io.stdout:write(string.format("\27[32m✔ Найдено совпадений: %d в %d менеджерах.\27[0m\n", total_found, managers_found))
+        if not all_mode then
+            io.stdout:write("  \27[90m(Поиск только среди пользовательских пакетов. Для поиска по всем зависимостям добавьте -a)\27[0m\n")
+        end
+        io.stdout:write("\n")
     end
 end
 
@@ -742,36 +824,43 @@ local function print_help()
 %s%sGrime Pkg%s — Унифицированное управление пакетами хоста, контейнеров и окружений
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime pkg                               # Сводная таблица активных пакетных менеджеров
-    grime pkg <менеджер> [фильтр]           # Список пакетов менеджера (поддерживает нечеткие имена)
-    grime pkg <пакет>                       # Сквозной нечеткий поиск пакета по всем менеджерам
-    grime pkg search <запрос>               # Явный сквозной нечеткий поиск
+    grime pkg [-a, --all]                   # Сводная таблица (по умолчанию: пользовательские пакеты; -a: все пакеты)
+    grime pkg <менеджер> [-a] [фильтр]      # Список пакетов менеджера (по умолчанию: пользовательские; -a: все)
+    grime pkg <пакет> [-a]                  # Сквозной нечеткий поиск пакета (по умолчанию: пользовательские; -a: все)
+    grime pkg search <запрос> [-a]          # Явный сквозной нечеткий поиск
     grime pkg install <менеджер> <пакеты...># Установка пакетов через выбранный менеджер
     grime pkg run <пакет_или_приложение>    # Изолированный запуск приложения или пакета
     grime pkg help, -h, --help              # Показать эту справку
 
+%sФЛАГИ:%s
+    -a, --all, --deps                       # Выводить или искать среди ВСЕХ пакетов и зависимостей системы
+                                            # (по умолчанию отображаются только явно установленные пользователем)
+
 %sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ (и их нечеткие алиасы):%s
-    • pacman    (pac, arch)
-    • flatpak   (flat, flt, fp)
-    • nix       (nixpkgs, nx)
-    • distrobox (box, dbox, dist, distro)
-    • apps      (app, applications)
-    • cargo     (crg, rust)
-    • pipx      (pip, python)
+    • pacman    (pac, arch)                 # Pacman: pacman -Qe (по умолчанию) vs pacman -Q (-a)
+    • flatpak   (flat, flt, fp)             # Flatpak: только приложения (по умолчанию) vs с runtime (-a)
+    • nix       (nixpkgs, nx)               # Nix: nix profile (по умолчанию) vs все замыкания (-a)
+    • distrobox (box, dbox, dist, distro)   # Distrobox: dnf userinstalled (по умолчанию) vs rpm -qa (-a)
+    • apps      (app, applications)         # Локальные приложения grime (~/.config/grime/apps)
+    • cargo     (crg, rust)                 # Cargo: cargo install --list
+    • pipx      (pip, python)               # Pipx: pipx list --short
 
 %sПРИМЕРЫ:%s
-    grime pkg                               # Сводная таблица всех пакетных менеджеров
-    grime pkg pacman                        # Список всех пакетов pacman
-    grime pkg pac                           # Список пакетов pacman (через нечеткое имя)
-    grime pkg flat                          # Список установленных Flatpak-приложений
-    grime pkg box                           # Список пакетов внутри контейнера Distrobox
-    grime pkg pac alsa                      # Фильтрация пакетов alsa в pacman
-    grime pkg git                           # Сквозной нечеткий поиск 'git' по всем пакетникам
-    grime pkg search nvim                   # Сквозной поиск Neovim во всех менеджерах
+    grime pkg                               # Сводная таблица пользовательских пакетов
+    grime pkg -a                            # Сводная таблица ВСЕХ пакетов хоста и контейнеров
+    grime pkg pacman                        # Список пакетов, явно установленных в pacman
+    grime pkg pacman -a                     # Список всех пакетов pacman (включая зависимости)
+    grime pkg box                           # Пользовательские пакеты в Distrobox (dnf userinstalled)
+    grime pkg box -a                        # Все RPM-пакеты контейнера Distrobox (rpm -qa)
+    grime pkg flat                          # Установленные Flatpak-приложения
+    grime pkg flat -a                       # Все Flatpak пакеты (приложения + runtime + платформы)
+    grime pkg git                           # Сквозной поиск 'git' среди пользовательских пакетов
+    grime pkg git -a                        # Сквозной поиск 'git' по всем пакетам и зависимостям
     grime pkg install pac ripgrep           # Установка ripgrep через pacman
     grime pkg run htop                      # Изолированный запуск через nix-shell
 ]],
     "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m"
@@ -800,16 +889,26 @@ function main()
         return
     end
 
+    local all_mode = (parsed.flags and parsed.flags.all == true) or false
+
     local raw_tokens = {}
     for _, tok in ipairs(parsed.args) do
-        table.insert(raw_tokens, tok)
+        if tok == "-a" or tok == "--all" or tok == "--deps" then
+            all_mode = true
+        else
+            table.insert(raw_tokens, tok)
+        end
     end
     for _, t in ipairs(parsed.command_tokens) do
-        table.insert(raw_tokens, t)
+        if t == "-a" or t == "--all" or t == "--deps" then
+            all_mode = true
+        else
+            table.insert(raw_tokens, t)
+        end
     end
 
     if action == "search" then
-        handle_search(raw_tokens)
+        handle_search(raw_tokens, all_mode)
         return
     end
 
@@ -839,8 +938,8 @@ function main()
 
     -- Обработка действия list / вызова без аргументов / вызова по имени менеджера или поиску пакета
     if #raw_tokens == 0 then
-        -- Вызов grime pkg или grime pkg list без аргументов -> сводная таблица
-        handle_summary()
+        -- Вызов grime pkg или grime pkg -a / grime pkg list без аргументов -> сводная таблица
+        handle_summary(all_mode)
         if ctx.has_next_step then
             ctx.module_return(ctx.target_dir)
         end
@@ -854,10 +953,10 @@ function main()
     if resolved_mgr then
         -- Первый аргумент — менеджер пакетов (например: grime pkg pacman, grime pkg box, grime pkg flat)
         table.remove(raw_tokens, 1)
-        handle_detailed_list(resolved_mgr, raw_tokens)
+        handle_detailed_list(resolved_mgr, raw_tokens, all_mode)
     else
         -- Первый аргумент не совпал с менеджером — выполняем сквозной нечеткий поиск пакета
-        handle_search(raw_tokens)
+        handle_search(raw_tokens, all_mode)
     end
 
     if ctx.has_next_step then

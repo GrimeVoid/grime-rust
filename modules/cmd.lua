@@ -79,12 +79,33 @@ function main()
         table.insert(cmd, a)
     end
 
-    ctx.log("Запуск: " .. table.concat(cmd, " ") .. " (директория: " .. base_dir .. ")")
-    local ret = ctx.run_process(cmd, base_dir)
+    local is_interactive_target = (program == "nvim" or program == "vim" or program == "nano" or program == "yazi" or program == "fzf" or program == "aider")
+    local should_stream = (input ~= nil and #input > 0) or ctx.has_next_step
 
-    if ret == 0 then
-        ctx.success(base_dir)
+    if should_stream and not is_interactive_target then
+        local stdin_data = input
+        if stdin_data and #stdin_data > 0 and not stdin_data:match("\n$") then
+            stdin_data = stdin_data .. "\n"
+        end
+        local res = ctx.capture(cmd, base_dir, nil, stdin_data)
+        if res.code == 0 then
+            local trimmed_out = grime.str.trim(res.stdout or "")
+            ctx.module_return(trimmed_out)
+        else
+            local err_msg = res.stderr and grime.str.trim(res.stderr) or ""
+            if #err_msg == 0 then
+                err_msg = string.format("Программа '%s' завершилась с кодом %d", program, res.code)
+            end
+            ctx.fail(err_msg)
+        end
     else
-        ctx.fail("Программа '" .. program .. "' завершилась с кодом " .. tostring(ret))
+        ctx.log("Запуск: " .. table.concat(cmd, " ") .. " (директория: " .. base_dir .. ")")
+        local ret = ctx.run_interactive(cmd, base_dir)
+
+        if ret == 0 then
+            ctx.success(base_dir)
+        else
+            ctx.fail("Программа '" .. program .. "' завершилась с кодом " .. tostring(ret))
+        end
     end
 end

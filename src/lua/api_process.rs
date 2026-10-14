@@ -59,23 +59,24 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
         })?,
     )?;
 
-    // grime.process.capture(cmd, cwd, env) -> { code = ..., stdout = ..., stderr = ... }
+    // grime.process.capture(cmd, cwd, env, stdin_input) -> { code = ..., stdout = ..., stderr = ... }
     proc_tbl.set(
         "capture",
-        lua.create_function(|lua, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+        lua.create_function(|lua, (cmd, cwd, env, stdin_input): (Value, Option<String>, Option<HashMap<String, String>>, Option<String>)| {
             let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            let stdin_ref = stdin_input.as_deref();
             let res = match cmd {
                 Value::String(s) => {
                     let cmd_str = s.to_str()?;
                     let parts = vec!["sh".to_string(), "-c".to_string(), cmd_str.to_string()];
-                    capture_command(&parts, &cwd_path, env.as_ref())
+                    capture_command(&parts, &cwd_path, env.as_ref(), stdin_ref)
                 }
                 Value::Table(tbl) => {
                     let mut args = Vec::new();
                     for item in tbl.sequence_values::<String>() {
                         args.push(item?);
                     }
-                    capture_command(&args, &cwd_path, env.as_ref())
+                    capture_command(&args, &cwd_path, env.as_ref(), stdin_ref)
                 }
                 _ => return Err(mlua::Error::runtime("Ожидалась строка или таблица аргументов команды")),
             };

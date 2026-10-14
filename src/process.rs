@@ -67,6 +67,7 @@ pub fn capture_command(
     cmd: &[String],
     cwd: &Path,
     env: Option<&HashMap<String, String>>,
+    stdin_input: Option<&str>,
 ) -> ProcessCaptureResult {
     if cmd.is_empty() {
         return ProcessCaptureResult {
@@ -84,14 +85,39 @@ pub fn capture_command(
     if let Some(envs) = env {
         command.envs(envs);
     }
-    command.stdin(Stdio::null());
 
-    match command.output() {
-        Ok(out) => ProcessCaptureResult {
-            exit_code: out.status.code().unwrap_or(0),
-            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-        },
+    if stdin_input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    match command.spawn() {
+        Ok(mut child) => {
+            if let Some(data) = stdin_input {
+                if let Some(mut sin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = sin.write_all(data.as_bytes());
+                    let _ = sin.flush();
+                    drop(sin);
+                }
+            }
+
+            match child.wait_with_output() {
+                Ok(out) => ProcessCaptureResult {
+                    exit_code: out.status.code().unwrap_or(0),
+                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                },
+                Err(e) => ProcessCaptureResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("Ошибка ожидания процесса: {}", e),
+                },
+            }
+        }
         Err(e) => ProcessCaptureResult {
             exit_code: 1,
             stdout: String::new(),

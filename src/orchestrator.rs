@@ -7,7 +7,7 @@ use crate::config::GrimeConfig;
 use crate::event_bus::EventBus;
 use crate::lua_engine::GrimeLuaEngine;
 use crate::payload::PipelinePayload;
-use crate::pipeline::{canonical_module_name, is_host_step, ParsedPipeline};
+use crate::pipeline::{canonical_module_name, ParsedPipeline};
 use crate::preflight::PreflightInspector;
 use crate::state_bus::StateBus;
 
@@ -125,12 +125,6 @@ impl Orchestrator {
 
             let step = &steps[step_idx];
             let mod_name = canonical_module_name(&step.module);
-
-            // Если шаг хоста — no-op
-            if is_host_step(&mod_name) {
-                step_idx += 1;
-                continue;
-            }
 
             // Выполнение шага Lua модуля: авто-определение рабочей директории из выхода прошлого шага
             if let Some(ref data) = pipeline_data {

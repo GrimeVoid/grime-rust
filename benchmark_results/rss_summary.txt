@@ -1,0 +1,4 @@
+Rust CLI (--help): 3800 KB
+Python CLI (--help): 23248 KB
+Rust 5-step pipeline: 5120 KB
+Python 5-step pipeline: 24448 KB

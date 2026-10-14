@@ -59,7 +59,6 @@ function main()
             ctx.success(nil)
         else
             local out = type(val) == "table" and grime.json.encode(val) or tostring(val)
-            print(out)
             ctx.success(out)
         end
     elseif action == "set" then
@@ -97,7 +96,6 @@ function main()
             ctx.fail("Не удалось проверить ключ '" .. key .. "' в шине: " .. tostring(exists))
             return
         end
-        print(tostring(exists))
         ctx.success(tostring(exists))
     elseif action == "emit" then
         if not (grime and grime.events) then

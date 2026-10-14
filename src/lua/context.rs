@@ -223,14 +223,14 @@ pub fn init_context_table(
     ctx_tbl.set(
         "capture",
         lua.create_function(
-            |lua_ctx, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+            |lua_ctx, (cmd, cwd, env, stdin_input): (Value, Option<String>, Option<HashMap<String, String>>, Option<String>)| {
                 let globals = lua_ctx.globals();
                 let g: Table = globals.get("grime")?;
                 let c: Table = g.get("ctx")?;
                 let proc_tbl: Table = g.get("process")?;
                 let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
                 let cap_fn: mlua::Function = proc_tbl.get("capture")?;
-                cap_fn.call::<Value>((cmd, effective_cwd, env))
+                cap_fn.call::<Value>((cmd, effective_cwd, env, stdin_input))
             },
         )?,
     )?;

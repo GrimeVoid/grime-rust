@@ -140,5 +140,13 @@ function main()
     local headers = { "Модуль", "Статус", "Описание", "Путь к файлу" }
     grime.ui.print_table(rows, headers)
 
-    ctx.done(true, tostring(#rows))
+    if ctx.has_next_step then
+        local lines = {}
+        for _, r in ipairs(rows) do
+            table.insert(lines, string.format("%-12s %s", r[1], r[3]))
+        end
+        ctx.done(true, table.concat(lines, "\n"))
+    else
+        ctx.done(true, tostring(#rows))
+    end
 end

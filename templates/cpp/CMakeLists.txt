@@ -1,10 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Автоматическое имя проекта по названию текущей папки, если не задано явно
-get_filename_component(DEFAULT_PROJECT_NAME "${CMAKE_CURRENT_SOURCE_DIR}" NAME)
-project(${DEFAULT_PROJECT_NAME} CXX C)
+# Имя проекта с поддержкой плейсхолдера или имени каталога
+project({{PROJECT_NAME}} LANGUAGES CXX C)
 
-# Стандарт C++
+# Стандарт C++20
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -13,7 +12,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Автоматический сбор всех исходных файлов из папки src/
-# Флаг CONFIGURE_DEPENDS заставляет CMake автоматически перезапускаться при добавлении новых файлов
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"

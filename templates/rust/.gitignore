@@ -1,0 +1,11 @@
+# Rust Cargo artifacts
+/target/
+**/*.rs.bk
+*.log
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

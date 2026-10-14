@@ -94,7 +94,10 @@ helper.ctx = setmetatable({}, {
             end
         elseif k == "is_newer" or k == "needs_rebuild" then
             return function(src, target)
-                return grime and grime.fs and grime.fs.is_newer(src, target) or true
+                if grime and grime.fs and grime.fs.is_newer then
+                    return grime.fs.is_newer(src, target)
+                end
+                return true
             end
         elseif k == "projects_root" then
             return function()
@@ -103,6 +106,10 @@ helper.ctx = setmetatable({}, {
         elseif k == "templates_root" then
             return function()
                 return grime and grime.config and grime.config.templates_root() or "./templates"
+            end
+        elseif k == "config_dir" then
+            return function()
+                return grime and grime.config and grime.config.config_dir() or "."
             end
         elseif k == "get_config" then
             return function(key, default)

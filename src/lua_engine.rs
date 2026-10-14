@@ -405,7 +405,15 @@ impl GrimeLuaEngine {
         cfg_tbl.set(
             "get",
             lua.create_function(move |_, (key, default): (String, Option<String>)| {
-                Ok(cfg_for_get.get(&key, default.as_deref()))
+                Ok(cfg_for_get.get_opt(&key, default.as_deref()))
+            })?,
+        )?;
+
+        let cfg_dir = cfg.clone();
+        cfg_tbl.set(
+            "config_dir",
+            lua.create_function(move |_, ()| {
+                Ok(cfg_dir.config_dir().to_string_lossy().to_string())
             })?,
         )?;
 
@@ -890,5 +898,25 @@ mod tests {
         let name: String = lua.load(script).eval().expect("msgpack eval");
         assert_eq!(name, "grime");
     }
+
+    #[test]
+    fn test_lua_config_api() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            local dir = grime.config.config_dir()
+            assert(dir ~= nil and #dir > 0)
+            local nonexistent = grime.config.get("nonexistent_key_xyz")
+            assert(nonexistent == nil)
+            local with_default = grime.config.get("nonexistent_key_xyz", "my_default")
+            assert(with_default == "my_default")
+            return dir
+        "#;
+
+        let dir: String = lua.load(script).eval().expect("config api eval");
+        assert!(!dir.is_empty());
+    }
 }
+
 

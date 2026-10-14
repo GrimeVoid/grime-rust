@@ -29,12 +29,263 @@ local function resolve_dir_or_project(arg)
     return nil
 end
 
+local function replace_in_file(path, pattern, replacement)
+    if not ctx.is_file(path) then return end
+    local f = io.open(path, "r")
+    if not f then return end
+    local content = f:read("*a")
+    f:close()
+    local updated = content:gsub(pattern, replacement)
+    local f_out = io.open(path, "w")
+    if f_out then
+        f_out:write(updated)
+        f_out:close()
+    end
+end
+
+--- Получение корня каталога приложений
+local function get_apps_root()
+    local apps_val = grime and grime.config and grime.config.get("apps")
+    local root = apps_val or (((grime and grime.config and grime.config.config_dir()) or ".") .. "/grime_app")
+    root = ctx.normalize_path(root)
+    if not ctx.exists(root) then
+        ctx.mkdir_p(root)
+    end
+    return root
+end
+
+--- Скаффолдинг структуры приложения
+local function scaffold_app(app_dir, app_name, lang, prompt)
+    if not ctx.exists(app_dir) then
+        ctx.mkdir_p(app_dir)
+    end
+
+    -- Поиск шаблона
+    local tpl_dir = ctx.templates_root() .. "/" .. lang
+    if not ctx.exists(tpl_dir) then
+        local dotfiles_tpl = "/home/danny/dotfiles/grime/templates/" .. lang
+        if ctx.exists(dotfiles_tpl) then
+            tpl_dir = dotfiles_tpl
+        end
+    end
+
+    if ctx.exists(tpl_dir) then
+        ctx.copy(tpl_dir, app_dir)
+        ctx.log(string.format("Каркас проекта скопирован из шаблона '%s'", lang))
+    else
+        ctx.mkdir_p(app_dir .. "/src")
+    end
+
+    -- Адаптация шаблона под имя приложения
+    if lang == "cpp" then
+        local cmake = app_dir .. "/CMakeLists.txt"
+        if ctx.is_file(cmake) then
+            replace_in_file(cmake, "project%s*%b()", "project(" .. app_name .. ")")
+            replace_in_file(cmake, "add_executable%s*%b()", "add_executable(" .. app_name .. " src/main.cpp)")
+        else
+            local f = io.open(cmake, "w")
+            if f then
+                f:write(string.format([[cmake_minimum_required(VERSION 3.20)
+project(%s)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+file(GLOB_RECURSE SOURCES "src/*.cpp")
+add_executable(%s ${SOURCES})
+]], app_name, app_name))
+                f:close()
+            end
+        end
+        local main_cpp = app_dir .. "/src/main.cpp"
+        if not ctx.is_file(main_cpp) then
+            local f = io.open(main_cpp, "w")
+            if f then
+                f:write([[#include <iostream>
+
+int main() {
+    std::cout << "Application started!" << std::endl;
+    return 0;
+}
+]])
+                f:close()
+            end
+        end
+    elseif lang == "rust" then
+        local cargo_toml = app_dir .. "/Cargo.toml"
+        if ctx.is_file(cargo_toml) then
+            replace_in_file(cargo_toml, 'name%s*=%s*"[^"]*"', 'name = "' .. app_name:lower() .. '"')
+        end
+    end
+
+    -- Генерация манифеста app.lua
+    local manifest_path = app_dir .. "/app.lua"
+    if not ctx.is_file(manifest_path) then
+        local desc = (prompt and prompt ~= "") and prompt or "Grime Application"
+        -- Экранируем переносы строк для строки манифеста
+        desc = desc:gsub("\n", " "):gsub('"', '\\"')
+
+        local m_content = ""
+        if lang == "cpp" then
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = "cpp",
+    artifact = "build/%s",
+    build = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
+    run = "build/%s",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc, app_name, app_name)
+        elseif lang == "rust" then
+            local pkg_name = app_name:lower()
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = "rust",
+    artifact = "target/release/%s",
+    build = "cargo build --release",
+    run = "target/release/%s",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc, pkg_name, pkg_name)
+        elseif lang == "python" then
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = "python",
+    artifact = "src/main.py",
+    run = "python3 src/main.py",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc)
+        elseif lang == "java" then
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = "java",
+    artifact = "target/%s-1.0-SNAPSHOT.jar",
+    build = "mvn package",
+    run = "java -jar target/%s-1.0-SNAPSHOT.jar",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc, app_name, app_name)
+        else
+            m_content = string.format([[return {
+    name = %q,
+    description = "%s",
+    type = %q,
+    artifact = "main.lua",
+    run = "lua main.lua",
+    box = nil,
+    detached = false,
+}
+]], app_name, desc, lang)
+        end
+
+        local f = io.open(manifest_path, "w")
+        if f then
+            f:write(m_content)
+            f:close()
+            ctx.log("Сгенерирован манифест app.lua")
+        end
+    end
+end
+
 function main()
     local target_dir = nil
     local incoming_pipeline_text = nil
-    local remaining_args = {}
+    local raw_cli_args = {}
     for _, a in ipairs(ctx.args) do
-        table.insert(remaining_args, a)
+        table.insert(raw_cli_args, a)
+    end
+
+    -- 0. Проверка режима создания приложения (--app <app_name> [--lang <lang>])
+    local is_app_mode = false
+    local app_name = nil
+    local app_lang = nil
+    local app_dir = nil
+    local filtered_args = {}
+
+    local idx = 1
+    while idx <= #raw_cli_args do
+        local a = raw_cli_args[idx]
+        if a == "--app" then
+            is_app_mode = true
+            if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
+                idx = idx + 1
+                app_name = raw_cli_args[idx]
+            end
+        elseif a == "--lang" or a == "-l" then
+            if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
+                idx = idx + 1
+                app_lang = raw_cli_args[idx]:lower()
+            end
+        else
+            table.insert(filtered_args, a)
+        end
+        idx = idx + 1
+    end
+
+    local remaining_args = filtered_args
+
+    if is_app_mode then
+        if not app_name or app_name == "" then
+            ctx.fail("Укажите имя приложения: grime aider --app <app_name> [--lang <lang>] [prompt]")
+            return
+        end
+
+        local apps_root = get_apps_root()
+        app_dir = apps_root .. "/" .. app_name
+        target_dir = app_dir
+
+        -- Сбор пользовательского промпта
+        local collected_prompt = {}
+        for _, arg in ipairs(remaining_args) do
+            if not arg:match("^%-") then
+                table.insert(collected_prompt, arg)
+            end
+        end
+        local user_prompt = table.concat(collected_prompt, " ")
+
+        -- Этап 1: Классификация стека
+        local final_lang = app_lang
+        if not final_lang or final_lang == "" then
+            if user_prompt ~= "" then
+                local config_aider = ctx.get_config("aider", "auto")
+                local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
+                local classify_prompt = string.format("Классифицируй задачу консольного приложения:\n%s\nКакой стек лучше использовать? Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua.", user_prompt)
+                ctx.log("Определение стека приложения через Aider/LLM...")
+                local cres = ctx.capture({ aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
+                if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
+                    local out_l = cres.stdout:lower()
+                    for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
+                        if out_l:find(l, 1, true) then
+                            final_lang = l
+                            break
+                        end
+                    end
+                end
+            end
+            if not final_lang or final_lang == "" then
+                final_lang = "cpp"
+            end
+        end
+
+        ctx.log(string.format("Выбран стек технологий для приложения '%s': %s", app_name, final_lang))
+
+        -- Этап 2: Скаффолдинг
+        scaffold_app(app_dir, app_name, final_lang, user_prompt)
+
+        -- Этап 3: Подготовка к вызову Aider
+        if user_prompt ~= "" then
+            local master_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и параметры сборки/запуска.", user_prompt)
+            remaining_args = { "-m", master_prompt }
+        else
+            remaining_args = {}
+        end
     end
 
     -- 1. Проверяем входные данные из конвейера
@@ -49,8 +300,8 @@ function main()
         end
     end
 
-    -- 2. Проверяем, передан ли путь или имя проекта первым аргументом
-    if #remaining_args > 0 and not target_dir then
+    -- 2. Проверяем, передан ли путь или имя проекта первым аргументом (если не в режиме --app)
+    if not is_app_mode and #remaining_args > 0 and not target_dir then
         local first_arg = remaining_args[1]
         local resolved = resolve_dir_or_project(first_arg)
         if resolved then
@@ -63,16 +314,15 @@ function main()
 
     -- 3. Обработка флага -m / --message и сбор свободных слов промпта без кавычек
     local msg_flag_idx = nil
-    for idx, arg in ipairs(remaining_args) do
+    for i, arg in ipairs(remaining_args) do
         if arg == "-m" or arg == "--message" then
-            msg_flag_idx = idx
+            msg_flag_idx = i
             break
         end
     end
 
     local user_message = ""
     if msg_flag_idx then
-        -- Случай А: флаг -m явно указан. Собираем все последующие токены до следующего флага (-*)
         local collected = {}
         local i = msg_flag_idx + 1
         while i <= #remaining_args do
@@ -94,9 +344,7 @@ function main()
             table.insert(new_args, remaining_args[k])
         end
         remaining_args = new_args
-    elseif #remaining_args > 0 then
-        -- Случай Б: флаг -m НЕ указан.
-        -- Разделяем флаги Aider и позиционные аргументы.
+    elseif #remaining_args > 0 and not is_app_mode then
         local flags_part = {}
         local positional = {}
         local i = 1
@@ -174,9 +422,9 @@ function main()
         end
 
         local m_found = false
-        for idx, a in ipairs(remaining_args) do
+        for i, a in ipairs(remaining_args) do
             if a == "-m" then
-                remaining_args[idx + 1] = combined_message
+                remaining_args[i + 1] = combined_message
                 m_found = true
                 break
             end
@@ -198,9 +446,9 @@ function main()
     -- 5. Prompt Chaining: если есть следующий шаг
     if is_headless and ctx.has_next_step then
         local chain_instruction = "\n\n[СИСТЕМНОЕ ТРЕБОВАНИЕ GRIME]: Сформируйте мастер-промпт для следующего шага и ОБЯЗАТЕЛЬНО оберните его в тег:\n<next_agent_prompt>\nинструкция\n</next_agent_prompt>"
-        for idx, a in ipairs(remaining_args) do
-            if a == "-m" and remaining_args[idx + 1] then
-                remaining_args[idx + 1] = remaining_args[idx + 1] .. chain_instruction
+        for i, a in ipairs(remaining_args) do
+            if a == "-m" and remaining_args[i + 1] then
+                remaining_args[i + 1] = remaining_args[i + 1] .. chain_instruction
                 break
             end
         end
@@ -241,7 +489,7 @@ function main()
             end
         end
         if not has_explicit then
-            local candidates = { "src/main.py", "src/main.cpp", "src/Main.java", "src/main.rs", "main.py" }
+            local candidates = { "src/main.py", "src/main.cpp", "src/Main.java", "src/main.rs", "main.py", "app.lua" }
             for _, c in ipairs(candidates) do
                 if ctx.exists(working_dir .. "/" .. c) then
                     table.insert(aider_cmd, c)
@@ -272,6 +520,11 @@ function main()
                 extracted = res.stdout:match("^%s*(.-)%s*$")
             end
 
+            if is_app_mode then
+                ctx.log(string.format("✓ Приложение '%s' создано в %s", app_name, app_dir))
+                ctx.log(string.format("Для запуска выполните: grime app %s", app_name))
+            end
+
             if ctx.has_next_step and extracted and extracted ~= "" then
                 ctx.module_return(extracted)
             elseif target_dir then
@@ -285,6 +538,10 @@ function main()
     else
         local ret = ctx.run_process(aider_cmd, working_dir)
         if ret == 0 then
+            if is_app_mode then
+                ctx.log(string.format("✓ Приложение '%s' настроено в %s", app_name, app_dir))
+                ctx.log(string.format("Для запуска выполните: grime app %s", app_name))
+            end
             if target_dir then
                 ctx.module_return(target_dir)
             else

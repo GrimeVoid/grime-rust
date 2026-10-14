@@ -1,0 +1,7 @@
+[package]
+name = "{{PROJECT_NAME_SNAKE}}"
+version = "0.1.0"
+edition = "2021"
+description = "Rust project {{PROJECT_NAME}}"
+
+[dependencies]

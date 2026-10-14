@@ -156,6 +156,20 @@ impl GrimeConfig {
             .unwrap_or_else(|| default.unwrap_or("").to_string())
     }
 
+    pub fn get_opt(&self, key: &str, default: Option<&str>) -> Option<String> {
+        self.paths
+            .get(key)
+            .cloned()
+            .or_else(|| default.map(|d| d.to_string()))
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| crate::fs_ops::normalize_path(p))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     pub fn projects_root(&self) -> PathBuf {
         let p = self.get_path("projects")
             .or_else(|| dirs::home_dir().map(|h| h.join("Projects")))

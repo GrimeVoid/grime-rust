@@ -102,6 +102,53 @@ local function replace_placeholders_in_dir(dir, replacements)
     end
 end
 
+--- Определение оптимального стека через Aider
+local function classify_stack(user_prompt)
+    if not user_prompt or user_prompt == "" then
+        return "cpp"
+    end
+    local config_aider = ctx.get_config and ctx.get_config("aider", "auto") or "auto"
+    local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
+    local classify_prompt = string.format([[Выбери оптимальный язык программирования для следующей задачи консольного приложения:
+"%s"
+
+Допустимые варианты: cpp, rust, python, java, lua.
+Критерии выбора:
+1. Ноль внешних зависимостей (zero external dependencies).
+2. Максимальная скорость исполнения и производительность.
+3. Минимальный вес артефакта и потребление ресурсов.
+
+Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
+    ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
+    local cres = ctx.capture({ aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
+    if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
+        local out_l = cres.stdout:lower()
+        for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
+            if out_l:find(l, 1, true) then
+                return l
+            end
+        end
+    end
+    return "cpp"
+end
+
+--- Запуск субагента Aider для реализации приложения
+local function run_dev(app_dir, prompt, app_name)
+    local grime_bin = os.getenv("GRIME_BIN") or "grime"
+    if prompt and prompt ~= "" then
+        local dev_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и команды сборки/запуска.", prompt)
+        ctx.log(string.format("Запуск субагента Aider для реализации '%s'...", app_name or "app"))
+        local code = ctx.run_process({ grime_bin, "aider", "-m", dev_prompt }, app_dir)
+        if code ~= 0 then
+            ctx.warn(string.format("Aider завершился с кодом %d", code))
+        end
+        return code
+    else
+        ctx.log("Запуск интерактивной сессии Aider для проектирования приложения...")
+        return ctx.run_process({ grime_bin, "aider" }, app_dir)
+    end
+end
+
 --- Получение корня каталога приложений
 local function get_apps_root()
     local root = (ctx.paths and ctx.paths.apps)
@@ -395,37 +442,7 @@ function main()
         local user_prompt = table.concat(collected_prompt, " ")
 
         -- Классификация стека при необходимости
-        local final_lang = app_lang
-        if not final_lang or final_lang == "" then
-            if user_prompt ~= "" then
-                local config_aider = ctx.get_config("aider", "auto")
-                local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
-                local classify_prompt = string.format([[Выбери оптимальный язык программирования для следующей задачи консольного приложения:
-"%s"
-
-Допустимые варианты: cpp, rust, python, java, lua.
-Критерии выбора:
-1. Ноль внешних зависимостей (zero external dependencies).
-2. Максимальная скорость исполнения и производительность.
-3. Минимальный вес артефакта и потребление ресурсов.
-
-Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
-                ctx.log("Определение стека приложения через Aider/LLM...")
-                local cres = ctx.capture({ aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
-                if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
-                    local out_l = cres.stdout:lower()
-                    for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
-                        if out_l:find(l, 1, true) then
-                            final_lang = l
-                            break
-                        end
-                    end
-                end
-            end
-            if not final_lang or final_lang == "" then
-                final_lang = "cpp"
-            end
-        end
+        local final_lang = app_lang or classify_stack(user_prompt)
 
         ctx.log(string.format("Выбран стек технологий для приложения '%s': %s", app_name, final_lang))
         scaffold_app(app_dir, app_name, final_lang, user_prompt)
@@ -721,3 +738,10 @@ function main()
         end
     end
 end
+
+local M = {
+    classify_stack = classify_stack,
+    run_dev = run_dev,
+}
+return M
+

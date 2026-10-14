@@ -42,7 +42,7 @@ impl StateBus {
         }
 
         match parts[0] {
-            "system" | "env" | "pipeline" => Ok(()),
+            "system" | "env" | "pipeline" | "app" | "box" => Ok(()),
             "modules" => {
                 if parts.len() < 3 {
                     Err(format!(
@@ -54,7 +54,7 @@ impl StateBus {
                 }
             }
             other => Err(format!(
-                "Неизвестное пространство имен '{}'. Допустимые: 'system', 'env', 'pipeline', 'modules.<name>'",
+                "Неизвестное пространство имен '{}'. Допустимые: 'system', 'env', 'pipeline', 'app', 'box', 'modules.<name>'",
                 other
             )),
         }

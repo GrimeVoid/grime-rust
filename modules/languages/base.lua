@@ -74,14 +74,19 @@ function BaseAdapter:get_target(root)
     return nil
 end
 
-function BaseAdapter:apply_template(root, ctx)
+function BaseAdapter:apply_template(root, ctx, extra)
     local tpl_root = (ctx.paths and ctx.paths.templates)
         or (ctx.get_path and ctx.get_path("templates"))
         or (ctx.templates_root and ctx.templates_root())
         or "./templates"
     local tpl_dir = ctx.normalize_path(tpl_root) .. "/" .. self.name
     if not ctx.exists(tpl_dir) then
-        return false
+        local dotfiles_tpl = "/home/danny/dotfiles/grime/templates/" .. self.name
+        if ctx.exists(dotfiles_tpl) then
+            tpl_dir = dotfiles_tpl
+        else
+            return false
+        end
     end
 
     local proj_name = root:match("([^/\\]+)$") or "app"
@@ -89,10 +94,28 @@ function BaseAdapter:apply_template(root, ctx)
     local kebab_name = proj_name:lower():gsub("[%s_]", "-")
     local lower_name = proj_name:lower()
     local upper_name = proj_name:upper()
+    local desc = "Grime application " .. proj_name
+    if type(extra) == "string" and extra ~= "" then
+        desc = extra:gsub("\n", " "):gsub('"', '\\"')
+    end
 
     -- Рекурсивно копируем файлы из директории шаблона в root
     ctx.copy(tpl_dir, root)
     ctx.log(string.format("Шаблон %s развернут из %s", self.name, tpl_dir))
+
+    local replacements = {
+        ["{{PROJECT_NAME}}"] = proj_name,
+        ["{{PROJECT_NAME_LOWER}}"] = lower_name,
+        ["{{PROJECT_NAME_UPPER}}"] = upper_name,
+        ["{{PROJECT_NAME_SNAKE}}"] = snake_name,
+        ["{{PROJECT_NAME_KEBAB}}"] = kebab_name,
+        ["{{PROJECT_DESCRIPTION}}"] = desc,
+    }
+    if type(extra) == "table" then
+        for k, v in pairs(extra) do
+            replacements[k] = tostring(v)
+        end
+    end
 
     -- Подстановка переменных во всех текстовых файлах
     local function substitute_file(filepath)
@@ -103,11 +126,9 @@ function BaseAdapter:apply_template(root, ctx)
         if not content then return end
 
         local new_content = content
-        new_content = new_content:gsub("{{PROJECT_NAME}}", proj_name)
-        new_content = new_content:gsub("{{PROJECT_NAME_LOWER}}", lower_name)
-        new_content = new_content:gsub("{{PROJECT_NAME_UPPER}}", upper_name)
-        new_content = new_content:gsub("{{PROJECT_NAME_SNAKE}}", snake_name)
-        new_content = new_content:gsub("{{PROJECT_NAME_KEBAB}}", kebab_name)
+        for k, v in pairs(replacements) do
+            new_content = new_content:gsub(k, v)
+        end
 
         if new_content ~= content then
             local wf = io.open(filepath, "w")

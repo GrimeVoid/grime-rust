@@ -119,23 +119,32 @@ pub fn run_interactive(
         command.envs(envs);
     }
 
-    // Попытка открыть /dev/tty для прямого доступа к терминалу
-    let tty_in = File::open("/dev/tty");
-    let tty_out = File::options().write(true).open("/dev/tty");
+    // Проверяем, является ли stdin терминалом
+    let is_stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let tty_in = if is_stdin_tty {
+        File::open("/dev/tty").ok()
+    } else {
+        None
+    };
+    let tty_out = File::options().write(true).open("/dev/tty").ok();
 
-    match (tty_in, tty_out) {
-        (Ok(tin), Ok(tout)) => {
+    if let (Some(tin), Some(tout)) = (&tty_in, &tty_out) {
+        unsafe {
+            let in_fd = tin.as_raw_fd();
+            let out_fd = tout.as_raw_fd();
+            command.stdin(Stdio::from_raw_fd(libc::dup(in_fd)));
+            command.stdout(Stdio::from_raw_fd(libc::dup(out_fd)));
+            command.stderr(Stdio::from_raw_fd(libc::dup(out_fd)));
+        }
+    } else {
+        command.stdin(Stdio::inherit());
+        if let Some(tout) = &tty_out {
             unsafe {
-                let in_fd = tin.as_raw_fd();
                 let out_fd = tout.as_raw_fd();
-                command.stdin(Stdio::from_raw_fd(libc::dup(in_fd)));
                 command.stdout(Stdio::from_raw_fd(libc::dup(out_fd)));
                 command.stderr(Stdio::from_raw_fd(libc::dup(out_fd)));
             }
-        }
-        _ => {
-            // Наследование стандартных потоков если /dev/tty недоступен
-            command.stdin(Stdio::inherit());
+        } else {
             command.stdout(Stdio::inherit());
             command.stderr(Stdio::inherit());
         }

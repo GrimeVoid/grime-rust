@@ -350,3 +350,21 @@ function cleanup()
         end
     end
 end
+
+local M = {
+    ensure_running = ensure_box_running,
+    exec = function(box_name, cmd, cwd, env)
+        ensure_box_running(box_name)
+        local cmd_list = { "distrobox", "enter", box_name, "--" }
+        if type(cmd) == "table" then
+            for _, c in ipairs(cmd) do table.insert(cmd_list, c) end
+            return ctx.run_process(cmd_list, cwd, env)
+        else
+            table.insert(cmd_list, "sh")
+            table.insert(cmd_list, "-c")
+            table.insert(cmd_list, cmd)
+            return ctx.run_process(cmd_list, cwd, env)
+        end
+    end,
+}
+return M

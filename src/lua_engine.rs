@@ -205,6 +205,13 @@ impl GrimeLuaEngine {
             }
         }
 
+        if let Some(home) = dirs::home_dir() {
+            let user_modules = home.join(".config").join("grime").join("modules");
+            if user_modules.exists() {
+                return user_modules;
+            }
+        }
+
         PathBuf::from("modules")
     }
 

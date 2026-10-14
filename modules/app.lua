@@ -3,11 +3,12 @@ local ctx = helper.ctx
 
 --- Получение корневой директории приложений
 local function get_apps_root()
-    local from_cfg = grime and grime.config and grime.config.get("apps")
-    local root = from_cfg
+    local root = (ctx.paths and ctx.paths.apps)
+        or (ctx.get_path and ctx.get_path("apps"))
+        or (ctx.apps_root and ctx.apps_root())
     if not root or root == "" then
-        local cfg_dir = (grime and grime.config and grime.config.config_dir()) or "."
-        root = cfg_dir .. "/grime_app"
+        local home = os.getenv("HOME") or ""
+        root = (home ~= "" and (home .. "/.config/grime/apps")) or "./apps"
     end
     root = ctx.normalize_path(root)
     if not ctx.exists(root) then

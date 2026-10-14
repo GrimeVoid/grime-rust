@@ -1,6 +1,9 @@
 # Конфигурация путей Grime (шаблон)
 # Скопируйте этот файл в gproj.conf и укажите ваши локальные пути:
 
-templates=templates
-projects=/path/to/your/projects/directory
+config=$HOME/.config/grime
+projects=$HOME/Projects
+templates=$HOME/.config/grime/templates
+apps=$HOME/.config/grime/apps
 aider=auto
+distrobox_default=fedora-box

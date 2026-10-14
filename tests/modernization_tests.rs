@@ -233,3 +233,66 @@ async fn test_stage4_event_bus_lifecycle() {
         "Должно присутствовать событие pipeline.finish"
     );
 }
+
+#[tokio::test]
+async fn test_stage5_paths_registry_and_lua_context() {
+    let tmp = TestTempDir::new("grime_stage5");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    // Копируем helper.lua в тестовую директорию
+    let helper_src = Path::new("modules/helper.lua");
+    if helper_src.exists() {
+        fs::copy(helper_src, mod_dir.join("helper.lua")).unwrap();
+    }
+
+    // Создаем кастомный gproj.conf с произвольными путями
+    let conf_path = tmp.path().join("gproj.conf");
+    let conf_content = r#"
+# Тестовая конфигурация
+projects = /tmp/test_projects
+custom_assets = /tmp/assets
+custom_key = /tmp/special_dir
+"#;
+    fs::write(&conf_path, conf_content).unwrap();
+
+    // Модуль test_paths.lua
+    fs::write(
+        mod_dir.join("test_paths.lua"),
+        r#"
+        local helper = require("helper")
+        local ctx = helper.ctx
+
+        function main()
+            -- 1. Проверка прямого доступа через ctx.paths
+            assert(ctx.paths ~= nil, "ctx.paths must exist")
+            assert(ctx.paths.projects == "/tmp/test_projects", "projects path mismatch")
+            assert(ctx.paths.custom_assets == "/tmp/assets", "custom_assets path mismatch")
+            assert(ctx.paths.custom_key == "/tmp/special_dir", "custom_key path mismatch")
+
+            -- 2. Проверка автоматических дефолтов
+            assert(ctx.paths.apps ~= nil and #ctx.paths.apps > 0, "apps default missing")
+            assert(ctx.paths.templates ~= nil and #ctx.paths.templates > 0, "templates default missing")
+            assert(ctx.paths.config ~= nil and #ctx.paths.config > 0, "config default missing")
+
+            -- 3. Проверка get_path
+            assert(ctx.get_path("custom_assets") == "/tmp/assets")
+            assert(ctx.get_path("nonexistent", "my_fallback") == "my_fallback")
+
+            -- 4. Проверка grime.paths
+            assert(grime.paths.custom_assets == "/tmp/assets")
+
+            ctx.success("paths_ok")
+        end
+    "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), Some(&conf_path)).unwrap();
+    let parsed = parse_pipeline_args(&["test_paths".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+
+    assert!(res.is_ok(), "Пайплайн с путями упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "paths_ok");
+}
+

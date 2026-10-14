@@ -27,12 +27,12 @@ impl PipelineCanceller {
 
     /// Инициировать отмену выполнения с указанием причины.
     pub fn cancel(&self, reason: &str) {
-        self.is_cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut r) = self.reason.write() {
             if r.is_none() {
                 *r = Some(reason.to_string());
             }
         }
+        self.is_cancelled.store(true, Ordering::SeqCst);
     }
 
     /// Проверить, отменен ли конвейер.

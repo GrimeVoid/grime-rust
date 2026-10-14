@@ -12,7 +12,14 @@ local function resolve_dir_or_project(arg)
     end
 
     -- 2. Проверяем в projects_root
-    local projects_root = ctx.projects_root()
+    local projects_root = (ctx.paths and ctx.paths.projects)
+        or (ctx.get_path and ctx.get_path("projects"))
+        or (ctx.projects_root and ctx.projects_root())
+    if not projects_root or projects_root == "" then
+        local home = os.getenv("HOME") or ""
+        projects_root = (home ~= "" and (home .. "/Projects")) or "./projects"
+    end
+    projects_root = ctx.normalize_path(projects_root)
     if projects_root and ctx.exists(projects_root) then
         for _, lang in ipairs({ "cpp", "python", "rust", "java", "C++" }) do
             local cand = projects_root .. "/" .. lang .. "/" .. arg
@@ -45,8 +52,13 @@ end
 
 --- Получение корня каталога приложений
 local function get_apps_root()
-    local apps_val = grime and grime.config and grime.config.get("apps")
-    local root = apps_val or (((grime and grime.config and grime.config.config_dir()) or ".") .. "/grime_app")
+    local root = (ctx.paths and ctx.paths.apps)
+        or (ctx.get_path and ctx.get_path("apps"))
+        or (ctx.apps_root and ctx.apps_root())
+    if not root or root == "" then
+        local home = os.getenv("HOME") or ""
+        root = (home ~= "" and (home .. "/.config/grime/apps")) or "./apps"
+    end
     root = ctx.normalize_path(root)
     if not ctx.exists(root) then
         ctx.mkdir_p(root)
@@ -61,7 +73,15 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
     end
 
     -- Поиск шаблона
-    local tpl_dir = ctx.templates_root() .. "/" .. lang
+    local templates_root = (ctx.paths and ctx.paths.templates)
+        or (ctx.get_path and ctx.get_path("templates"))
+        or (ctx.templates_root and ctx.templates_root())
+    if not templates_root or templates_root == "" then
+        local home = os.getenv("HOME") or ""
+        templates_root = (home ~= "" and (home .. "/.config/grime/templates")) or "./templates"
+    end
+    templates_root = ctx.normalize_path(templates_root)
+    local tpl_dir = templates_root .. "/" .. lang
     if not ctx.exists(tpl_dir) then
         local dotfiles_tpl = "/home/danny/dotfiles/grime/templates/" .. lang
         if ctx.exists(dotfiles_tpl) then

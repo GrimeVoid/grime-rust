@@ -75,7 +75,11 @@ function BaseAdapter:get_target(root)
 end
 
 function BaseAdapter:apply_template(root, ctx)
-    local tpl_dir = ctx.templates_root() .. "/" .. self.name
+    local tpl_root = (ctx.paths and ctx.paths.templates)
+        or (ctx.get_path and ctx.get_path("templates"))
+        or (ctx.templates_root and ctx.templates_root())
+        or "./templates"
+    local tpl_dir = ctx.normalize_path(tpl_root) .. "/" .. self.name
     if not ctx.exists(tpl_dir) then
         return false
     end

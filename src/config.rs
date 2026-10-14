@@ -30,13 +30,59 @@ impl GrimeConfig {
                     let _ = fs::create_dir_all(conf_path.parent().unwrap_or(&conf_path));
                     let _ = fs::write(&conf_path, &content);
                     config.read_file(&conf_path);
+                    config.ensure_defaults();
                     return config;
                 }
             }
             config.generate_default(&conf_path);
         }
 
+        config.ensure_defaults();
         config
+    }
+
+    /// Получение дефолтных путей Grime:
+    /// - config: $HOME/.config/grime
+    /// - projects: $HOME/Projects
+    /// - templates: $HOME/.config/grime/templates
+    /// - apps: $HOME/.config/grime/apps
+    pub fn default_paths() -> HashMap<String, String> {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let mut map = HashMap::new();
+
+        let cfg_dir = home.join(".config").join("grime");
+        map.insert(
+            "config".to_string(),
+            crate::fs_ops::normalize_path(&cfg_dir).to_string_lossy().to_string(),
+        );
+
+        let projects_dir = home.join("Projects");
+        map.insert(
+            "projects".to_string(),
+            crate::fs_ops::normalize_path(&projects_dir).to_string_lossy().to_string(),
+        );
+
+        let templates_dir = home.join(".config").join("grime").join("templates");
+        map.insert(
+            "templates".to_string(),
+            crate::fs_ops::normalize_path(&templates_dir).to_string_lossy().to_string(),
+        );
+
+        let apps_dir = home.join(".config").join("grime").join("apps");
+        map.insert(
+            "apps".to_string(),
+            crate::fs_ops::normalize_path(&apps_dir).to_string_lossy().to_string(),
+        );
+
+        map
+    }
+
+    /// Дополнение отсутствующих путей дефолтными значениями
+    pub fn ensure_defaults(&mut self) {
+        let defaults = Self::default_paths();
+        for (key, default_val) in defaults {
+            self.paths.entry(key).or_insert(default_val);
+        }
     }
 
     fn discover_config_path() -> PathBuf {
@@ -83,7 +129,7 @@ impl GrimeConfig {
         PathBuf::from("config/gproj.conf")
     }
 
-    fn read_file(&mut self, path: &Path) {
+    pub fn read_file(&mut self, path: &Path) {
         if let Ok(content) = fs::read_to_string(path) {
             let base_dir = path.parent().unwrap_or(path);
             for line in content.lines() {
@@ -99,7 +145,10 @@ impl GrimeConfig {
                         self.paths.insert(key, "auto".to_string());
                     } else {
                         let trimmed = val.trim_end_matches('/');
-                        let expanded = shellexpand::tilde(trimmed).to_string();
+                        let expanded = match shellexpand::full(trimmed) {
+                            Ok(exp) => exp.to_string(),
+                            Err(_) => shellexpand::tilde(trimmed).to_string(),
+                        };
                         let p = PathBuf::from(&expanded);
                         let resolved = if p.is_absolute() {
                             crate::fs_ops::normalize_path(&p)
@@ -111,32 +160,35 @@ impl GrimeConfig {
                 }
             }
         }
+        self.ensure_defaults();
     }
 
     fn generate_default(&mut self, path: &Path) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let default_templates = home.join("Projects").join("templates");
-        let default_projects = home.join("Projects");
+        let default_config = crate::fs_ops::normalize_path(&home.join(".config").join("grime"));
+        let default_projects = crate::fs_ops::normalize_path(&home.join("Projects"));
+        let default_templates = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("templates"));
+        let default_apps = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("apps"));
 
         let default_content = format!(
             "# Конфигурация путей GrimeProject\n\
-             templates={}\n\
+             config={}\n\
              projects={}\n\
+             templates={}\n\
+             apps={}\n\
              aider=auto\n\
              distrobox_default=fedora-box\n",
+            default_config.display(),
+            default_projects.display(),
             default_templates.display(),
-            default_projects.display()
+            default_apps.display()
         );
 
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(path, default_content);
-
-        self.paths.insert("templates".to_string(), default_templates.to_string_lossy().to_string());
-        self.paths.insert("projects".to_string(), default_projects.to_string_lossy().to_string());
-        self.paths.insert("aider".to_string(), "auto".to_string());
-        self.paths.insert("distrobox_default".to_string(), "fedora-box".to_string());
+        self.read_file(path);
     }
 
     pub fn get_path(&self, key: &str) -> Option<PathBuf> {
@@ -164,23 +216,73 @@ impl GrimeConfig {
     }
 
     pub fn config_dir(&self) -> PathBuf {
-        self.config_file
-            .parent()
-            .map(|p| crate::fs_ops::normalize_path(p))
-            .unwrap_or_else(|| PathBuf::from("."))
+        self.get_path("config")
+            .unwrap_or_else(|| {
+                self.config_file
+                    .parent()
+                    .map(|p| crate::fs_ops::normalize_path(p))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            })
     }
 
     pub fn projects_root(&self) -> PathBuf {
-        let p = self.get_path("projects")
-            .or_else(|| dirs::home_dir().map(|h| h.join("Projects")))
-            .unwrap_or_else(|| PathBuf::from("./projects"));
-        crate::fs_ops::normalize_path(&p)
+        self.get_path("projects")
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                crate::fs_ops::normalize_path(&home.join("Projects"))
+            })
     }
 
     pub fn templates_root(&self) -> PathBuf {
-        let p = self.get_path("templates")
-            .or_else(|| dirs::home_dir().map(|h| h.join("Projects").join("templates")))
-            .unwrap_or_else(|| PathBuf::from("./templates"));
-        crate::fs_ops::normalize_path(&p)
+        self.get_path("templates")
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("templates"))
+            })
+    }
+
+    pub fn apps_root(&self) -> PathBuf {
+        self.get_path("apps")
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("apps"))
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_paths_exist() {
+        let defaults = GrimeConfig::default_paths();
+        assert!(defaults.contains_key("config"));
+        assert!(defaults.contains_key("projects"));
+        assert!(defaults.contains_key("templates"));
+        assert!(defaults.contains_key("apps"));
+    }
+
+    #[test]
+    fn test_custom_paths_and_defaults_fallback() {
+        let mut config = GrimeConfig {
+            paths: HashMap::new(),
+            config_file: PathBuf::from("/tmp/fake_gproj.conf"),
+        };
+
+        // Зададим кастомный путь для projects и произвольный ключ
+        config.paths.insert("projects".to_string(), "/custom/projects".to_string());
+        config.paths.insert("my_custom_cache".to_string(), "/var/cache/my_app".to_string());
+
+        config.ensure_defaults();
+
+        // projects должен остаться кастомным
+        assert_eq!(config.get("projects", None), "/custom/projects");
+        // my_custom_cache должен сохраниться
+        assert_eq!(config.get("my_custom_cache", None), "/var/cache/my_app");
+        // templates, apps, config должны дополниться дефолтами
+        assert!(!config.get("templates", None).is_empty());
+        assert!(!config.get("apps", None).is_empty());
+        assert!(!config.get("config", None).is_empty());
     }
 }

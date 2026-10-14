@@ -99,17 +99,72 @@ helper.ctx = setmetatable({}, {
                 end
                 return true
             end
+        elseif k == "paths" then
+            if c.paths then
+                return c.paths
+            elseif grime and grime.paths then
+                return grime.paths
+            end
+            return {}
+        elseif k == "get_path" then
+            return function(name, fallback)
+                if not name then return fallback end
+                local p = nil
+                if c.paths and c.paths[name] and c.paths[name] ~= "" then
+                    p = c.paths[name]
+                elseif grime and grime.paths and grime.paths[name] and grime.paths[name] ~= "" then
+                    p = grime.paths[name]
+                elseif grime and grime.config and grime.config.get then
+                    p = grime.config.get(name)
+                end
+                if not p or p == "" or p == "auto" then
+                    return fallback
+                end
+                return p
+            end
         elseif k == "projects_root" then
             return function()
-                return grime and grime.config and grime.config.projects_root() or "./projects"
+                local p = (c.paths and c.paths.projects)
+                    or (grime and grime.paths and grime.paths.projects)
+                    or (grime and grime.config and grime.config.projects_root and grime.config.projects_root())
+                if not p or p == "" then
+                    local home = os.getenv("HOME") or ""
+                    p = (home ~= "" and (home .. "/Projects")) or "./projects"
+                end
+                return helper.normalize_path(p)
             end
         elseif k == "templates_root" then
             return function()
-                return grime and grime.config and grime.config.templates_root() or "./templates"
+                local p = (c.paths and c.paths.templates)
+                    or (grime and grime.paths and grime.paths.templates)
+                    or (grime and grime.config and grime.config.templates_root and grime.config.templates_root())
+                if not p or p == "" then
+                    local home = os.getenv("HOME") or ""
+                    p = (home ~= "" and (home .. "/.config/grime/templates")) or "./templates"
+                end
+                return helper.normalize_path(p)
+            end
+        elseif k == "apps_root" then
+            return function()
+                local p = (c.paths and c.paths.apps)
+                    or (grime and grime.paths and grime.paths.apps)
+                    or (grime and grime.config and grime.config.apps_root and grime.config.apps_root())
+                if not p or p == "" then
+                    local home = os.getenv("HOME") or ""
+                    p = (home ~= "" and (home .. "/.config/grime/apps")) or "./apps"
+                end
+                return helper.normalize_path(p)
             end
         elseif k == "config_dir" then
             return function()
-                return grime and grime.config and grime.config.config_dir() or "."
+                local p = (c.paths and c.paths.config)
+                    or (grime and grime.paths and grime.paths.config)
+                    or (grime and grime.config and grime.config.config_dir and grime.config.config_dir())
+                if not p or p == "" then
+                    local home = os.getenv("HOME") or ""
+                    p = (home ~= "" and (home .. "/.config/grime")) or "."
+                end
+                return helper.normalize_path(p)
             end
         elseif k == "get_config" then
             return function(key, default)

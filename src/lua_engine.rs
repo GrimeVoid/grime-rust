@@ -444,7 +444,22 @@ impl GrimeLuaEngine {
                 Ok(cfg_tpl.templates_root().to_string_lossy().to_string())
             })?,
         )?;
+
+        let cfg_apps = cfg.clone();
+        cfg_tbl.set(
+            "apps_root",
+            lua.create_function(move |_, ()| {
+                Ok(cfg_apps.apps_root().to_string_lossy().to_string())
+            })?,
+        )?;
         grime_tbl.set("config", cfg_tbl)?;
+
+        // grime.paths (единый реестр путей)
+        let paths_tbl = lua.create_table()?;
+        for (k, v) in &self.config.paths {
+            paths_tbl.set(k.as_str(), v.as_str())?;
+        }
+        grime_tbl.set("paths", paths_tbl.clone())?;
 
         // grime.msgpack
         let msgpack_tbl = lua.create_table()?;
@@ -539,6 +554,7 @@ impl GrimeLuaEngine {
         // grime.ctx (инициализируем пустой контекст)
         let ctx_tbl = lua.create_table()?;
         ctx_tbl.set("args", lua.create_table()?)?;
+        ctx_tbl.set("paths", paths_tbl)?;
         ctx_tbl.set("target_dir", ".")?;
         ctx_tbl.set("pipeline_input", Value::Nil)?;
         ctx_tbl.set("payload", Value::Nil)?;
@@ -673,6 +689,12 @@ impl GrimeLuaEngine {
 
         let has_next = step_index < total_steps.saturating_sub(1);
         let is_last = !has_next;
+
+        let paths_tbl = lua.create_table()?;
+        for (k, v) in &self.config.paths {
+            paths_tbl.set(k.as_str(), v.as_str())?;
+        }
+        ctx.set("paths", paths_tbl)?;
 
         ctx.set("args", args_tbl)?;
         ctx.set("target_dir", target_dir.to_string_lossy().to_string())?;
@@ -917,6 +939,37 @@ mod tests {
         let dir: String = lua.load(script).eval().expect("config api eval");
         assert!(!dir.is_empty());
     }
+
+    #[test]
+    fn test_lua_paths_registry() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            -- 1. Проверка grime.paths
+            assert(grime.paths ~= nil, "grime.paths should exist")
+            assert(grime.paths.config ~= nil, "grime.paths.config should exist")
+            assert(grime.paths.projects ~= nil, "grime.paths.projects should exist")
+            assert(grime.paths.templates ~= nil, "grime.paths.templates should exist")
+            assert(grime.paths.apps ~= nil, "grime.paths.apps should exist")
+
+            -- 2. Проверка grime.ctx.paths
+            assert(grime.ctx.paths ~= nil, "grime.ctx.paths should exist")
+            assert(grime.ctx.paths.apps == grime.paths.apps)
+            assert(grime.ctx.paths.projects == grime.paths.projects)
+            assert(grime.ctx.paths.templates == grime.paths.templates)
+
+            -- 3. Проверка grime.config.get_all()
+            local all = grime.config.get_all()
+            assert(all.apps == grime.paths.apps)
+
+            return grime.paths.apps
+        "#;
+
+        let apps_path: String = lua.load(script).eval().expect("paths registry eval");
+        assert!(!apps_path.is_empty());
+    }
 }
+
 
 

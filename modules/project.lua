@@ -40,8 +40,30 @@ local function detect_language(dir)
     return nil
 end
 
+local function get_projects_root()
+    local root = (ctx.paths and ctx.paths.projects)
+        or (ctx.get_path and ctx.get_path("projects"))
+        or (ctx.projects_root and ctx.projects_root())
+    if not root or root == "" then
+        local home = os.getenv("HOME") or ""
+        root = (home ~= "" and (home .. "/Projects")) or "./projects"
+    end
+    return ctx.normalize_path(root)
+end
+
+local function get_templates_root()
+    local root = (ctx.paths and ctx.paths.templates)
+        or (ctx.get_path and ctx.get_path("templates"))
+        or (ctx.templates_root and ctx.templates_root())
+    if not root or root == "" then
+        local home = os.getenv("HOME") or ""
+        root = (home ~= "" and (home .. "/.config/grime/templates")) or "./templates"
+    end
+    return ctx.normalize_path(root)
+end
+
 local function get_language_dir(projects_root, lang)
-    projects_root = ctx.normalize_path(projects_root)
+    projects_root = ctx.normalize_path(projects_root or get_projects_root())
     local candidates = {
         projects_root .. "/" .. lang,
         projects_root .. "/" .. lang:sub(1,1):upper() .. lang:sub(2),
@@ -148,7 +170,7 @@ local function handle_rename(projects_root, args)
 end
 
 local function resolve_project_context(parsed)
-    local projects_root = ctx.projects_root()
+    local projects_root = get_projects_root()
     local supported_langs = get_supported_languages()
 
     local action = parsed.action or "path"
@@ -224,7 +246,7 @@ local function resolve_project_context(parsed)
 end
 
 function main()
-    local projects_root = ctx.projects_root()
+    local projects_root = get_projects_root()
 
     local cls = classifier.new({
         actions = ACTION_SYNONYMS,

@@ -28,10 +28,15 @@ end
 
 function CppAdapter:create_default_files(root, ctx)
     local proj_name = root:match("([^/\\]+)$") or "MyGame"
+    local tpl_root = (ctx.paths and ctx.paths.templates)
+        or (ctx.get_path and ctx.get_path("templates"))
+        or (ctx.templates_root and ctx.templates_root())
+        or "./templates"
+    tpl_root = ctx.normalize_path(tpl_root)
 
     local cmake_file = root .. "/CMakeLists.txt"
     if not ctx.exists(cmake_file) then
-        local tpl = ctx.templates_root() .. "/cpp/CMakeLists.txt"
+        local tpl = tpl_root .. "/cpp/CMakeLists.txt"
         if ctx.exists(tpl) then
             ctx.copy(tpl, cmake_file)
             ctx.log("Шаблон CMakeLists.txt скопирован")
@@ -54,7 +59,7 @@ add_executable(%s src/main.cpp)
 
     local main_file = root .. "/src/main.cpp"
     if not ctx.exists(main_file) then
-        local tpl = ctx.templates_root() .. "/cpp/main.cpp"
+        local tpl = tpl_root .. "/cpp/main.cpp"
         if ctx.exists(tpl) then
             ctx.copy(tpl, main_file)
             ctx.log("Шаблон src/main.cpp скопирован")

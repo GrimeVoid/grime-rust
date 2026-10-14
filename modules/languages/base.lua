@@ -81,8 +81,9 @@ function BaseAdapter:apply_template(root, ctx, extra)
         or "./templates"
     local tpl_dir = ctx.normalize_path(tpl_root) .. "/" .. self.name
     if not ctx.exists(tpl_dir) then
-        local dotfiles_tpl = "/home/danny/dotfiles/grime/templates/" .. self.name
-        if ctx.exists(dotfiles_tpl) then
+        local home_dir = os.getenv("HOME") or ""
+        local dotfiles_tpl = home_dir .. "/dotfiles/grime/templates/" .. self.name
+        if home_dir ~= "" and ctx.exists(dotfiles_tpl) then
             tpl_dir = dotfiles_tpl
         else
             return false

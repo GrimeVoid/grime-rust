@@ -411,6 +411,7 @@ impl GrimeLuaEngine {
         target_dir: &Path,
         pipeline_input: Option<&str>,
         payload: Option<&PipelinePayload>,
+        force: bool,
     ) -> Result<(), mlua::Error> {
         context::update_step_context(
             &self.lua,
@@ -421,6 +422,7 @@ impl GrimeLuaEngine {
             target_dir,
             pipeline_input,
             payload,
+            force,
         )
     }
 
@@ -535,8 +537,8 @@ impl GrimeLuaEngine {
         let grime: mlua::Table = globals.get("grime")?;
         let ctx: mlua::Table = grime.get("ctx")?;
 
-        let status: bool = ctx.get("_status").unwrap_or(true);
-        let error_msg: Option<String> = ctx.get("_error_message").ok();
+        let mut status: bool = ctx.get("_status").unwrap_or(true);
+        let mut error_msg: Option<String> = ctx.get("_error_message").ok();
         let mut ret_val: Option<String> = ctx.get("_return_value").ok();
         let mut ret_payload: Option<PipelinePayload> = ctx
             .get::<Option<PipelinePayload>>("_return_payload")
@@ -545,21 +547,53 @@ impl GrimeLuaEngine {
 
         // Если модуль вернул значение напрямую (через return в скрипте/main), но не вызвал ctx.success(val):
         if ret_val.is_none() && ret_payload.is_none() {
-            if let Some(val) = direct_return_value {
-                if let Some(payload) = extract_payload(val.clone()) {
-                    let text = payload.to_string_lossy();
-                    ret_val = Some(text);
-                    ret_payload = Some(payload);
-                } else {
-                    let s = match val {
-                        Value::String(st) => st.to_string_lossy().to_string(),
-                        Value::Integer(i) => i.to_string(),
-                        Value::Number(n) => n.to_string(),
-                        Value::Boolean(b) => b.to_string(),
-                        _ => format!("{:?}", val),
-                    };
-                    ret_payload = Some(PipelinePayload::from_string(s.clone()));
-                    ret_val = Some(s);
+            if let Some(ref val) = direct_return_value {
+                match val {
+                    Value::Boolean(false) => {
+                        status = false;
+                        if error_msg.is_none() {
+                            error_msg = Some(format!("Модуль '{}' вернул false", module_name));
+                        }
+                    }
+                    Value::Table(ref tbl) => {
+                        let is_ok = match tbl.get::<Value>("ok") {
+                            Ok(Value::Boolean(b)) => Some(b),
+                            _ => match tbl.get::<Value>("success") {
+                                Ok(Value::Boolean(b)) => Some(b),
+                                _ => None,
+                            },
+                        };
+                        if is_ok == Some(false) {
+                            status = false;
+                            let msg: Option<String> = tbl.get("error").ok().or_else(|| tbl.get("message").ok());
+                            error_msg = msg.or_else(|| Some(format!("Модуль '{}' завершился со статусом ошибки", module_name)));
+                        } else if let Ok(json_val) = crate::state_bus::lua_to_json(val.clone()) {
+                            let s = serde_json::to_string(&json_val).unwrap_or_else(|_| format!("{:?}", val));
+                            ret_payload = Some(PipelinePayload::from_string(s.clone()));
+                            ret_val = Some(s);
+                        } else {
+                            let s = format!("{:?}", val);
+                            ret_payload = Some(PipelinePayload::from_string(s.clone()));
+                            ret_val = Some(s);
+                        }
+                    }
+                    _ => {
+                        if let Some(payload) = extract_payload(val.clone()) {
+                            let text = payload.to_string_lossy();
+                            ret_val = Some(text);
+                            ret_payload = Some(payload);
+                        } else {
+                            let s = match val {
+                                Value::String(st) => st.to_string_lossy().to_string(),
+                                Value::Integer(i) => i.to_string(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Boolean(b) => b.to_string(),
+                                _ => format!("{:?}", val),
+                            };
+                            ret_payload = Some(PipelinePayload::from_string(s.clone()));
+                            ret_val = Some(s);
+                        }
+                    }
                 }
             }
         }

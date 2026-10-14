@@ -69,9 +69,9 @@ function main()
     end
 
     local search_dirs = {
+        "modules",
         ctx.config_dir() .. "/modules",
         (os.getenv("HOME") or "") .. "/dotfiles/grime/modules",
-        "modules",
     }
 
     local found_modules = {}
@@ -80,19 +80,21 @@ function main()
     for _, dir in ipairs(search_dirs) do
         local norm_dir = grime.fs.normalize(dir)
         if grime.fs.is_dir(norm_dir) then
-            local files = grime.fs.list(norm_dir)
+            local files = grime.fs.list(norm_dir) or {}
             for _, f in ipairs(files) do
                 if f:sub(-4) == ".lua" then
                     local name = f:sub(1, -5)
                     if not seen[name] then
                         seen[name] = true
                         local full_path = grime.fs.join(norm_dir, f)
-                        local desc = extract_summary(full_path, name)
+                        local is_valid_file = grime.fs.is_file(full_path)
+                        local status = is_valid_file and "Активен" or "Поврежденный симлинк"
+                        local desc = is_valid_file and extract_summary(full_path, name) or "Файл или симлинк недоступен"
                         table.insert(found_modules, {
                             name = name,
                             desc = desc,
                             path = full_path,
-                            status = "Активен",
+                            status = status,
                         })
                     end
                 end

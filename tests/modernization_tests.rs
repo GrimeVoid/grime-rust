@@ -529,5 +529,171 @@ async fn test_command_list_and_aliases() {
     }
 }
 
+#[tokio::test]
+async fn test_pipeline_table_to_json_serialization() {
+    let tmp = TestTempDir::new("grime_json_table");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("producer_tbl.lua"),
+        r#"
+        function main()
+            return {
+                status = "ok",
+                count = 42,
+                items = { "apple", "banana" }
+            }
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("consumer_tbl.lua"),
+        r#"
+        function main()
+            local raw = grime.ctx.input or grime.ctx.pipeline_input
+            assert(raw and #raw > 0, "Ожидался JSON input")
+            local parsed = grime.json.decode(raw)
+            assert(parsed.status == "ok", "Ожидался status == ok")
+            assert(parsed.count == 42, "Ожидался count == 42")
+            assert(#parsed.items == 2, "Ожидалось 2 элемента")
+            grime.ctx.success("verified:" .. parsed.items[1])
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["producer_tbl".to_string(), ":".to_string(), "consumer_tbl".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_ok(), "Пайплайн упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "verified:apple");
+}
+
+#[tokio::test]
+async fn test_pipeline_stop_on_error_and_return_false() {
+    let tmp = TestTempDir::new("grime_stop_err");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("fail_step.lua"),
+        r#"
+        function main()
+            return false
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("never_step.lua"),
+        r#"
+        function main()
+            grime.bus.set("modules.never.ran", true)
+            grime.ctx.success("ran")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir.clone()), None).unwrap();
+
+    // 1. Без force: конвейер останавливается на fail_step, never_step не выполняется
+    let parsed_no_force = parse_pipeline_args(&["fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
+    let res = orch.run_pipeline(&parsed_no_force).await;
+    assert!(res.is_err(), "Конвейер должен был вернуть ошибку без --force");
+    assert!(!orch.state_bus().has("modules.never.ran"), "never_step не должен был запускаться!");
+
+    // 2. С force: конвейер продолжает выполнение
+    let parsed_force = parse_pipeline_args(&["--force".to_string(), "fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
+    assert!(parsed_force.force);
+    let res_force = orch.run_pipeline(&parsed_force).await;
+    assert!(res_force.is_ok(), "Конвейер с --force должен был продолжить работу");
+    assert!(orch.state_bus().has("modules.never.ran"), "never_step должен был запуститься с --force!");
+}
+
+#[tokio::test]
+async fn test_pipeline_input_special_characters_and_multiline() {
+    let tmp = TestTempDir::new("grime_special_chars");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("producer_multiline.lua"),
+        r#"
+        function main()
+            local multiline = "Line 1 with spaces\nLine 2 with \"quotes\" and 'single'\nLine 3: 🦀 русские символы!"
+            grime.ctx.success(multiline)
+        end
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("consumer_multiline.lua"),
+        r#"
+        function main()
+            local inp = grime.ctx.input or grime.ctx.pipeline_input
+            assert(inp:find("Line 1 with spaces"), "Строка 1 не найдена")
+            assert(inp:find("Line 2 with \"quotes\""), "Строка 2 не найдена")
+            assert(inp:find("🦀 русские символы!"), "Строка 3 не найдена")
+            grime.ctx.success("multiline_verified")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["producer_multiline".to_string(), "->".to_string(), "consumer_multiline".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_ok(), "Многострочный пайплайн упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "multiline_verified");
+}
+
+#[tokio::test]
+async fn test_project_overwrite_protection() {
+    let tmp = TestTempDir::new("grime_proj_overwrite");
+    let proj_dir = tmp.path().join("existing_project");
+    fs::create_dir_all(&proj_dir).unwrap();
+    fs::write(proj_dir.join("important_user_code.txt"), "DO NOT OVERWRITE ME!").unwrap();
+
+    let local_mods = PathBuf::from("modules");
+    if local_mods.exists() {
+        let orch = Orchestrator::new(Some(local_mods), None).unwrap();
+
+        // 1. Попытка создания без --force в существующей непустой директории должна вернуть ошибку
+        let parsed_no_force = parse_pipeline_args(&[
+            "project".to_string(),
+            "init".to_string(),
+            "cpp".to_string(),
+            proj_dir.to_string_lossy().to_string(),
+        ]);
+        let res = orch.run_pipeline(&parsed_no_force).await;
+        assert!(res.is_err(), "Инициализация поверх непустой директории без --force должна завершиться ошибкой!");
+        let err_msg = res.unwrap_err();
+        assert!(err_msg.contains("уже существует и не пуста"));
+
+        // Файл пользователя не должен быть поврежден
+        let content = fs::read_to_string(proj_dir.join("important_user_code.txt")).unwrap();
+        assert_eq!(content, "DO NOT OVERWRITE ME!");
+
+        // 2. С флагом --force инициализация проходит успешно
+        let parsed_force = parse_pipeline_args(&[
+            "--force".to_string(),
+            "project".to_string(),
+            "init".to_string(),
+            "cpp".to_string(),
+            proj_dir.to_string_lossy().to_string(),
+        ]);
+        assert!(parsed_force.force);
+        let res_force = orch.run_pipeline(&parsed_force).await;
+        assert!(res_force.is_ok(), "Инициализация с --force должна была выполниться: {:?}", res_force);
+    }
+}
+
+
 
 

@@ -315,6 +315,7 @@ function main()
         flags = {
             path_requested = { "path", "-p", "--path", "-path" },
             help = { "help", "-h", "--help" },
+            force = { "-f", "--force", "-force" },
         },
         categories = { language = LANGUAGE_ALIASES },
         detect_dir = true,
@@ -359,6 +360,25 @@ function main()
     end
 
     if action == "init" then
+        local is_forced = (ctx.force == true)
+            or (ctx.flags and ctx.flags.force == true)
+            or (parsed.flags and parsed.flags.force == true)
+
+        if ctx.exists(project_dir) then
+            local is_empty = true
+            local files = (grime and grime.fs and grime.fs.list) and grime.fs.list(project_dir) or {}
+            for _, f in ipairs(files) do
+                if f ~= "." and f ~= ".." then
+                    is_empty = false
+                    break
+                end
+            end
+            if not is_empty and not is_forced then
+                ctx.fail(string.format("Директория '%s' уже существует и не пуста! Используйте --force для перезаписи.", project_dir))
+                return
+            end
+        end
+
         ctx.mkdir_p(project_dir)
         adapter:init_project(project_dir, ctx)
         ctx.log(string.format("Проект под %s инициализирован: %s", lang, project_dir))

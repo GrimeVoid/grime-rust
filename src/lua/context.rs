@@ -35,6 +35,10 @@ pub fn init_context_table(
     ctx_tbl.set("total_steps", 1)?;
     ctx_tbl.set("has_next_step", false)?;
     ctx_tbl.set("is_last_step", true)?;
+    ctx_tbl.set("force", false)?;
+    let flags_init = lua.create_table()?;
+    flags_init.set("force", false)?;
+    ctx_tbl.set("flags", flags_init)?;
     ctx_tbl.set("_status", true)?;
     ctx_tbl.set("_error_message", Value::Nil)?;
     ctx_tbl.set("_return_value", Value::Nil)?;
@@ -87,6 +91,13 @@ pub fn init_context_table(
                         Value::Integer(i) => i.to_string(),
                         Value::Number(n) => n.to_string(),
                         Value::Boolean(b) => b.to_string(),
+                        Value::Table(_) => {
+                            if let Ok(json_val) = crate::state_bus::lua_to_json(v.clone()) {
+                                serde_json::to_string(&json_val).unwrap_or_else(|_| format!("{:?}", v))
+                            } else {
+                                format!("{:?}", v)
+                            }
+                        }
                         _ => format!("{:?}", v),
                     };
                     c.set("_return_value", s.clone())?;
@@ -504,6 +515,7 @@ pub fn update_step_context(
     target_dir: &Path,
     pipeline_input: Option<&str>,
     payload: Option<&PipelinePayload>,
+    force: bool,
 ) -> Result<(), mlua::Error> {
     let globals = lua.globals();
     let grime: Table = globals.get("grime")?;
@@ -523,6 +535,10 @@ pub fn update_step_context(
     ctx.set("total_steps", total_steps as i64)?;
     ctx.set("has_next_step", has_next)?;
     ctx.set("is_last_step", is_last)?;
+    ctx.set("force", force)?;
+    let flags_tbl = lua.create_table()?;
+    flags_tbl.set("force", force)?;
+    ctx.set("flags", flags_tbl)?;
     ctx.set("_status", true)?;
     ctx.set("_error_message", Value::Nil)?;
     ctx.set("_return_value", Value::Nil)?;

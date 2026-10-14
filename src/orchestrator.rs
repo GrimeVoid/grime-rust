@@ -134,18 +134,26 @@ impl Orchestrator {
 
             // Выполнение шага Lua модуля: авто-определение рабочей директории из выхода прошлого шага
             if let Some(ref data) = pipeline_data {
-                let candidate = PathBuf::from(data.trim());
-                if candidate.exists() {
-                    let dir = if candidate.is_file() {
-                        candidate.parent().unwrap_or(&candidate).to_path_buf()
-                    } else {
-                        candidate
-                    };
-                    current_target_dir = crate::fs_ops::normalize_path(&dir);
+                let trimmed = data.trim();
+                if !trimmed.is_empty()
+                    && trimmed.len() < 4096
+                    && !trimmed.contains('\n')
+                    && !trimmed.starts_with('{')
+                    && !trimmed.starts_with('[')
+                {
+                    let candidate = PathBuf::from(trimmed);
+                    if candidate.exists() {
+                        let dir = if candidate.is_file() {
+                            candidate.parent().unwrap_or(&candidate).to_path_buf()
+                        } else {
+                            candidate
+                        };
+                        current_target_dir = crate::fs_ops::normalize_path(&dir);
+                    }
                 }
             }
 
-            // Установка контекста шага с передачей PipelinePayload (Zero-Copy bytes::Bytes)
+            // Установка контекста шага с передачей PipelinePayload (Zero-Copy bytes::Bytes) и флага force
             if let Err(e) = self.engine.set_step_context(
                 step,
                 step_idx,
@@ -153,6 +161,7 @@ impl Orchestrator {
                 &current_target_dir,
                 pipeline_data.as_deref(),
                 pipeline_payload.as_ref(),
+                parsed.force,
             ) {
                 for m in &executed_modules {
                     self.engine.call_cleanup(m);

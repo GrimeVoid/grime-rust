@@ -599,6 +599,13 @@ local function handle_detailed_list(mgr, filter_tokens, all_mode)
         hint_all = string.format(" Для отображения всех зависимостей: grime pkg %s -a.", mgr)
     end
     io.stdout:write(string.format("\27[90mПоказано: %d пакетов.%s Для запуска: grime pkg run <имя>\27[0m\n\n", count_matched, hint_all))
+    if ctx.has_next_step then
+        local names = {}
+        for _, item in ipairs(display_pkgs) do
+            table.insert(names, item.pkg.name)
+        end
+        ctx.module_return(table.concat(names, "\n"))
+    end
 end
 
 -- 3. Сквозной нечеткий поиск пакета по всем менеджерам
@@ -616,6 +623,7 @@ local function handle_search(query_tokens, all_mode)
     local managers = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local total_found = 0
     local managers_found = 0
+    local all_matched_names = {}
 
     for _, mgr in ipairs(managers) do
         local bin = MANAGER_BINARIES[mgr]
@@ -651,6 +659,7 @@ local function handle_search(query_tokens, all_mode)
                     io.stdout:write(string.format("\n  \27[1;33m[%s]\27[0m \27[90m(найдено: %d)\27[0m\n", mgr_label, #matches))
                     for _, item in ipairs(matches) do
                         local p = item.pkg
+                        table.insert(all_matched_names, p.name)
                         local extra_info = p.details or ""
                         if p.path and p.path ~= "" then
                             if extra_info ~= "" then
@@ -683,6 +692,10 @@ local function handle_search(query_tokens, all_mode)
             io.stdout:write("  \27[90m(Поиск только среди пользовательских пакетов. Для поиска по всем зависимостям добавьте -a)\27[0m\n")
         end
         io.stdout:write("\n")
+    end
+
+    if ctx.has_next_step then
+        ctx.module_return(table.concat(all_matched_names, "\n"))
     end
 end
 
@@ -931,7 +944,8 @@ function main()
         -- Вызов grime pkg или grime pkg -a / grime pkg list без аргументов -> сводная таблица
         handle_summary(all_mode)
         if ctx.has_next_step then
-            ctx.module_return(ctx.target_dir)
+            local active_mgrs = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
+            ctx.module_return(table.concat(active_mgrs, "\n"))
         end
         return
     end
@@ -947,9 +961,5 @@ function main()
     else
         -- Первый аргумент не совпал с менеджером — выполняем сквозной нечеткий поиск пакета
         handle_search(raw_tokens, all_mode)
-    end
-
-    if ctx.has_next_step then
-        ctx.module_return(ctx.target_dir)
     end
 end

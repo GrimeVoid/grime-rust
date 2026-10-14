@@ -38,13 +38,22 @@ function main()
         return
     end
 
+    if not (grime and grime.bus) then
+        ctx.fail("Шина состояния Grime (StateBus) недоступна в текущем контексте")
+        return
+    end
+
     if action == "get" then
         local key = args[2] or ctx.input or ctx.pipeline_input
         if not key or #key == 0 then
             ctx.fail("Укажите ключ для чтения: grime bus get <key>")
             return
         end
-        local val = grime.bus.get(key)
+        local ok, val = pcall(grime.bus.get, key)
+        if not ok then
+            ctx.fail("Не удалось прочитать ключ '" .. key .. "' из шины: " .. tostring(val))
+            return
+        end
         if val == nil then
             ctx.log("Ключ '" .. key .. "' не найден")
             ctx.success(nil)
@@ -83,10 +92,18 @@ function main()
             ctx.fail("Укажите ключ: grime bus has <key>")
             return
         end
-        local exists = grime.bus.has(key)
+        local ok, exists = pcall(grime.bus.has, key)
+        if not ok then
+            ctx.fail("Не удалось проверить ключ '" .. key .. "' в шине: " .. tostring(exists))
+            return
+        end
         print(tostring(exists))
         ctx.success(tostring(exists))
     elseif action == "emit" then
+        if not (grime and grime.events) then
+            ctx.fail("Шина событий Grime (EventBus) недоступна")
+            return
+        end
         local event_name = args[2]
         if not event_name then
             ctx.fail("Укажите имя события: grime bus emit <event> [json_payload]")
@@ -102,9 +119,13 @@ function main()
                 payload = { message = payload_str }
             end
         end
-        grime.events.emit(event_name, payload)
-        ctx.log(string.format("Событие '%s' отправлено в шину", event_name))
-        ctx.success(event_name)
+        local ok, err = pcall(grime.events.emit, event_name, payload)
+        if ok then
+            ctx.log(string.format("Событие '%s' отправлено в шину", event_name))
+            ctx.success(event_name)
+        else
+            ctx.fail("Не удалось опубликовать событие '" .. event_name .. "': " .. tostring(err))
+        end
     else
         ctx.fail("Неизвестная команда bus: " .. action)
     end

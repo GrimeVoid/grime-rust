@@ -184,6 +184,41 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
         return 0
     end
 
+    if ctx.has_next_step and not is_detach and not m.detached then
+        local cmd_str = to_cmd_str(cmd_tokens)
+        if ctx.is_file(app_dir .. "/flake.nix") or ctx.exists(app_dir .. "/flake.nix") then
+            cmd_str = string.format("nix develop --command sh -c %q", cmd_str)
+        elseif ctx.is_file(app_dir .. "/shell.nix") or ctx.exists(app_dir .. "/shell.nix") then
+            cmd_str = string.format("nix-shell shell.nix --run %q", cmd_str)
+        elseif m.nix then
+            local pkgs = type(m.nix) == "table" and table.concat(m.nix, " ") or tostring(m.nix)
+            cmd_str = string.format("nix-shell -p %s --run %q", pkgs, cmd_str)
+        elseif m.box and m.box ~= "" then
+            cmd_str = string.format("distrobox enter %s -- sh -c %q", m.box, cmd_str)
+        end
+
+        local run_cmd = cmd_str
+        local tmp_file = nil
+        local cur_payload = ctx.input or ctx.pipeline_input
+        if cur_payload and cur_payload ~= "" then
+            tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
+            local f = io.open(tmp_file, "w")
+            if f then f:write(cur_payload); f:close() end
+            run_cmd = string.format("%s < %q", cmd_str, tmp_file)
+        end
+
+        local res = ctx.capture(run_cmd, app_dir, env)
+        if tmp_file then ctx.delete(tmp_file, true) end
+
+        if res.code ~= 0 then
+            return res.code
+        end
+
+        local out = res.stdout or ""
+        ctx.success(out)
+        return 0
+    end
+
     return exec_cmd(m, cmd_tokens, app_dir, env)
 end
 
@@ -255,7 +290,7 @@ local function run_chain(apps_root, segments)
         local run_cmd = cmd_str
         local tmp_file = nil
         if cur_payload and cur_payload ~= "" then
-            tmp_file = dir .. "/.chain_in_" .. tostring(os.time()) .. ".tmp"
+            tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
             local f = io.open(tmp_file, "w")
             if f then f:write(cur_payload); f:close() end
             run_cmd = string.format("%s < %q", cmd_str, tmp_file)
@@ -530,7 +565,9 @@ function main()
         if code ~= 0 then
             ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code))
         else
-            ctx.success(dir)
+            if not ctx.has_next_step then
+                ctx.success(dir)
+            end
         end
     end
 end

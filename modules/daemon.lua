@@ -26,7 +26,17 @@ local function get_socket_path()
     if xdg and #xdg > 0 then
         return xdg .. "/grime.sock"
     end
-    return "/tmp/grime-" .. (os.getenv("USER") or "default") .. ".sock"
+    local uid = "default"
+    local uid_p = io.popen("id -u 2>/dev/null")
+    if uid_p then
+        local u = uid_p:read("*line")
+        uid_p:close()
+        if u and #u > 0 then uid = u:match("%d+") or uid end
+    end
+    if ctx.exists("/run/user/" .. uid) then
+        return "/run/user/" .. uid .. "/grime.sock"
+    end
+    return "/tmp/grime-" .. uid .. ".sock"
 end
 
 function main()

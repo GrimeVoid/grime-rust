@@ -1,5 +1,3 @@
-local helper = require("helper")
-
 local classifier = {}
 classifier.__index = classifier
 
@@ -70,9 +68,9 @@ function classifier:parse(args, default_target_dir)
 
             for flag_name, patterns in pairs(self.flags) do
                 for _, pat in ipairs(patterns) do
-                    local matched = helper.fuzzy_match_flag(tok, { pat }, self.fuzzy_threshold)
+                    local matched = grime.fuzzy.match_flag(tok, { pat }, self.fuzzy_threshold)
                     if matched then
-                        local sim = helper.similarity(tok:gsub("^%-%-?", ""), pat:gsub("^%-%-?", ""))
+                        local sim = grime.fuzzy.similarity(tok:gsub("^%-%-?", ""), pat:gsub("^%-%-?", ""))
                         if sim > best_score then
                             if best_flag_name and best_flag_name ~= flag_name then
                                 second_best_score = best_score

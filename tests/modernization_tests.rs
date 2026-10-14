@@ -383,3 +383,53 @@ async fn test_fuzzy_matching_entities_and_flags() {
     assert_eq!(res.unwrap().unwrap(), "fuzzy_tests_passed");
 }
 
+#[tokio::test]
+async fn test_no_helper_lua_native_execution() {
+    let temp = TestTempDir::new("grime_no_helper_test");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    // Убеждаемся, что helper.lua физически отсутствует в тестовой директории
+    assert!(!mod_dir.join("helper.lua").exists());
+
+    // Скопируем реальные модули cmd.lua и classifier.lua
+    let repo_modules = Path::new("modules");
+    if repo_modules.join("classifier.lua").exists() {
+        fs::copy(repo_modules.join("classifier.lua"), mod_dir.join("classifier.lua")).unwrap();
+    }
+    if repo_modules.join("cmd.lua").exists() {
+        fs::copy(repo_modules.join("cmd.lua"), mod_dir.join("cmd.lua")).unwrap();
+    }
+
+    // Тестовый модуль native_test.lua, который не запрашивает helper
+    fs::write(
+        mod_dir.join("native_test.lua"),
+        r#"
+        local ctx = grime.ctx
+
+        function main()
+            assert(helper == nil, "helper is not required by default")
+            assert(ctx ~= nil, "global/native ctx exists")
+            assert(ctx.args ~= nil, "ctx.args exists")
+            assert(ctx.paths ~= nil, "ctx.paths exists")
+            assert(ctx.exists(".") == true, "ctx.exists works")
+            assert(grime.str.to_snake_case("NativeRunner") == "native_runner")
+            assert(grime.fs.normalize("./foo/../bar"):find("bar") ~= nil)
+
+            local matched = grime.fuzzy.match_flag("--al", { "--all", "-a" }, 0.75)
+            assert(matched == "--all")
+
+            ctx.success("native_ok")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["native_test".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+
+    assert!(res.is_ok(), "Пайплайн без helper.lua упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "native_ok");
+}
+

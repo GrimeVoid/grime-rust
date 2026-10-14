@@ -1,6 +1,5 @@
-local helper = require("helper")
 local classifier = require("classifier")
-local ctx = helper.ctx
+local ctx = grime.ctx
 
 local ACTIONS = {
     list = "list", ls = "list", l = "list", show = "list",
@@ -161,7 +160,7 @@ local function resolve_manager(query)
     end
 
     -- 4. Унифицированный нечеткий поиск менеджеров с высоким порогом (порог 0.75)
-    local best_mgr, score = helper.find_best_match(q, CANONICAL_MANAGERS, 0.75)
+    local best_mgr, score = grime.fuzzy.find_best_match(q, CANONICAL_MANAGERS, 0.75)
     if best_mgr then
         return best_mgr
     end
@@ -859,7 +858,7 @@ end
 
 function main()
     for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
         if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return

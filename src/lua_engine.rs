@@ -403,6 +403,66 @@ impl GrimeLuaEngine {
                 Ok(is_newer(&s, &t))
             })?,
         )?;
+
+        fs_tbl.set(
+            "join",
+            lua.create_function(|_, parts: MultiValue| {
+                let mut res = PathBuf::new();
+                for val in parts {
+                    if let Value::String(s) = val {
+                        let part = s.to_str()?;
+                        if !part.is_empty() {
+                            let expanded = shellexpand::tilde(part.as_ref()).to_string();
+                            res.push(expanded);
+                        }
+                    }
+                }
+                let normalized = crate::fs_ops::normalize_path(&res);
+                Ok(normalized.to_string_lossy().to_string())
+            })?,
+        )?;
+
+        fs_tbl.set(
+            "read",
+            lua.create_function(|_, path: String| {
+                let p = PathBuf::from(shellexpand::tilde(&path).to_string());
+                match fs::read_to_string(&p) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(_) => Ok(None),
+                }
+            })?,
+        )?;
+
+        fs_tbl.set(
+            "write",
+            lua.create_function(|_, (path, content): (String, String)| {
+                let p = PathBuf::from(shellexpand::tilde(&path).to_string());
+                if let Some(parent) = p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match fs::write(&p, content) {
+                    Ok(_) => Ok(true),
+                    Err(e) => Err(mlua::Error::runtime(format!("fs.write failed: {}", e))),
+                }
+            })?,
+        )?;
+
+        fs_tbl.set(
+            "list",
+            lua.create_function(|lua, path: Option<String>| {
+                let p_str = path.unwrap_or_else(|| ".".to_string());
+                let p = PathBuf::from(shellexpand::tilde(&p_str).to_string());
+                let tbl = lua.create_table()?;
+                if let Ok(entries) = fs::read_dir(&p) {
+                    for (idx, entry) in entries.flatten().enumerate() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        tbl.set(idx + 1, name)?;
+                    }
+                }
+                Ok(tbl)
+            })?,
+        )?;
+
         grime_tbl.set("fs", fs_tbl)?;
 
         // grime.config
@@ -523,7 +583,246 @@ impl GrimeLuaEngine {
                 Ok(s)
             })?,
         )?;
-        grime_tbl.set("json", json_tbl)?;
+        grime_tbl.set("json", &json_tbl)?;
+
+        // grime.str
+        let str_tbl = lua.create_table()?;
+        str_tbl.set(
+            "to_snake_case",
+            lua.create_function(|_, s: String| {
+                let mut result = String::new();
+                let chars: Vec<char> = s.chars().collect();
+                for i in 0..chars.len() {
+                    let c = chars[i];
+                    if c.is_whitespace() || c == '-' {
+                        if !result.ends_with('_') && !result.is_empty() {
+                            result.push('_');
+                        }
+                    } else if c.is_uppercase() {
+                        if i > 0 && !result.ends_with('_') {
+                            let prev = chars[i - 1];
+                            if prev.is_lowercase() || prev.is_numeric() {
+                                result.push('_');
+                            }
+                        }
+                        for lc in c.to_lowercase() {
+                            result.push(lc);
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                Ok(result.trim_matches('_').to_string())
+            })?,
+        )?;
+        str_tbl.set(
+            "to_kebab_case",
+            lua.create_function(|_, s: String| {
+                let mut result = String::new();
+                let chars: Vec<char> = s.chars().collect();
+                for i in 0..chars.len() {
+                    let c = chars[i];
+                    if c.is_whitespace() || c == '_' {
+                        if !result.ends_with('-') && !result.is_empty() {
+                            result.push('-');
+                        }
+                    } else if c.is_uppercase() {
+                        if i > 0 && !result.ends_with('-') {
+                            let prev = chars[i - 1];
+                            if prev.is_lowercase() || prev.is_numeric() {
+                                result.push('-');
+                            }
+                        }
+                        for lc in c.to_lowercase() {
+                            result.push(lc);
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                Ok(result.trim_matches('-').to_string())
+            })?,
+        )?;
+        str_tbl.set(
+            "trim",
+            lua.create_function(|_, s: String| {
+                Ok(s.trim().to_string())
+            })?,
+        )?;
+        str_tbl.set(
+            "split",
+            lua.create_function(|lua, (s, sep): (String, Option<String>)| {
+                let tbl = lua.create_table()?;
+                let separator = sep.unwrap_or_else(|| " ".to_string());
+                if separator.is_empty() {
+                    for (idx, ch) in s.chars().enumerate() {
+                        tbl.set(idx + 1, ch.to_string())?;
+                    }
+                } else {
+                    for (idx, part) in s.split(&separator).enumerate() {
+                        tbl.set(idx + 1, part.to_string())?;
+                    }
+                }
+                Ok(tbl)
+            })?,
+        )?;
+        str_tbl.set(
+            "starts_with",
+            lua.create_function(|_, (s, prefix): (String, String)| {
+                Ok(s.starts_with(&prefix))
+            })?,
+        )?;
+        str_tbl.set(
+            "ends_with",
+            lua.create_function(|_, (s, suffix): (String, String)| {
+                Ok(s.ends_with(&suffix))
+            })?,
+        )?;
+        str_tbl.set(
+            "pad_left",
+            lua.create_function(|_, (s, len, ch): (String, usize, Option<String>)| {
+                let pad_char = ch.and_then(|c| c.chars().next()).unwrap_or(' ');
+                let cur_len = s.chars().count();
+                if cur_len >= len {
+                    Ok(s)
+                } else {
+                    let pad: String = std::iter::repeat(pad_char).take(len - cur_len).collect();
+                    Ok(format!("{}{}", pad, s))
+                }
+            })?,
+        )?;
+        str_tbl.set(
+            "pad_right",
+            lua.create_function(|_, (s, len, ch): (String, usize, Option<String>)| {
+                let pad_char = ch.and_then(|c| c.chars().next()).unwrap_or(' ');
+                let cur_len = s.chars().count();
+                if cur_len >= len {
+                    Ok(s)
+                } else {
+                    let pad: String = std::iter::repeat(pad_char).take(len - cur_len).collect();
+                    Ok(format!("{}{}", s, pad))
+                }
+            })?,
+        )?;
+        grime_tbl.set("str", &str_tbl)?;
+
+        // grime.table
+        let tbl_tbl = lua.create_table()?;
+        tbl_tbl.set(
+            "keys",
+            lua.create_function(|lua, tbl: mlua::Table| {
+                let res = lua.create_table()?;
+                let mut idx = 1;
+                for pair in tbl.pairs::<Value, Value>() {
+                    let (k, _) = pair?;
+                    res.set(idx, k)?;
+                    idx += 1;
+                }
+                Ok(res)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "values",
+            lua.create_function(|lua, tbl: mlua::Table| {
+                let res = lua.create_table()?;
+                let mut idx = 1;
+                for pair in tbl.pairs::<Value, Value>() {
+                    let (_, v) = pair?;
+                    res.set(idx, v)?;
+                    idx += 1;
+                }
+                Ok(res)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "contains",
+            lua.create_function(|_, (tbl, target): (mlua::Table, Value)| {
+                for pair in tbl.pairs::<Value, Value>() {
+                    let (_, v) = pair?;
+                    if v == target {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "merge",
+            lua.create_function(|lua, (t1, t2): (mlua::Table, mlua::Table)| {
+                let res = lua.create_table()?;
+                for pair in t1.pairs::<Value, Value>() {
+                    let (k, v) = pair?;
+                    res.set(k, v)?;
+                }
+                for pair in t2.pairs::<Value, Value>() {
+                    let (k, v) = pair?;
+                    res.set(k, v)?;
+                }
+                Ok(res)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "filter",
+            lua.create_function(|lua, (tbl, pred): (mlua::Table, mlua::Function)| {
+                let res = lua.create_table()?;
+                let mut out_idx = 1;
+                let len = tbl.raw_len();
+                if len > 0 {
+                    for i in 1..=len {
+                        let val: Value = tbl.get(i)?;
+                        if pred.call::<bool>(val.clone())? {
+                            res.set(out_idx, val)?;
+                            out_idx += 1;
+                        }
+                    }
+                } else {
+                    for pair in tbl.pairs::<Value, Value>() {
+                        let (k, v) = pair?;
+                        if pred.call::<bool>((v.clone(), k.clone()))? {
+                            res.set(k, v)?;
+                        }
+                    }
+                }
+                Ok(res)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "map",
+            lua.create_function(|lua, (tbl, mapper): (mlua::Table, mlua::Function)| {
+                let res = lua.create_table()?;
+                let len = tbl.raw_len();
+                if len > 0 {
+                    for i in 1..=len {
+                        let val: Value = tbl.get(i)?;
+                        let mapped: Value = mapper.call(val)?;
+                        res.set(i, mapped)?;
+                    }
+                } else {
+                    for pair in tbl.pairs::<Value, Value>() {
+                        let (k, v) = pair?;
+                        let mapped: Value = mapper.call((v, k.clone()))?;
+                        res.set(k, mapped)?;
+                    }
+                }
+                Ok(res)
+            })?,
+        )?;
+        tbl_tbl.set(
+            "slice",
+            lua.create_function(|lua, (tbl, start, end_idx): (mlua::Table, usize, Option<usize>)| {
+                let res = lua.create_table()?;
+                let len = tbl.raw_len();
+                let finish = end_idx.unwrap_or(len).min(len);
+                let mut out_idx = 1;
+                for i in start..=finish {
+                    let val: Value = tbl.get(i)?;
+                    res.set(out_idx, val)?;
+                    out_idx += 1;
+                }
+                Ok(res)
+            })?,
+        )?;
+        grime_tbl.set("table", tbl_tbl)?;
 
         // grime.ui
         let ui_tbl = lua.create_table()?;
@@ -553,6 +852,83 @@ impl GrimeLuaEngine {
             lua.create_function(|_, msg: String| {
                 eprintln!("{} {}", "[Grime Success]".green().bold(), msg);
                 Ok(())
+            })?,
+        )?;
+        ui_tbl.set(
+            "print_table",
+            lua.create_function(|_, (rows, headers): (Vec<Vec<String>>, Option<Vec<String>>)| {
+                let mut col_widths: Vec<usize> = Vec::new();
+                if let Some(ref hdrs) = headers {
+                    for (col_idx, h) in hdrs.iter().enumerate() {
+                        if col_widths.len() <= col_idx {
+                            col_widths.push(h.chars().count());
+                        } else {
+                            col_widths[col_idx] = col_widths[col_idx].max(h.chars().count());
+                        }
+                    }
+                }
+                for row in &rows {
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        let cell_len = cell.chars().count();
+                        if col_widths.len() <= col_idx {
+                            col_widths.push(cell_len);
+                        } else {
+                            col_widths[col_idx] = col_widths[col_idx].max(cell_len);
+                        }
+                    }
+                }
+
+                if let Some(ref hdrs) = headers {
+                    let mut header_line = String::new();
+                    for (i, h) in hdrs.iter().enumerate() {
+                        let width = col_widths.get(i).copied().unwrap_or(h.len());
+                        header_line.push_str(&format!("{:<width$}  ", h, width = width));
+                    }
+                    println!("{}", header_line.bold());
+                    let sep_len: usize = col_widths.iter().map(|w| w + 2).sum();
+                    println!("{}", "-".repeat(sep_len).dimmed());
+                }
+
+                for row in &rows {
+                    let mut row_line = String::new();
+                    for (i, cell) in row.iter().enumerate() {
+                        let width = col_widths.get(i).copied().unwrap_or(cell.len());
+                        row_line.push_str(&format!("{:<width$}  ", cell, width = width));
+                    }
+                    println!("{}", row_line);
+                }
+                Ok(())
+            })?,
+        )?;
+        ui_tbl.set(
+            "format_columns",
+            lua.create_function(|lua, (items, max_width): (Vec<String>, Option<usize>)| {
+                let limit = max_width.unwrap_or(80);
+                let max_item_len = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+                let col_width = max_item_len + 2;
+                let num_cols = (limit / col_width.max(1)).max(1);
+                let mut out_lines = Vec::new();
+
+                let mut current_line = String::new();
+                let mut col_count = 0;
+                for item in &items {
+                    if col_count >= num_cols {
+                        out_lines.push(current_line);
+                        current_line = String::new();
+                        col_count = 0;
+                    }
+                    current_line.push_str(&format!("{:<width$}", item, width = col_width));
+                    col_count += 1;
+                }
+                if !current_line.is_empty() {
+                    out_lines.push(current_line);
+                }
+
+                let res_tbl = lua.create_table()?;
+                for (idx, l) in out_lines.into_iter().enumerate() {
+                    res_tbl.set(idx + 1, l)?;
+                }
+                Ok(res_tbl)
             })?,
         )?;
         grime_tbl.set("ui", ui_tbl)?;
@@ -598,11 +974,79 @@ impl GrimeLuaEngine {
             })?,
         )?;
         fuzzy_tbl.set(
-            "find_best_match",
-            lua.create_function(|_, (query, candidates, threshold): (String, Vec<String>, Option<f64>)| {
+            "fuzzy_match_flag",
+            lua.create_function(|_, (token, candidates, threshold): (String, Vec<String>, Option<f64>)| {
                 let thresh = threshold.unwrap_or(0.75);
                 let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-                Ok(crate::args::fuzzy_match_entity(&query, &cand_refs, thresh).map(|s| s.to_string()))
+                Ok(crate::args::fuzzy_match_flag(&token, &cand_refs, thresh).map(|s| s.to_string()))
+            })?,
+        )?;
+        fuzzy_tbl.set(
+            "find_best_match",
+            lua.create_function(|lua, (query, candidates, threshold): (String, Value, Option<f64>)| {
+                let thresh = threshold.unwrap_or(0.75);
+                let mut cand_list = Vec::new();
+                if let Value::Table(tbl) = candidates {
+                    let len = tbl.raw_len();
+                    if len > 0 {
+                        for i in 1..=len {
+                            if let Ok(s) = tbl.get::<String>(i) {
+                                if !s.is_empty() {
+                                    cand_list.push(s);
+                                }
+                            }
+                        }
+                    } else {
+                        for pair in tbl.pairs::<Value, Value>() {
+                            if let Ok((k, _)) = pair {
+                                if let Value::String(s) = k {
+                                    if let Ok(utf8) = s.to_str() {
+                                        if !utf8.is_empty() {
+                                            cand_list.push(utf8.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let cand_refs: Vec<&str> = cand_list.iter().map(|s| s.as_str()).collect();
+                if let Some(matched) = crate::args::fuzzy_match_entity(&query, &cand_refs, thresh) {
+                    let sim = crate::args::flag_similarity(&query, matched);
+                    let m_str = lua.create_string(matched)?;
+                    let mut multi = MultiValue::new();
+                    multi.push_back(Value::String(m_str));
+                    multi.push_back(Value::Number(sim));
+                    Ok(multi)
+                } else {
+                    let mut multi = MultiValue::new();
+                    multi.push_back(Value::Nil);
+                    multi.push_back(Value::Number(0.0));
+                    Ok(multi)
+                }
+            })?,
+        )?;
+        fuzzy_tbl.set(
+            "fuzzy_match",
+            fuzzy_tbl.get::<Value>("find_best_match")?,
+        )?;
+        fuzzy_tbl.set(
+            "normalize_flags",
+            lua.create_function(|lua, (args, known_flags, threshold): (Vec<String>, Vec<String>, Option<f64>)| {
+                let thresh = threshold.unwrap_or(0.75);
+                let cand_refs: Vec<&str> = known_flags.iter().map(|s| s.as_str()).collect();
+                let res_tbl = lua.create_table()?;
+                for (idx, arg) in args.iter().enumerate() {
+                    let replaced = if arg.starts_with('-') && arg != "--" {
+                        crate::args::fuzzy_match_flag(arg, &cand_refs, thresh)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| arg.clone())
+                    } else {
+                        arg.clone()
+                    };
+                    res_tbl.set(idx + 1, replaced)?;
+                }
+                Ok(res_tbl)
             })?,
         )?;
         grime_tbl.set("fuzzy", fuzzy_tbl)?;
@@ -708,9 +1152,331 @@ impl GrimeLuaEngine {
             })?,
         )?;
 
-        grime_tbl.set("ctx", ctx_tbl)?;
+        // Логирование и вывод через ctx
+        ctx_tbl.set(
+            "log",
+            lua.create_function(|_, msg: String| {
+                eprintln!("{} {}", "[Grime]".cyan().bold(), msg);
+                Ok(())
+            })?,
+        )?;
+        ctx_tbl.set(
+            "warn",
+            lua.create_function(|_, msg: String| {
+                eprintln!("{} {}", "[Grime Warning]".yellow().bold(), msg);
+                Ok(())
+            })?,
+        )?;
+        ctx_tbl.set(
+            "error",
+            lua.create_function(|_, msg: String| {
+                eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
+                Ok(())
+            })?,
+        )?;
+
+        // Запуск процессов через ctx
+        ctx_tbl.set(
+            "run_process",
+            lua.create_function(|lua_ctx, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let proc_tbl: mlua::Table = g.get("process")?;
+                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let run_fn: mlua::Function = proc_tbl.get("run_interactive")?;
+                run_fn.call::<i32>((cmd, effective_cwd, env))
+            })?,
+        )?;
+        ctx_tbl.set("run_interactive", ctx_tbl.get::<Value>("run_process")?)?;
+
+        ctx_tbl.set(
+            "run_shell",
+            lua.create_function(|lua_ctx, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let proc_tbl: mlua::Table = g.get("process")?;
+                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let run_fn: mlua::Function = proc_tbl.get("run")?;
+                run_fn.call::<i32>((cmd, effective_cwd, env))
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "capture",
+            lua.create_function(|lua_ctx, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let proc_tbl: mlua::Table = g.get("process")?;
+                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let cap_fn: mlua::Function = proc_tbl.get("capture")?;
+                cap_fn.call::<Value>((cmd, effective_cwd, env))
+            })?,
+        )?;
+
+        // Файловые операции через ctx
+        ctx_tbl.set(
+            "exists",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("exists")?;
+                f.call::<bool>(path)
+            })?,
+        )?;
+        ctx_tbl.set(
+            "is_dir",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("is_dir")?;
+                f.call::<bool>(path)
+            })?,
+        )?;
+        ctx_tbl.set(
+            "is_file",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("is_file")?;
+                f.call::<bool>(path)
+            })?,
+        )?;
+        ctx_tbl.set(
+            "mkdir_p",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("mkdir_p")?;
+                f.call::<bool>(path)
+            })?,
+        )?;
+        ctx_tbl.set(
+            "delete",
+            lua.create_function(|lua_ctx, (path, missing_ok): (String, Option<bool>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("delete")?;
+                f.call::<bool>((path, missing_ok))
+            })?,
+        )?;
+        ctx_tbl.set("remove", ctx_tbl.get::<Value>("delete")?)?;
+
+        ctx_tbl.set(
+            "copy",
+            lua.create_function(|lua_ctx, (src, dst): (String, String)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("copy")?;
+                f.call::<String>((src, dst))
+            })?,
+        )?;
+        ctx_tbl.set(
+            "move",
+            lua.create_function(|lua_ctx, (src, dst): (String, String)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("move")?;
+                f.call::<String>((src, dst))
+            })?,
+        )?;
+        ctx_tbl.set("rename", ctx_tbl.get::<Value>("move")?)?;
+
+        ctx_tbl.set(
+            "mtime",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("mtime")?;
+                f.call::<f64>(path)
+            })?,
+        )?;
+        ctx_tbl.set(
+            "is_newer",
+            lua.create_function(|lua_ctx, (src, target): (String, String)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("is_newer")?;
+                f.call::<bool>((src, target))
+            })?,
+        )?;
+        ctx_tbl.set("needs_rebuild", ctx_tbl.get::<Value>("is_newer")?)?;
+
+        ctx_tbl.set(
+            "normalize_path",
+            lua.create_function(|lua_ctx, path: String| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("normalize")?;
+                f.call::<String>(path)
+            })?,
+        )?;
+        ctx_tbl.set("normalize", ctx_tbl.get::<Value>("normalize_path")?)?;
+
+        ctx_tbl.set(
+            "join",
+            lua.create_function(|lua_ctx, parts: MultiValue| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let f: mlua::Function = fs_tbl.get("join")?;
+                f.call::<String>(parts)
+            })?,
+        )?;
+        ctx_tbl.set("path_join", ctx_tbl.get::<Value>("join")?)?;
+
+        // Получение путей и конфигураций через ctx
+        ctx_tbl.set(
+            "get_path",
+            lua.create_function(|lua_ctx, (name, fallback): (Option<String>, Option<String>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                if let Some(n) = name {
+                    if let Ok(paths) = c.get::<mlua::Table>("paths") {
+                        if let Ok(val) = paths.get::<String>(n.as_str()) {
+                            if !val.is_empty() && val != "auto" {
+                                return Ok(Some(val));
+                            }
+                        }
+                    }
+                    if let Ok(paths) = g.get::<mlua::Table>("paths") {
+                        if let Ok(val) = paths.get::<String>(n.as_str()) {
+                            if !val.is_empty() && val != "auto" {
+                                return Ok(Some(val));
+                            }
+                        }
+                    }
+                    if let Ok(cfg) = g.get::<mlua::Table>("config") {
+                        if let Ok(get_fn) = cfg.get::<mlua::Function>("get") {
+                            if let Ok(val) = get_fn.call::<Option<String>>(n.as_str()) {
+                                if let Some(v) = val {
+                                    if !v.is_empty() && v != "auto" {
+                                        return Ok(Some(v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(fallback)
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "projects_root",
+            lua.create_function(|lua_ctx, ()| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let get_path_fn: mlua::Function = c.get("get_path")?;
+                let default_p = dirs::home_dir().map(|h| h.join("Projects").to_string_lossy().to_string()).unwrap_or_else(|| "./projects".to_string());
+                let p: String = get_path_fn.call(("projects", Some(default_p)))?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+                norm_fn.call::<String>(p)
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "templates_root",
+            lua.create_function(|lua_ctx, ()| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let get_path_fn: mlua::Function = c.get("get_path")?;
+                let default_p = dirs::home_dir().map(|h| h.join(".config").join("grime").join("templates").to_string_lossy().to_string()).unwrap_or_else(|| "./templates".to_string());
+                let p: String = get_path_fn.call(("templates", Some(default_p)))?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+                norm_fn.call::<String>(p)
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "apps_root",
+            lua.create_function(|lua_ctx, ()| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let get_path_fn: mlua::Function = c.get("get_path")?;
+                let default_p = dirs::home_dir().map(|h| h.join(".config").join("grime").join("apps").to_string_lossy().to_string()).unwrap_or_else(|| "./apps".to_string());
+                let p: String = get_path_fn.call(("apps", Some(default_p)))?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+                norm_fn.call::<String>(p)
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "config_dir",
+            lua.create_function(|lua_ctx, ()| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let c: mlua::Table = g.get("ctx")?;
+                let get_path_fn: mlua::Function = c.get("get_path")?;
+                let default_p = dirs::home_dir().map(|h| h.join(".config").join("grime").to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+                let p: String = get_path_fn.call(("config", Some(default_p)))?;
+                let fs_tbl: mlua::Table = g.get("fs")?;
+                let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+                norm_fn.call::<String>(p)
+            })?,
+        )?;
+
+        ctx_tbl.set(
+            "get_config",
+            lua.create_function(|lua_ctx, (key, default): (String, Option<String>)| {
+                let globals = lua_ctx.globals();
+                let g: mlua::Table = globals.get("grime")?;
+                let cfg: mlua::Table = g.get("config")?;
+                let get_fn: mlua::Function = cfg.get("get")?;
+                get_fn.call::<Option<String>>((key, default))
+            })?,
+        )?;
+
+        ctx_tbl.set("json", json_tbl.clone())?;
+        ctx_tbl.set("to_snake_case", str_tbl.get::<Value>("to_snake_case")?)?;
+
+        grime_tbl.set("ctx", ctx_tbl.clone())?;
 
         lua.globals().set("grime", grime_tbl)?;
+        lua.globals().set("ctx", ctx_tbl)?;
+
+        // Встроенный прелюд Grime (prelude) для стандартных хелперов и совместимости
+        let prelude = r#"
+            package.preload["helper"] = function()
+                return {
+                    ctx = grime.ctx,
+                    normalize_path = grime.fs.normalize,
+                    join = grime.fs.join,
+                    path_join = grime.fs.join,
+                    to_snake_case = grime.str.to_snake_case,
+                    to_kebab_case = grime.str.to_kebab_case,
+                    json_decode = grime.json.decode,
+                    json_encode = grime.json.encode,
+                    damerau_levenshtein = grime.fuzzy.damerau_levenshtein,
+                    similarity = grime.fuzzy.similarity,
+                    fuzzy_match_flag = grime.fuzzy.match_flag,
+                    normalize_flags = grime.fuzzy.normalize_flags,
+                    find_best_match = grime.fuzzy.find_best_match,
+                    fuzzy_match = grime.fuzzy.find_best_match,
+                }
+            end
+            _G.ctx = grime.ctx
+        "#;
+        lua.load(prelude).set_name("@grime/prelude.lua").exec()?;
 
         // 3. Регистрация API Shared State Bus (`grime.bus.*`)
         register_state_bus_api(lua, self.state_bus.clone())?;
@@ -774,6 +1540,8 @@ impl GrimeLuaEngine {
         } else {
             ctx.set("payload", Value::Nil)?;
         }
+
+        globals.set("ctx", ctx)?;
 
         Ok(())
     }
@@ -1066,6 +1834,109 @@ mod tests {
         "#;
 
         let res: bool = lua.load(script).eval().expect("json encode/decode eval");
+        assert!(res);
+    }
+
+    #[test]
+    fn test_lua_str_api() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            assert(grime.str.to_snake_case("HelloWorld") == "hello_world")
+            assert(grime.str.to_snake_case("my-super-app") == "my_super_app")
+            assert(grime.str.to_kebab_case("HelloWorld") == "hello-world")
+            assert(grime.str.trim("   hello world   ") == "hello world")
+            local parts = grime.str.split("a,b,c", ",")
+            assert(#parts == 3 and parts[1] == "a" and parts[2] == "b" and parts[3] == "c")
+            assert(grime.str.starts_with("prefix_val", "prefix") == true)
+            assert(grime.str.ends_with("val_suffix", "suffix") == true)
+            assert(grime.str.pad_left("5", 3, "0") == "005")
+            assert(grime.str.pad_right("abc", 5, " ") == "abc  ")
+            return true
+        "#;
+        let res: bool = lua.load(script).eval().expect("str api eval");
+        assert!(res);
+    }
+
+    #[test]
+    fn test_lua_table_api() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            local t = { a = 1, b = 2 }
+            local keys = grime.table.keys(t)
+            assert(#keys == 2)
+            assert(grime.table.contains(keys, "a") or grime.table.contains(keys, "b"))
+
+            local merged = grime.table.merge({ x = 1 }, { y = 2 })
+            assert(merged.x == 1 and merged.y == 2)
+
+            local list = { 1, 2, 3, 4, 5 }
+            local evens = grime.table.filter(list, function(v) return v % 2 == 0 end)
+            assert(#evens == 2 and evens[1] == 2 and evens[2] == 4)
+
+            local doubled = grime.table.map(list, function(v) return v * 2 end)
+            assert(#doubled == 5 and doubled[1] == 2 and doubled[5] == 10)
+
+            local sliced = grime.table.slice(list, 2, 4)
+            assert(#sliced == 3 and sliced[1] == 2 and sliced[3] == 4)
+            return true
+        "#;
+        let res: bool = lua.load(script).eval().expect("table api eval");
+        assert!(res);
+    }
+
+    #[test]
+    fn test_lua_fuzzy_and_fs_and_ctx_native() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Init lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            -- 1. Fuzzy match
+            local best, score = grime.fuzzy.find_best_match("pckg", { "pkg", "app", "box" }, 0.75)
+            assert(best == "pkg", "find_best_match pckg -> pkg")
+            assert(score > 0.75)
+
+            -- Поиск по словарю с ключами
+            local dict_candidates = { ["pacman"] = true, ["cargo"] = true, ["nix"] = true }
+            local best_dict = grime.fuzzy.find_best_match("pacmn", dict_candidates, 0.75)
+            assert(best_dict == "pacman", "find_best_match with dict keys")
+
+            -- Флаги
+            local flags = { "--help", "-h", "--all", "-a" }
+            assert(grime.fuzzy.match_flag("--al", flags, 0.75) == "--all")
+            assert(grime.fuzzy.fuzzy_match_flag("--halp", flags, 0.75) == "--help")
+
+            local normalized = grime.fuzzy.normalize_flags({ "--al", "my_pkg", "-hlp" }, flags, 0.75)
+            assert(#normalized == 3)
+            assert(normalized[1] == "--all")
+            assert(normalized[2] == "my_pkg")
+            assert(normalized[3] == "--help")
+
+            -- 2. FS
+            local joined = grime.fs.join("foo", "bar", "baz")
+            assert(joined:find("foo/bar/baz") ~= nil)
+
+            -- 3. Context native
+            assert(ctx ~= nil, "global ctx exists")
+            assert(ctx.normalize_path ~= nil)
+            assert(ctx.projects_root ~= nil and #ctx.projects_root() > 0)
+            assert(ctx.apps_root ~= nil and #ctx.apps_root() > 0)
+            assert(ctx.templates_root ~= nil and #ctx.templates_root() > 0)
+            assert(ctx.config_dir ~= nil and #ctx.config_dir() > 0)
+            assert(ctx.to_snake_case("AppTest") == "app_test")
+
+            -- 4. Обратная совместимость через package.preload['helper']
+            local helper = require("helper")
+            assert(helper ~= nil, "helper preloaded")
+            assert(helper.ctx == ctx, "helper.ctx is same as ctx")
+            assert(helper.find_best_match("proj", { "project", "pkg" }, 0.75) == "project")
+
+            return true
+        "#;
+        let res: bool = lua.load(script).eval().expect("fuzzy fs ctx native eval");
         assert!(res);
     }
 }

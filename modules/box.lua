@@ -1,6 +1,5 @@
-local helper = require("helper")
 local classifier = require("classifier")
-local ctx = helper.ctx
+local ctx = grime.ctx
 
 local ACTIONS = {
     list = "list", ls = "list", status = "list", ps = "list",
@@ -325,7 +324,7 @@ end
 
 function main()
     for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
         if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return

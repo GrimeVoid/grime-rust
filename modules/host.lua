@@ -1,5 +1,4 @@
-local helper = require("helper")
-local ctx = helper.ctx
+local ctx = grime.ctx
 
 local function print_help()
     print(string.format([[

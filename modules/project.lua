@@ -1,6 +1,5 @@
-local helper = require("helper")
 local classifier = require("classifier")
-local ctx = helper.ctx
+local ctx = grime.ctx
 
 local ACTION_SYNONYMS = {
     delete = "delete", del = "delete", remove = "delete", rm = "delete", d = "delete",
@@ -126,7 +125,7 @@ local function find_project_dir(lang_dir, query)
     end
 
     -- 5. Нечеткий поиск с высоким порогом (порог 0.75)
-    local best, score = helper.find_best_match(query, subdirs, 0.75)
+    local best, score = grime.fuzzy.find_best_match(query, subdirs, 0.75)
     if best then
         ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
         return lang_dir .. "/" .. best
@@ -301,7 +300,7 @@ function main()
     end
 
     for _, a in ipairs(raw_args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
         if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return

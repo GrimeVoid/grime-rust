@@ -1,5 +1,4 @@
-local helper = require("helper")
-local ctx = helper.ctx
+local ctx = grime.ctx
 local BaseAdapter = require("languages.base")
 local aider = require("aider")
 local box = require("box")
@@ -206,7 +205,7 @@ local function resolve_app_name(apps_root, raw_name)
         p:close()
     end
 
-    local best = helper.find_best_match(raw_name, installed, 0.75)
+    local best = grime.fuzzy.find_best_match(raw_name, installed, 0.75)
     if best then
         ctx.log(string.format("Приложение '%s' не найдено, выбрано похожее: '%s'", raw_name, best))
         return best
@@ -454,7 +453,7 @@ function main()
     local is_detach, filtered = false, {}
     local wants_help = false
     for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--detach", "-d", "--help", "-h" }, 0.75) or a
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--detach", "-d", "--help", "-h" }, 0.75) or a
         if matched == "--detach" or matched == "-d" then
             is_detach = true
         elseif matched == "--help" or matched == "-h" or a == "help" then

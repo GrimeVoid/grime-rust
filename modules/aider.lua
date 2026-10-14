@@ -1,5 +1,4 @@
-local helper = require("helper")
-local ctx = helper.ctx
+local ctx = grime.ctx
 
 local GRIME_CONVENTIONS = [[
 
@@ -206,7 +205,7 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
     desc = desc:gsub("\n", " "):gsub('"', '\\"')
 
     -- Плейсхолдеры для замены
-    local snake_name = helper.to_snake_case(app_name)
+    local snake_name = grime.str.to_snake_case(app_name)
     local replacements = {
         ["{{PROJECT_NAME}}"] = app_name,
         ["{{PROJECT_NAME_LOWER}}"] = app_name:lower(),
@@ -319,7 +318,7 @@ local function parse_aider_tags(output, working_dir)
             local raw_val = content:match("^%s*(.-)%s*$")
             local val = raw_val
             if b_type == "json" or raw_val:match("^[%[{]") then
-                local decoded = helper.json_decode(raw_val)
+                local decoded = grime.json.decode(raw_val)
                 if decoded ~= nil then
                     val = decoded
                 end
@@ -445,7 +444,7 @@ function main()
     end
 
     local first_arg = raw_cli_args[1]
-    local first_flag = (type(first_arg) == "string" and first_arg:match("^%-")) and helper.fuzzy_match_flag(first_arg, { "--help", "-h" }, 0.75) or first_arg
+    local first_flag = (type(first_arg) == "string" and first_arg:match("^%-")) and grime.fuzzy.match_flag(first_arg, { "--help", "-h" }, 0.75) or first_arg
     if (#raw_cli_args == 0 and not ctx.pipeline_input) or first_flag == "--help" or first_flag == "-h" or first_arg == "help" then
         print_help()
         return
@@ -464,7 +463,7 @@ function main()
     local idx = 1
     while idx <= #raw_cli_args do
         local a = raw_cli_args[idx]
-        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--app", "--lang", "-l" }, 0.75) or a
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--app", "--lang", "-l" }, 0.75) or a
         if matched == "--app" then
             is_app_mode = true
             if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then

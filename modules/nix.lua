@@ -331,7 +331,8 @@ function main()
     end
 
     for _, a in ipairs(raw_args) do
-        if a == "--help" or a == "-h" or a == "help" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return
         end

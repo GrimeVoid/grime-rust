@@ -125,12 +125,11 @@ local function find_project_dir(lang_dir, query)
         end
     end
 
-    -- 5. Нечеткий поиск через grime.fuzzy
-    if grime and grime.fuzzy then
-        local best = grime.fuzzy.match_best(query, subdirs)
-        if best then
-            return lang_dir .. "/" .. best
-        end
+    -- 5. Нечеткий поиск с высоким порогом (порог 0.75)
+    local best, score = helper.find_best_match(query, subdirs, 0.75)
+    if best then
+        ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
+        return lang_dir .. "/" .. best
     end
 
     return nil
@@ -302,7 +301,8 @@ function main()
     end
 
     for _, a in ipairs(raw_args) do
-        if a == "--help" or a == "-h" or a == "help" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return
         end

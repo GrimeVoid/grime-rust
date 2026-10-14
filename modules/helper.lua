@@ -260,5 +260,282 @@ function helper.json_encode(val)
     return tostring(val)
 end
 
+-- Расстояние Дамерау-Левенштейна (с транспозициями соседних символов)
+function helper.damerau_levenshtein(s1, s2)
+    if grime and grime.fuzzy and grime.fuzzy.damerau_levenshtein then
+        local ok, res = pcall(grime.fuzzy.damerau_levenshtein, s1, s2)
+        if ok and res ~= nil then return res end
+    end
+
+    local len1 = #(s1 or "")
+    local len2 = #(s2 or "")
+    if len1 == 0 then return len2 end
+    if len2 == 0 then return len1 end
+
+    local d = {}
+    for i = 0, len1 do
+        d[i] = { [0] = i }
+    end
+    for j = 0, len2 do
+        d[0][j] = j
+    end
+
+    for i = 1, len1 do
+        local c1 = s1:sub(i, i)
+        for j = 1, len2 do
+            local c2 = s2:sub(j, j)
+            local cost = (c1 == c2) and 0 or 1
+
+            local del = d[i - 1][j] + 1
+            local ins = d[i][j - 1] + 1
+            local sub = d[i - 1][j - 1] + cost
+
+            local min_val = del
+            if ins < min_val then min_val = ins end
+            if sub < min_val then min_val = sub end
+
+            if i > 1 and j > 1 and c1 == s2:sub(j - 1, j - 1) and s1:sub(i - 1, i - 1) == c2 then
+                local trans = d[i - 2][j - 2] + 1
+                if trans < min_val then min_val = trans end
+            end
+
+            d[i][j] = min_val
+        end
+    end
+
+    return d[len1][len2]
+end
+
+-- Мера сходства флагов (от 0.0 до 1.0)
+function helper.similarity(s1, s2)
+    if grime and grime.fuzzy and grime.fuzzy.similarity then
+        local ok, res = pcall(grime.fuzzy.similarity, s1, s2)
+        if ok and res ~= nil then return res end
+    end
+
+    local inp = (s1 or ""):lower()
+    local cand = (s2 or ""):lower()
+    if inp == cand then return 1.0 end
+
+    local len_inp = #inp
+    local len_cand = #cand
+    if len_inp == 0 or len_cand == 0 then return 0.0 end
+
+    local max_len = (len_inp > len_cand) and len_inp or len_cand
+    local dist = helper.damerau_levenshtein(inp, cand)
+    local base_sim = 1.0 - (dist / max_len)
+
+    -- Префиксный бонус
+    if cand:find(inp, 1, true) == 1 and len_inp >= 2 then
+        local diff = len_cand - len_inp
+        if diff <= 3 then
+            local prefix_sim = 1.0 - (diff / (len_cand * 2.0))
+            if prefix_sim > base_sim then
+                base_sim = prefix_sim
+            end
+        end
+    end
+
+    -- Граничный бонус (совпадение первой и последней буквы)
+    if dist == 1 and len_inp >= 3 and len_cand >= 3 then
+        if inp:sub(1, 1) == cand:sub(1, 1) and inp:sub(-1) == cand:sub(-1) then
+            base_sim = math.min(1.0, base_sim + 0.05)
+        end
+    end
+
+    return base_sim
+end
+
+-- Нечёткий поиск флага с высоким порогом (threshold по умолчанию 0.75)
+-- ПРАВИЛО: произвольные строковые значения (не начинающиеся с '-') не затрагиваются!
+function helper.fuzzy_match_flag(token, known_flags, threshold)
+    threshold = threshold or 0.75
+    if not token or type(token) ~= "string" then return nil end
+
+    -- Строгое ограничение: только аргументы, начинающиеся с '-' и не являющиеся '--'
+    if not token:match("^%-") or token == "--" then
+        return nil
+    end
+
+    -- Если токен совпадает в точности с одним из флагов
+    for _, cand in ipairs(known_flags or {}) do
+        if token == cand then
+            return cand
+        end
+    end
+
+    -- Вызов нативного Rust-матчера при наличии
+    if grime and grime.fuzzy and grime.fuzzy.match_flag then
+        local ok, res = pcall(grime.fuzzy.match_flag, token, known_flags, threshold)
+        if ok and res ~= nil then return res end
+    end
+
+    local is_double = (token:sub(1, 2) == "--")
+    local input_raw = token:gsub("^%-%-?", ""):lower()
+    local len_raw = #input_raw
+
+    -- Однобуквенные флаги (-x, -h, -a) не подвергаются нечеткому поиску
+    if len_raw <= 1 then
+        return nil
+    end
+
+    local best_candidate = nil
+    local best_cand_raw = nil
+    local best_score = 0.0
+    local second_best_score = 0.0
+
+    for _, cand in ipairs(known_flags or {}) do
+        local cand_is_double = (cand:sub(1, 2) == "--")
+        local cand_raw = cand:gsub("^%-%-?", ""):lower()
+        local len_cand = #cand_raw
+
+        if len_cand > 1 then
+            local sim = helper.similarity(input_raw, cand_raw)
+            local dist = helper.damerau_levenshtein(input_raw, cand_raw)
+
+            local valid_dist = false
+            if len_cand <= 4 then
+                valid_dist = (dist <= 1) or (cand_raw:find(input_raw, 1, true) == 1)
+            elseif len_cand <= 7 then
+                valid_dist = (dist <= 2)
+            else
+                valid_dist = (dist <= 3)
+            end
+
+            if valid_dist and sim >= threshold then
+                if best_cand_raw and best_cand_raw == cand_raw then
+                    if cand_is_double == is_double then
+                        best_candidate = cand
+                    end
+                elseif sim > best_score then
+                    second_best_score = best_score
+                    best_score = sim
+                    best_candidate = cand
+                    best_cand_raw = cand_raw
+                elseif math.abs(sim - best_score) < 1e-4 then
+                    second_best_score = sim
+                elseif sim > second_best_score then
+                    second_best_score = sim
+                end
+            end
+        end
+    end
+
+    if best_candidate then
+        if (best_score - second_best_score >= 0.08) or (second_best_score < threshold) then
+            return best_candidate
+        end
+    end
+
+    return nil
+end
+
+-- Нормализация списка аргументов для флагов (позиционные строковые аргументы остаются неизменными)
+function helper.normalize_flags(args, known_flags, threshold)
+    threshold = threshold or 0.75
+    local res = {}
+    for _, arg in ipairs(args or {}) do
+        if type(arg) == "string" and arg:match("^%-") and arg ~= "--" then
+            local matched = helper.fuzzy_match_flag(arg, known_flags, threshold)
+            table.insert(res, matched or arg)
+        else
+            table.insert(res, arg)
+        end
+    end
+    return res
+end
+
+-- Универсальный нечёткий поиск лучшего совпадения для ключевых сущностей
+-- (имена модулей, приложений, проектов, пакетов и пакетных менеджеров).
+-- threshold по умолчанию 0.75. Принимает список строк или таблицу с ключами.
+function helper.find_best_match(query, candidates, threshold)
+    threshold = threshold or 0.75
+    if not query or type(query) ~= "string" or query == "" then
+        return nil, 0.0
+    end
+
+    local q = query:lower():match("^%s*(.-)%s*$")
+    if not q or q == "" then
+        return nil, 0.0
+    end
+
+    -- Приведение candidates к списку строк
+    local cand_list = {}
+    if type(candidates) == "table" then
+        if #candidates > 0 then
+            for _, c in ipairs(candidates) do
+                if type(c) == "string" and c ~= "" then
+                    table.insert(cand_list, c)
+                end
+            end
+        else
+            for k, _ in pairs(candidates) do
+                if type(k) == "string" and k ~= "" then
+                    table.insert(cand_list, k)
+                end
+            end
+        end
+    end
+
+    if #cand_list == 0 then
+        return nil, 0.0
+    end
+
+    -- 1. Точное совпадение
+    for _, cand in ipairs(cand_list) do
+        if q == cand:lower() then
+            return cand, 1.0
+        end
+    end
+
+    -- 2. Вызов нативного Rust-матчера при наличии
+    if grime and grime.fuzzy and grime.fuzzy.find_best_match then
+        local ok, res = pcall(grime.fuzzy.find_best_match, q, cand_list, threshold)
+        if ok and res ~= nil and res ~= "" then
+            local sim = helper.similarity(q, res)
+            return res, sim
+        end
+    end
+
+    -- 3. Чистый fallback на Lua
+    local len_q = #q
+    local best_cand = nil
+    local best_score = 0.0
+    local second_best_score = 0.0
+
+    for _, cand in ipairs(cand_list) do
+        local c = cand:lower()
+        local len_c = #c
+
+        local sim = helper.similarity(q, c)
+        local dist = helper.damerau_levenshtein(q, c)
+
+        local is_prefix = (c:find(q, 1, true) == 1) and (len_q >= 2) and (len_c >= len_q) and (len_c - len_q <= 3)
+        local valid_dist = is_prefix or (len_c <= 3 and dist <= 1) or (len_c <= 6 and dist <= 1) or (len_c <= 9 and dist <= 2) or (dist <= 3)
+
+        if valid_dist and sim >= threshold then
+            if sim > best_score then
+                second_best_score = best_score
+                best_score = sim
+                best_cand = cand
+            elseif math.abs(sim - best_score) < 1e-4 then
+                second_best_score = sim
+            elseif sim > second_best_score then
+                second_best_score = sim
+            end
+        end
+    end
+
+    if best_cand then
+        if (best_score - second_best_score >= 0.08) or (second_best_score < threshold) then
+            return best_cand, best_score
+        end
+    end
+
+    return nil, 0.0
+end
+
+helper.fuzzy_match = helper.find_best_match
+
 return helper
 

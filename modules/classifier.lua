@@ -1,3 +1,5 @@
+local helper = require("helper")
+
 local classifier = {}
 classifier.__index = classifier
 
@@ -9,6 +11,7 @@ function classifier.new(opts)
     self.flags = opts.flags or {} -- { flag_name = { "-f", "--force" } }
     self.categories = opts.categories or {} -- { cat_name = { key = val } }
     self.detect_dir = opts.detect_dir or false
+    self.fuzzy_threshold = opts.fuzzy_threshold or 0.75
     return self
 end
 
@@ -47,7 +50,7 @@ function classifier:parse(args, default_target_dir)
         local tok_lower = string.lower(tok)
         local flag_matched = false
 
-        -- 1. Проверка флагов
+        -- 1. Проверка точного совпадения флагов
         for flag_name, patterns in pairs(self.flags) do
             for _, pat in ipairs(patterns) do
                 if tok == pat then
@@ -57,6 +60,36 @@ function classifier:parse(args, default_target_dir)
                 end
             end
             if flag_matched then break end
+        end
+
+        -- 1.1. Нечёткое сопоставление флагов с высоким порогом (СТРОГО только для флагов, начинающихся с '-')
+        if not flag_matched and tok:sub(1, 1) == "-" and tok ~= "--" then
+            local best_flag_name = nil
+            local best_score = 0.0
+            local second_best_score = 0.0
+
+            for flag_name, patterns in pairs(self.flags) do
+                for _, pat in ipairs(patterns) do
+                    local matched = helper.fuzzy_match_flag(tok, { pat }, self.fuzzy_threshold)
+                    if matched then
+                        local sim = helper.similarity(tok:gsub("^%-%-?", ""), pat:gsub("^%-%-?", ""))
+                        if sim > best_score then
+                            if best_flag_name and best_flag_name ~= flag_name then
+                                second_best_score = best_score
+                            end
+                            best_score = sim
+                            best_flag_name = flag_name
+                        elseif math.abs(sim - best_score) < 1e-4 and best_flag_name ~= flag_name then
+                            second_best_score = sim
+                        end
+                    end
+                end
+            end
+
+            if best_flag_name and (best_score - second_best_score >= 0.08 or second_best_score < self.fuzzy_threshold) then
+                res_flags[best_flag_name] = true
+                flag_matched = true
+            end
         end
 
         if not flag_matched then

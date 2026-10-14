@@ -188,13 +188,40 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
     return exec_cmd(m, cmd_tokens, app_dir, env)
 end
 
+local function resolve_app_name(apps_root, raw_name)
+    if not raw_name or raw_name == "" then return raw_name end
+    local exact_dir = apps_root .. "/" .. raw_name
+    if ctx.exists(exact_dir) then
+        return raw_name
+    end
+
+    local installed = {}
+    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
+    if p then
+        for item in p:lines() do
+            if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+                table.insert(installed, item)
+            end
+        end
+        p:close()
+    end
+
+    local best = helper.find_best_match(raw_name, installed, 0.75)
+    if best then
+        ctx.log(string.format("Приложение '%s' не найдено, выбрано похожее: '%s'", raw_name, best))
+        return best
+    end
+
+    return raw_name
+end
+
 --- Выполнение цепочки приложений через разделитель '->' (App Chaining)
 local function run_chain(apps_root, segments)
     local cur_payload = ctx.pipeline_input or ""
     local last_output = cur_payload
 
     for idx, seg in ipairs(segments) do
-        local name = seg[1]
+        local name = resolve_app_name(apps_root, seg[1])
         local dir = apps_root .. "/" .. name
         if not ctx.exists(dir) then
             ctx.fail(string.format("Приложение '%s' в цепочке не найдено в %s", name, apps_root))
@@ -427,9 +454,10 @@ function main()
     local is_detach, filtered = false, {}
     local wants_help = false
     for _, a in ipairs(ctx.args or {}) do
-        if a == "--detach" or a == "-d" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--detach", "-d", "--help", "-h" }, 0.75) or a
+        if matched == "--detach" or matched == "-d" then
             is_detach = true
-        elseif a == "--help" or a == "-h" or a == "help" then
+        elseif matched == "--help" or matched == "-h" or a == "help" then
             wants_help = true
         else
             table.insert(filtered, a)
@@ -451,14 +479,16 @@ function main()
         return
     elseif subcmd == "build" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app build <app_name>"); return end
-        local dir = apps_root .. "/" .. filtered[2]
-        local m, err = load_manifest(dir, filtered[2])
+        local app_name = resolve_app_name(apps_root, filtered[2])
+        local dir = apps_root .. "/" .. app_name
+        local m, err = load_manifest(dir, app_name)
         if not m then ctx.fail(err or "Манифест не найден"); return end
-        build_app(filtered[2], m, dir)
+        build_app(app_name, m, dir)
         return
     elseif subcmd == "rm" or subcmd == "remove" or subcmd == "delete" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app rm <app_name>"); return end
-        rm_app(apps_root, filtered[2])
+        local app_name = resolve_app_name(apps_root, filtered[2])
+        rm_app(apps_root, app_name)
         return
     end
 
@@ -487,7 +517,7 @@ function main()
         local code = run_chain(apps_root, segments)
         if code ~= 0 then ctx.fail(string.format("Цепочка приложений завершилась с ошибкой (код %d)", code)) end
     else
-        local name = filtered[1]
+        local name = resolve_app_name(apps_root, filtered[1])
         local dir = apps_root .. "/" .. name
         if not ctx.exists(dir) then
             ctx.fail(string.format("Приложение '%s' не найдено в %s.\nИспользуйте 'grime app new %s' для создания.", name, apps_root, name))

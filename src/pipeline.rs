@@ -16,15 +16,28 @@ pub struct ParsedPipeline {
 }
 
 pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
+pub const STANDARD_MODULES: &[&str] = &[
+    "project", "pkg", "app", "box", "nix", "aider", "cmd", "host",
+];
 
 pub fn canonical_module_name(name: &str) -> String {
     let lower = name.to_lowercase();
-    match lower.as_str() {
+    let alias_resolved = match lower.as_str() {
         "exec" => "cmd".to_string(),
         "proj" => "project".to_string(),
         h if HOST_ALIASES.contains(&h) => "host".to_string(),
         _ => lower,
+    };
+
+    if STANDARD_MODULES.contains(&alias_resolved.as_str()) {
+        return alias_resolved;
     }
+
+    if let Some(matched) = crate::args::fuzzy_match_entity(&alias_resolved, STANDARD_MODULES, 0.75) {
+        return matched.to_string();
+    }
+
+    alias_resolved
 }
 
 pub fn is_host_step(name: &str) -> bool {
@@ -33,7 +46,7 @@ pub fn is_host_step(name: &str) -> bool {
 }
 
 pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
-    let mut args: Vec<String> = raw_args.to_vec();
+    let mut args: Vec<String> = crate::args::normalize_cli_flags(raw_args, crate::args::GLOBAL_GRIME_FLAGS);
 
     // 1. Извлечение флагов --force / -f и --detach / -d
     let mut force = false;
@@ -186,12 +199,14 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
                 .filter(|t| !mod_flags.contains(t.as_str()))
                 .collect();
             if !filtered.is_empty() {
-                let mod_name = canonical_module_name(&filtered[0]);
-                let mod_args = filtered[1..].to_vec();
-                steps.push(PipelineStep {
-                    module: mod_name,
-                    args: mod_args,
-                });
+                if !filtered[0].starts_with('-') {
+                    let mod_name = canonical_module_name(&filtered[0]);
+                    let mod_args = filtered[1..].to_vec();
+                    steps.push(PipelineStep {
+                        module: mod_name,
+                        args: mod_args,
+                    });
+                }
             }
         }
     }
@@ -364,5 +379,24 @@ mod tests {
         assert_eq!(res.steps[0].module, "aider");
         assert_eq!(res.steps[0].args, vec!["-m", "привет"]);
         assert!(res.work_path.is_some());
+    }
+
+    #[test]
+    fn test_fuzzy_global_flags() {
+        let args = vec![
+            "--forc".to_string(),
+            "--detch".to_string(),
+            "--pth".to_string(),
+            "/home/user/project".to_string(),
+            "project".to_string(),
+            "build".to_string(),
+        ];
+        let res = parse_pipeline_args(&args);
+        assert_eq!(res.force, true);
+        assert_eq!(res.detach, true);
+        assert_eq!(res.work_path, Some(PathBuf::from("/home/user/project")));
+        assert_eq!(res.steps.len(), 1);
+        assert_eq!(res.steps[0].module, "project");
+        assert_eq!(res.steps[0].args, vec!["build"]);
     }
 }

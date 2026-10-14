@@ -577,6 +577,34 @@ impl GrimeLuaEngine {
                 Ok(best_candidate)
             })?,
         )?;
+        fuzzy_tbl.set(
+            "similarity",
+            lua.create_function(|_, (s1, s2): (String, String)| {
+                Ok(crate::args::flag_similarity(&s1, &s2))
+            })?,
+        )?;
+        fuzzy_tbl.set(
+            "damerau_levenshtein",
+            lua.create_function(|_, (s1, s2): (String, String)| {
+                Ok(crate::args::damerau_levenshtein(&s1, &s2))
+            })?,
+        )?;
+        fuzzy_tbl.set(
+            "match_flag",
+            lua.create_function(|_, (token, candidates, threshold): (String, Vec<String>, Option<f64>)| {
+                let thresh = threshold.unwrap_or(0.75);
+                let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+                Ok(crate::args::fuzzy_match_flag(&token, &cand_refs, thresh).map(|s| s.to_string()))
+            })?,
+        )?;
+        fuzzy_tbl.set(
+            "find_best_match",
+            lua.create_function(|_, (query, candidates, threshold): (String, Vec<String>, Option<f64>)| {
+                let thresh = threshold.unwrap_or(0.75);
+                let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+                Ok(crate::args::fuzzy_match_entity(&query, &cand_refs, thresh).map(|s| s.to_string()))
+            })?,
+        )?;
         grime_tbl.set("fuzzy", fuzzy_tbl)?;
 
         // grime.ctx (инициализируем пустой контекст)
@@ -767,14 +795,39 @@ impl GrimeLuaEngine {
 
         let lua = &self.lua;
 
-        let mod_file = self.modules_dir.join(format!("{}.lua", module_name));
+        let mut target_mod_name = module_name.to_string();
+        let mut mod_file = self.modules_dir.join(format!("{}.lua", target_mod_name));
         if !mod_file.exists() {
-            return Ok(StepExecutionResult {
-                success: false,
-                return_value: None,
-                payload: None,
-                error_message: Some(format!("Модуль '{}.lua' не найден в {:?}", module_name, self.modules_dir)),
-            });
+            let mut available: Vec<String> = Vec::new();
+            if let Ok(entries) = fs::read_dir(&self.modules_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lua") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            available.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+
+            let cand_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+            if let Some(matched) = crate::args::fuzzy_match_entity(module_name, &cand_refs, 0.75) {
+                eprintln!(
+                    "{} Модуль '{}' не найден, запущен похожий модуль '{}'",
+                    "[Grime]".cyan().bold(),
+                    module_name,
+                    matched
+                );
+                target_mod_name = matched.to_string();
+                mod_file = self.modules_dir.join(format!("{}.lua", target_mod_name));
+            } else {
+                return Ok(StepExecutionResult {
+                    success: false,
+                    return_value: None,
+                    payload: None,
+                    error_message: Some(format!("Модуль '{}.lua' не найден в {:?}", module_name, self.modules_dir)),
+                });
+            }
         }
 
         let content = fs::read_to_string(&mod_file)

@@ -444,7 +444,9 @@ function main()
         table.insert(raw_cli_args, a)
     end
 
-    if (#raw_cli_args == 0 and not ctx.pipeline_input) or raw_cli_args[1] == "--help" or raw_cli_args[1] == "-h" or raw_cli_args[1] == "help" then
+    local first_arg = raw_cli_args[1]
+    local first_flag = (type(first_arg) == "string" and first_arg:match("^%-")) and helper.fuzzy_match_flag(first_arg, { "--help", "-h" }, 0.75) or first_arg
+    if (#raw_cli_args == 0 and not ctx.pipeline_input) or first_flag == "--help" or first_flag == "-h" or first_arg == "help" then
         print_help()
         return
     end
@@ -462,13 +464,14 @@ function main()
     local idx = 1
     while idx <= #raw_cli_args do
         local a = raw_cli_args[idx]
-        if a == "--app" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--app", "--lang", "-l" }, 0.75) or a
+        if matched == "--app" then
             is_app_mode = true
             if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
                 idx = idx + 1
                 app_name = raw_cli_args[idx]
             end
-        elseif a == "--lang" or a == "-l" then
+        elseif matched == "--lang" or matched == "-l" then
             if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
                 idx = idx + 1
                 app_lang = raw_cli_args[idx]:lower()

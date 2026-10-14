@@ -296,3 +296,90 @@ custom_key = /tmp/special_dir
     assert_eq!(res.unwrap().unwrap(), "paths_ok");
 }
 
+#[tokio::test]
+async fn test_fuzzy_matching_entities_and_flags() {
+    let temp = TestTempDir::new("grime_fuzzy_test");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    // Скопируем helper.lua и classifier.lua во временную директорию модулей
+    let repo_modules = Path::new("modules");
+    if repo_modules.join("helper.lua").exists() {
+        fs::copy(repo_modules.join("helper.lua"), mod_dir.join("helper.lua")).unwrap();
+    }
+    if repo_modules.join("classifier.lua").exists() {
+        fs::copy(repo_modules.join("classifier.lua"), mod_dir.join("classifier.lua")).unwrap();
+    }
+
+    // Тестовый модуль: test_fuzzy.lua
+    fs::write(
+        mod_dir.join("test_fuzzy.lua"),
+        r#"
+        local helper = require("helper")
+        local classifier = require("classifier")
+        local ctx = helper.ctx
+
+        function main()
+            -- 1. Тест нечеткого поиска названий модулей
+            local modules = { "project", "pkg", "app", "box", "nix", "aider", "cmd", "host" }
+            assert(helper.find_best_match("pckg", modules, 0.75) == "pkg", "pckg -> pkg")
+            assert(helper.find_best_match("ap", modules, 0.75) == "app", "ap -> app")
+            assert(helper.find_best_match("nx", modules, 0.75) == "nix", "nx -> nix")
+            assert(helper.find_best_match("aidr", modules, 0.75) == "aider", "aidr -> aider")
+            assert(helper.find_best_match("proj", modules, 0.75) == "project", "proj -> project")
+
+            -- Несвязанные имена модулей не должны давать ложных срабатываний
+            assert(helper.find_best_match("unknown_module_xyz", modules, 0.75) == nil, "unknown -> nil")
+
+            -- 2. Тест названий аппов
+            local apps = { "neovim", "terminal_chat", "system_monitor", "fzf_launcher" }
+            assert(helper.find_best_match("neovm", apps, 0.75) == "neovim", "neovm -> neovim")
+            assert(helper.find_best_match("sys_monitor", apps, 0.75) == "system_monitor" or helper.find_best_match("system_mon", apps, 0.75) == "system_monitor", "sys -> monitor")
+
+            -- 3. Тест названий проектов
+            local projects = { "SpaceInvaders", "DatabaseEngine", "WebScraper" }
+            assert(helper.find_best_match("SpaceInvader", projects, 0.75) == "SpaceInvaders", "SpaceInvader -> SpaceInvaders")
+            assert(helper.find_best_match("DataEngine", projects, 0.75) == "DatabaseEngine" or helper.find_best_match("DatabaseEng", projects, 0.75) == "DatabaseEngine", "DatabaseEngine")
+
+            -- 4. Тест пакетов и менеджеров
+            local mgrs = { "pacman", "flatpak", "nix", "distrobox", "cargo", "pipx" }
+            assert(helper.find_best_match("pacmn", mgrs, 0.75) == "pacman", "pacmn -> pacman")
+            assert(helper.find_best_match("fltpak", mgrs, 0.75) == "flatpak", "fltpak -> flatpak")
+
+            -- 5. Тест флагов
+            local flags = { "--all", "-a", "--deps", "--help", "-h", "--force", "-f" }
+            assert(helper.fuzzy_match_flag("--al", flags, 0.75) == "--all", "--al -> --all")
+            assert(helper.fuzzy_match_flag("--dep", flags, 0.75) == "--deps", "--dep -> --deps")
+            assert(helper.fuzzy_match_flag("-hlp", flags, 0.75) == "--help", "-hlp -> --help")
+            assert(helper.fuzzy_match_flag("--halp", flags, 0.75) == "--help", "--halp -> --help")
+
+            -- Строки не должны превращаться во флаги
+            assert(helper.fuzzy_match_flag("git", flags, 0.75) == nil, "git is string")
+            assert(helper.fuzzy_match_flag("MyGame", flags, 0.75) == nil, "MyGame is string")
+
+            -- 6. Проверка classifier c нечёткими флагами
+            local cls = classifier.new({
+                flags = {
+                    all = { "-a", "--all", "--deps" },
+                    force = { "-f", "--force" }
+                }
+            })
+            local parsed = cls:parse({ "--al", "--forc", "my_package" })
+            assert(parsed.flags.all == true, "classifier flag all matched via --al")
+            assert(parsed.flags.force == true, "classifier flag force matched via --forc")
+            assert(#parsed.args == 1 and parsed.args[1] == "my_package", "my_package kept as positional arg")
+
+            ctx.success("fuzzy_tests_passed")
+        end
+    "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["test_fuzzy".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+
+    assert!(res.is_ok(), "Пайплайн с fuzzy тестами упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "fuzzy_tests_passed");
+}
+

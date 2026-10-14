@@ -160,20 +160,10 @@ local function resolve_manager(query)
         end
     end
 
-    -- 4. Нечеткий поиск (только если длина q >= 3 и score >= 35)
-    if #q >= 3 then
-        local best_mgr = nil
-        local best_score = 0
-        for _, mgr in ipairs(CANONICAL_MANAGERS) do
-            local matched, score = fuzzy_match(q, mgr)
-            if matched and score > best_score then
-                best_score = score
-                best_mgr = mgr
-            end
-        end
-        if best_mgr and best_score >= 35 then
-            return best_mgr
-        end
+    -- 4. Унифицированный нечеткий поиск менеджеров с высоким порогом (порог 0.75)
+    local best_mgr, score = helper.find_best_match(q, CANONICAL_MANAGERS, 0.75)
+    if best_mgr then
+        return best_mgr
     end
 
     return nil
@@ -869,7 +859,8 @@ end
 
 function main()
     for _, a in ipairs(ctx.args or {}) do
-        if a == "--help" or a == "-h" or a == "help" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return
         end

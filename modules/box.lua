@@ -325,7 +325,8 @@ end
 
 function main()
     for _, a in ipairs(ctx.args or {}) do
-        if a == "--help" or a == "-h" or a == "help" then
+        local matched = (type(a) == "string" and a:match("^%-")) and helper.fuzzy_match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return
         end

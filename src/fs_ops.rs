@@ -1,7 +1,41 @@
+use std::borrow::Cow;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use walkdir::WalkDir;
+
+static HOME_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CANONICAL_HOME_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Возвращает ссылку на закэшированную домашнюю директорию пользователя.
+pub fn get_cached_home_dir() -> Option<&'static Path> {
+    HOME_DIR.get_or_init(dirs::home_dir).as_deref()
+}
+
+/// Возвращает ссылку на закэшированный канонический путь к домашней директории.
+pub fn get_cached_canonical_home() -> Option<&'static Path> {
+    CANONICAL_HOME_DIR
+        .get_or_init(|| get_cached_home_dir().and_then(|h| h.canonicalize().ok()))
+        .as_deref()
+}
+
+/// Быстрое развертывание тильды `~` в начале пути без избыточных аллокаций.
+pub fn expand_tilde<'a, P: ?Sized + AsRef<Path>>(path: &'a P) -> Cow<'a, Path> {
+    let p = path.as_ref();
+    if let Ok(stripped) = p.strip_prefix("~") {
+        if let Some(home) = get_cached_home_dir() {
+            return Cow::Owned(home.join(stripped));
+        }
+    }
+    Cow::Borrowed(p)
+}
+
+/// Быстрое развертывание тильды и нормализация пути.
+pub fn expand_and_normalize<P: AsRef<Path>>(path: P) -> PathBuf {
+    let expanded = expand_tilde(path.as_ref());
+    normalize_path(expanded.as_ref())
+}
 
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
@@ -31,11 +65,9 @@ pub fn is_system_or_root_path(path: &Path) -> bool {
         return true;
     }
 
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(home_canon) = home.canonicalize() {
-            if canonical == home_canon {
-                return true;
-            }
+    if let Some(home_canon) = get_cached_canonical_home() {
+        if canonical == home_canon {
+            return true;
         }
     }
 
@@ -237,6 +269,16 @@ mod tests {
             normalize_path(Path::new("/home/user/projects//rust/app")),
             PathBuf::from("/home/user/projects/rust/app")
         );
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        if let Some(home) = get_cached_home_dir() {
+            assert_eq!(expand_tilde(Path::new("~")).as_ref(), home);
+            assert_eq!(expand_tilde(Path::new("~/test")).as_ref(), home.join("test"));
+        }
+        assert_eq!(expand_tilde(Path::new("/abs/path")).as_ref(), Path::new("/abs/path"));
+        assert_eq!(expand_tilde(Path::new("rel/path")).as_ref(), Path::new("rel/path"));
     }
 }
 

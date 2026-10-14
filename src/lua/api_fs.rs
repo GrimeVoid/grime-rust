@@ -7,7 +7,10 @@ use mlua::{Lua, MultiValue, Table, Value};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::fs_ops::{copy_recursive, delete_safe, get_latest_mtime, is_newer, move_safe, normalize_path};
+use crate::fs_ops::{
+    copy_recursive, delete_safe, expand_and_normalize, expand_tilde, get_latest_mtime, is_newer,
+    move_safe, normalize_path,
+};
 
 /// Регистрирует подтаблицу `grime.fs` со всеми файловыми функциями.
 pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
@@ -17,9 +20,7 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "normalize",
         lua.create_function(|_, path: String| {
-            let expanded = shellexpand::tilde(&path).to_string();
-            let p = PathBuf::from(&expanded);
-            let normalized = normalize_path(&p);
+            let normalized = expand_and_normalize(&path);
             Ok(normalized.to_string_lossy().to_string())
         })?,
     )?;
@@ -28,8 +29,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "exists",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            Ok(p.exists())
+            let p = expand_tilde(&path);
+            Ok(p.as_ref().exists())
         })?,
     )?;
 
@@ -37,8 +38,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "is_dir",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            Ok(p.is_dir())
+            let p = expand_tilde(&path);
+            Ok(p.as_ref().is_dir())
         })?,
     )?;
 
@@ -46,8 +47,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "is_file",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            Ok(p.is_file())
+            let p = expand_tilde(&path);
+            Ok(p.as_ref().is_file())
         })?,
     )?;
 
@@ -55,10 +56,10 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "mkdir_p",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            match fs::create_dir_all(&p) {
+            let p = expand_tilde(&path);
+            match fs::create_dir_all(p.as_ref()) {
                 Ok(_) => Ok(true),
-                Err(e) => Err(mlua::Error::runtime(format!("Ошибка создания каталога '{}': {}", p.display(), e))),
+                Err(e) => Err(mlua::Error::runtime(format!("Ошибка создания каталога '{}': {}", p.as_ref().display(), e))),
             }
         })?,
     )?;
@@ -67,8 +68,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "delete",
         lua.create_function(|_, (path, missing_ok): (String, Option<bool>)| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            match delete_safe(&p, missing_ok.unwrap_or(true)) {
+            let p = expand_tilde(&path);
+            match delete_safe(p.as_ref(), missing_ok.unwrap_or(true)) {
                 Ok(val) => Ok(val),
                 Err(e) => Err(mlua::Error::runtime(e)),
             }
@@ -80,9 +81,9 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "copy",
         lua.create_function(|_, (src, dst): (String, String)| {
-            let s = PathBuf::from(shellexpand::tilde(&src).to_string());
-            let d = PathBuf::from(shellexpand::tilde(&dst).to_string());
-            match copy_recursive(&s, &d) {
+            let s = expand_tilde(&src);
+            let d = expand_tilde(&dst);
+            match copy_recursive(s.as_ref(), d.as_ref()) {
                 Ok(res) => Ok(res.to_string_lossy().to_string()),
                 Err(e) => Err(mlua::Error::runtime(e)),
             }
@@ -93,9 +94,9 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "move",
         lua.create_function(|_, (src, dst): (String, String)| {
-            let s = PathBuf::from(shellexpand::tilde(&src).to_string());
-            let d = PathBuf::from(shellexpand::tilde(&dst).to_string());
-            match move_safe(&s, &d) {
+            let s = expand_tilde(&src);
+            let d = expand_tilde(&dst);
+            match move_safe(s.as_ref(), d.as_ref()) {
                 Ok(res) => Ok(res.to_string_lossy().to_string()),
                 Err(e) => Err(mlua::Error::runtime(e)),
             }
@@ -107,8 +108,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "mtime",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            Ok(get_latest_mtime(&p))
+            let p = expand_tilde(&path);
+            Ok(get_latest_mtime(p.as_ref()))
         })?,
     )?;
 
@@ -116,9 +117,9 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "is_newer",
         lua.create_function(|_, (src, target): (String, String)| {
-            let s = PathBuf::from(shellexpand::tilde(&src).to_string());
-            let t = PathBuf::from(shellexpand::tilde(&target).to_string());
-            Ok(is_newer(&s, &t))
+            let s = expand_tilde(&src);
+            let t = expand_tilde(&target);
+            Ok(is_newer(s.as_ref(), t.as_ref()))
         })?,
     )?;
 
@@ -131,8 +132,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
                 if let Value::String(s) = val {
                     let part = s.to_str()?;
                     if !part.is_empty() {
-                        let expanded = shellexpand::tilde(part.as_ref()).to_string();
-                        res.push(expanded);
+                        let expanded = expand_tilde(part.as_ref());
+                        res.push(expanded.as_ref());
                     }
                 }
             }
@@ -146,8 +147,8 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "read",
         lua.create_function(|_, path: String| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            match fs::read_to_string(&p) {
+            let p = expand_tilde(&path);
+            match fs::read_to_string(p.as_ref()) {
                 Ok(s) => Ok(Some(s)),
                 Err(_) => Ok(None),
             }
@@ -158,13 +159,13 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     fs_tbl.set(
         "write",
         lua.create_function(|_, (path, content): (String, String)| {
-            let p = PathBuf::from(shellexpand::tilde(&path).to_string());
-            if let Some(parent) = p.parent() {
+            let p = expand_tilde(&path);
+            if let Some(parent) = p.as_ref().parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match fs::write(&p, content) {
+            match fs::write(p.as_ref(), content) {
                 Ok(_) => Ok(true),
-                Err(e) => Err(mlua::Error::runtime(format!("Ошибка записи файла '{}': {}", p.display(), e))),
+                Err(e) => Err(mlua::Error::runtime(format!("Ошибка записи файла '{}': {}", p.as_ref().display(), e))),
             }
         })?,
     )?;
@@ -174,9 +175,9 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
         "list",
         lua.create_function(|lua, path: Option<String>| {
             let p_str = path.unwrap_or_else(|| ".".to_string());
-            let p = PathBuf::from(shellexpand::tilde(&p_str).to_string());
+            let p = expand_tilde(&p_str);
             let tbl = lua.create_table()?;
-            if let Ok(entries) = fs::read_dir(&p) {
+            if let Ok(entries) = fs::read_dir(p.as_ref()) {
                 for (idx, entry) in entries.flatten().enumerate() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     tbl.set(idx + 1, name)?;

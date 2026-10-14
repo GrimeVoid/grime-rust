@@ -131,6 +131,29 @@ pub fn init_context_table(
         })?,
     )?;
 
+    // ctx.done(ok, val_or_err) — единый компактный шаблон завершения шага
+    ctx_tbl.set(
+        "done",
+        lua.create_function(|lua_ctx, (ok, val_or_err): (bool, Option<Value>)| {
+            let globals = lua_ctx.globals();
+            let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            if ok {
+                let succ_fn: mlua::Function = c.get("success")?;
+                succ_fn.call::<()>(val_or_err)?;
+            } else {
+                let fail_fn: mlua::Function = c.get("fail")?;
+                let err_str = match val_or_err {
+                    Some(Value::String(s)) => s.to_str()?.to_string(),
+                    Some(other) => format!("{:?}", other),
+                    None => "Шаг конвейера завершился ошибкой".to_string(),
+                };
+                fail_fn.call::<()>(Some(err_str))?;
+            }
+            Ok(())
+        })?,
+    )?;
+
     // Логирование и вывод через ctx
     ctx_tbl.set(
         "log",
@@ -474,7 +497,7 @@ pub fn init_context_table(
 /// Обновляет параметры контекста перед запуском очередного шага конвейера.
 pub fn update_step_context(
     lua: &Lua,
-    config: &GrimeConfig,
+    _config: &GrimeConfig,
     step: &PipelineStep,
     step_index: usize,
     total_steps: usize,
@@ -486,19 +509,13 @@ pub fn update_step_context(
     let grime: Table = globals.get("grime")?;
     let ctx: Table = grime.get("ctx")?;
 
-    let args_tbl = lua.create_table()?;
+    let args_tbl = lua.create_table_with_capacity(step.args.len(), 0)?;
     for (i, arg) in step.args.iter().enumerate() {
         args_tbl.set(i + 1, arg.as_str())?;
     }
 
     let has_next = step_index < total_steps.saturating_sub(1);
     let is_last = !has_next;
-
-    let paths_tbl = lua.create_table()?;
-    for (k, v) in &config.paths {
-        paths_tbl.set(k.as_str(), v.as_str())?;
-    }
-    ctx.set("paths", paths_tbl)?;
 
     ctx.set("args", args_tbl)?;
     ctx.set("target_dir", target_dir.to_string_lossy().to_string())?;

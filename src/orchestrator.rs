@@ -217,6 +217,9 @@ impl Orchestrator {
             pipeline_data = result.return_value;
             pipeline_payload = result.payload;
 
+            // Инкрементальная сборка мусора Lua между шагами для предотвращения накопления памяти
+            self.engine.gc_step(100);
+
             // Событие успешного завершения шага
             self.engine.emit_event(
                 "pipeline.step.finish",

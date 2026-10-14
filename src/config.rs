@@ -47,7 +47,9 @@ impl GrimeConfig {
     /// - templates: $HOME/.config/grime/templates
     /// - apps: $HOME/.config/grime/apps
     pub fn default_paths() -> HashMap<String, String> {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let home = crate::fs_ops::get_cached_home_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         let mut map = HashMap::new();
 
         let cfg_dir = home.join(".config").join("grime");
@@ -117,7 +119,7 @@ impl GrimeConfig {
         }
 
         // 4. Домашняя папка ~/.config/grime/gproj.conf
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::fs_ops::get_cached_home_dir() {
             let home_conf = home.join(".config").join("grime").join("gproj.conf");
             if home_conf.exists() {
                 return home_conf;

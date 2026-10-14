@@ -38,7 +38,7 @@ pub struct StepExecutionResult {
 pub struct GrimeLuaEngine {
     lua: Lua,
     modules_dir: PathBuf,
-    config: GrimeConfig,
+    config: Arc<GrimeConfig>,
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
     canceller: PipelineCanceller,
@@ -158,7 +158,7 @@ impl GrimeLuaEngine {
         canceller: PipelineCanceller,
     ) -> Result<Self, mlua::Error> {
         let lua = Lua::new();
-        let config = GrimeConfig::load_or_default(custom_config);
+        let config = Arc::new(GrimeConfig::load_or_default(custom_config));
         let resolved_modules = modules_dir.unwrap_or_else(Self::discover_modules_dir);
 
         let engine = Self {
@@ -172,6 +172,16 @@ impl GrimeLuaEngine {
 
         engine.init_runtime()?;
         Ok(engine)
+    }
+
+    /// Выполняет инкрементальный шаг сборщика мусора Lua для поддержания минимального footprint памяти.
+    pub fn gc_step(&self, step_size: i32) {
+        let _ = self.lua.gc_step_kbytes(step_size);
+    }
+
+    /// Возвращает ссылку на конфигурацию Grime.
+    pub fn config(&self) -> &Arc<GrimeConfig> {
+        &self.config
     }
 
     /// Возвращает ссылку на шину состояния.
@@ -322,22 +332,25 @@ impl GrimeLuaEngine {
         msgpack_tbl.set(
             "decode",
             lua.create_function(|lua, val: Value| {
-                let bytes = match val {
-                    Value::String(s) => s.as_bytes().to_vec(),
-                    Value::UserData(ud) => {
+                match val {
+                    Value::String(ref s) => {
+                        let mut cursor = std::io::Cursor::new(s.as_bytes());
+                        let rmpv_val = rmpv::decode::read_value(&mut cursor)
+                            .map_err(|e| mlua::Error::runtime(format!("MsgPack decode error: {}", e)))?;
+                        rmpv_to_lua_value(lua, rmpv_val)
+                    }
+                    Value::UserData(ref ud) => {
                         if let Ok(p) = ud.borrow::<PipelinePayload>() {
-                            p.as_slice().to_vec()
+                            let mut cursor = std::io::Cursor::new(p.as_slice());
+                            let rmpv_val = rmpv::decode::read_value(&mut cursor)
+                                .map_err(|e| mlua::Error::runtime(format!("MsgPack decode error: {}", e)))?;
+                            rmpv_to_lua_value(lua, rmpv_val)
                         } else {
-                            return Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования"));
+                            Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования"))
                         }
                     }
-                    _ => return Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования")),
-                };
-
-                let mut cursor = std::io::Cursor::new(bytes);
-                let rmpv_val = rmpv::decode::read_value(&mut cursor)
-                    .map_err(|e| mlua::Error::runtime(format!("MsgPack decode error: {}", e)))?;
-                rmpv_to_lua_value(lua, rmpv_val)
+                    _ => Err(mlua::Error::runtime("Ожидалась строка или PipelinePayload для декодирования")),
+                }
             })?,
         )?;
         grime_tbl.set("msgpack", msgpack_tbl)?;

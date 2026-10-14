@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -17,14 +16,21 @@ pub struct ParsedPipeline {
 
 pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
 pub const STANDARD_MODULES: &[&str] = &[
-    "project", "pkg", "app", "box", "nix", "aider", "cmd", "host",
+    "project", "pkg", "app", "box", "nix", "aider", "cmd", "host", "doctor", "bus", "daemon",
+    "classifier", "list",
 ];
+
+const PATH_FLAGS: &[&str] = &["-p", "-path", "--path"];
+const ARG_FLAGS: &[&str] = &["-arg", "--args", "-c", "-com", "--com"];
+const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
+const SEPARATORS: &[&str] = &["--", ":", "->", "|"];
 
 pub fn canonical_module_name(name: &str) -> String {
     let lower = name.to_lowercase();
     let alias_resolved = match lower.as_str() {
         "exec" => "cmd".to_string(),
         "proj" => "project".to_string(),
+        "ls" | "modules" => "list".to_string(),
         h if HOST_ALIASES.contains(&h) => "host".to_string(),
         _ => lower,
     };
@@ -61,25 +67,15 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         args.remove(pos);
     }
 
-
-    let path_flags: HashSet<&str> = ["-p", "-path", "--path"].into_iter().collect();
-    let arg_flags: HashSet<&str> = [
-        "-arg", "--args", "-c", "-com", "--com",
-    ]
-    .into_iter()
-    .collect();
-    let mod_flags: HashSet<&str> = ["-mod", "--mod"].into_iter().collect();
-    let separators: HashSet<&str> = ["--", ":", "->", "|"].into_iter().collect();
-
     // 2. Извлечение рабочего пути (-p / --path)
     let mut work_path: Option<PathBuf> = None;
-    let mut tokens: Vec<String> = Vec::new();
+    let mut tokens: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         let token = &args[i];
-        if path_flags.contains(token.as_str()) && i + 1 < args.len() {
-            let path_str = shellexpand::tilde(&args[i + 1]).to_string();
-            work_path = Some(PathBuf::from(path_str));
+        if PATH_FLAGS.contains(&token.as_str()) && i + 1 < args.len() {
+            let expanded = crate::fs_ops::expand_tilde(&args[i + 1]);
+            work_path = Some(expanded.into_owned());
             i += 2;
             continue;
         }
@@ -104,8 +100,8 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             || first.starts_with('/')
             || first.starts_with('~')
         {
-            let path_str = shellexpand::tilde(first).to_string();
-            work_path = Some(PathBuf::from(path_str));
+            let expanded = crate::fs_ops::expand_tilde(first);
+            work_path = Some(expanded.into_owned());
             tokens.remove(0);
             if tokens.is_empty() {
                 return ParsedPipeline {
@@ -119,7 +115,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
     }
 
     // 3. Проверка разделителей конвейера (-- или :)
-    let has_pipeline_separators = tokens.iter().any(|t| separators.contains(t.as_str()));
+    let has_pipeline_separators = tokens.iter().any(|t| SEPARATORS.contains(&t.as_str()));
     let mut steps: Vec<PipelineStep> = Vec::new();
 
     if has_pipeline_separators {
@@ -127,7 +123,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         let mut current_section: Vec<String> = Vec::new();
 
         for t in tokens {
-            if separators.contains(t.as_str()) {
+            if SEPARATORS.contains(&t.as_str()) {
                 if !current_section.is_empty() {
                     sections.push(current_section);
                     current_section = Vec::new();
@@ -144,7 +140,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             if sec.is_empty() {
                 continue;
             }
-            if mod_flags.contains(sec[0].as_str()) && sec.len() > 1 {
+            if MOD_FLAGS.contains(&sec[0].as_str()) && sec.len() > 1 {
                 sec.remove(0);
             }
 
@@ -152,7 +148,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             let mut mod_args: Vec<String> = Vec::new();
 
             for arg_tok in sec.into_iter().skip(1) {
-                if arg_flags.contains(arg_tok.as_str()) {
+                if ARG_FLAGS.contains(&arg_tok.as_str()) {
                     continue;
                 }
                 mod_args.push(arg_tok);
@@ -167,7 +163,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         // Режим без разделителей (одиночный модуль или legacy -a)
         let mut arg_flag_idx: Option<usize> = None;
         for (idx, t) in tokens.iter().enumerate() {
-            if arg_flags.contains(t.as_str()) {
+            if ARG_FLAGS.contains(&t.as_str()) {
                 arg_flag_idx = Some(idx);
                 break;
             }
@@ -176,7 +172,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         if let Some(idx) = arg_flag_idx {
             let modules: Vec<String> = tokens[..idx]
                 .iter()
-                .filter(|t| !mod_flags.contains(t.as_str()))
+                .filter(|t| !MOD_FLAGS.contains(&t.as_str()))
                 .map(|t| canonical_module_name(t))
                 .collect();
             let args_part: Vec<String> = tokens[idx + 1..].to_vec();
@@ -196,7 +192,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         } else {
             let filtered: Vec<String> = tokens
                 .into_iter()
-                .filter(|t| !mod_flags.contains(t.as_str()))
+                .filter(|t| !MOD_FLAGS.contains(&t.as_str()))
                 .collect();
             if !filtered.is_empty() {
                 if !filtered[0].starts_with('-') {

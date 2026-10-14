@@ -1,9 +1,39 @@
+use std::borrow::Cow;
 use std::cmp::min;
 
+#[inline]
+fn to_lower_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// Расстояние Дамерау-Левенштейна между двумя строками (учитывает вставки, удаления, замены и транспозиции соседних символов).
+/// Оптимизировано: ASCII строки обрабатываются как байтовые срезы без аллокаций;
+/// для коротких строк матрица хранится на стеке без единой аллокации в куче.
 pub fn damerau_levenshtein(s1: &str, s2: &str) -> usize {
+    if s1 == s2 {
+        return 0;
+    }
+    if s1.is_empty() {
+        return s2.chars().count();
+    }
+    if s2.is_empty() {
+        return s1.chars().count();
+    }
+
+    if s1.is_ascii() && s2.is_ascii() {
+        return damerau_levenshtein_slice(s1.as_bytes(), s2.as_bytes());
+    }
+
     let a: Vec<char> = s1.chars().collect();
     let b: Vec<char> = s2.chars().collect();
+    damerau_levenshtein_slice(&a, &b)
+}
+
+fn damerau_levenshtein_slice<T: PartialEq + Copy>(a: &[T], b: &[T]) -> usize {
     let len_a = a.len();
     let len_b = b.len();
 
@@ -14,51 +44,77 @@ pub fn damerau_levenshtein(s1: &str, s2: &str) -> usize {
         return len_a;
     }
 
-    let mut d = vec![vec![0usize; len_b + 1]; len_a + 1];
+    let stride = len_b + 1;
+    let total_cells = (len_a + 1) * stride;
+
+    const STACK_LIMIT: usize = 1024;
+    let mut stack_buf = [0usize; STACK_LIMIT];
+
+    if total_cells <= STACK_LIMIT {
+        compute_dl_matrix(a, b, stride, &mut stack_buf[..total_cells])
+    } else {
+        let mut heap_buf = vec![0usize; total_cells];
+        compute_dl_matrix(a, b, stride, &mut heap_buf)
+    }
+}
+
+#[inline(always)]
+fn compute_dl_matrix<T: PartialEq + Copy>(
+    a: &[T],
+    b: &[T],
+    stride: usize,
+    d: &mut [usize],
+) -> usize {
+    let len_a = a.len();
+    let len_b = b.len();
 
     for i in 0..=len_a {
-        d[i][0] = i;
+        d[i * stride] = i;
     }
     for j in 0..=len_b {
-        d[0][j] = j;
+        d[j] = j;
     }
 
     for i in 1..=len_a {
+        let row_curr = i * stride;
+        let row_prev = (i - 1) * stride;
+        let a_curr = a[i - 1];
+
         for j in 1..=len_b {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = if a_curr == b[j - 1] { 0 } else { 1 };
 
-            d[i][j] = min(
-                min(
-                    d[i - 1][j] + 1,     // удаление
-                    d[i][j - 1] + 1,     // вставка
-                ),
-                d[i - 1][j - 1] + cost, // замена
-            );
+            let del = d[row_prev + j] + 1;
+            let ins = d[row_curr + (j - 1)] + 1;
+            let sub = d[row_prev + (j - 1)] + cost;
 
-            // Транспозиция двух соседних символов
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1);
+            let mut m = min(del, min(ins, sub));
+
+            if i > 1 && j > 1 && a_curr == b[j - 2] && a[i - 2] == b[j - 1] {
+                let trans = d[(i - 2) * stride + (j - 2)] + 1;
+                m = min(m, trans);
             }
+
+            d[row_curr + j] = m;
         }
     }
 
-    d[len_a][len_b]
+    d[len_a * stride + len_b]
 }
 
-/// Вычисление меры сходства (от 0.0 до 1.0) между строкой флага (без дефисов) и кандидатом.
-pub fn flag_similarity(input_raw: &str, cand_raw: &str) -> f64 {
-    let inp = input_raw.to_lowercase();
-    let cand = cand_raw.to_lowercase();
+/// Вычисление меры сходства (от 0.0 до 1.0) и расстояния Дамерау-Левенштейна за один проход.
+pub fn flag_similarity_and_dist(input_raw: &str, cand_raw: &str) -> (f64, usize) {
+    let inp = to_lower_cow(input_raw);
+    let cand = to_lower_cow(cand_raw);
 
     if inp == cand {
-        return 1.0;
+        return (1.0, 0);
     }
 
-    let len_inp = inp.chars().count();
-    let len_cand = cand.chars().count();
+    let len_inp = if inp.is_ascii() { inp.len() } else { inp.chars().count() };
+    let len_cand = if cand.is_ascii() { cand.len() } else { cand.chars().count() };
 
     if len_inp == 0 || len_cand == 0 {
-        return 0.0;
+        return (0.0, std::cmp::max(len_inp, len_cand));
     }
 
     let max_len = std::cmp::max(len_inp, len_cand);
@@ -66,7 +122,7 @@ pub fn flag_similarity(input_raw: &str, cand_raw: &str) -> f64 {
     let mut base_sim = 1.0 - (dist as f64 / max_len as f64);
 
     // Префиксный бонус: если кандидат начинается с введенного префикса (например, 'al' для 'all', 'dep' для 'deps')
-    if cand.starts_with(&inp) && len_inp >= 2 {
+    if cand.starts_with(inp.as_ref()) && len_inp >= 2 {
         let diff = len_cand - len_inp;
         if diff <= 3 {
             let prefix_sim = 1.0 - (diff as f64 / (len_cand as f64 * 2.0));
@@ -88,7 +144,12 @@ pub fn flag_similarity(input_raw: &str, cand_raw: &str) -> f64 {
         }
     }
 
-    base_sim
+    (base_sim, dist)
+}
+
+/// Вычисление меры сходства (от 0.0 до 1.0) между строкой флага (без дефисов) и кандидатом.
+pub fn flag_similarity(input_raw: &str, cand_raw: &str) -> f64 {
+    flag_similarity_and_dist(input_raw, cand_raw).0
 }
 
 /// Нечёткое сопоставление флага со списком известных флагов.
@@ -122,7 +183,7 @@ pub fn fuzzy_match_flag<'a>(
         &token[1..]
     };
 
-    let len_raw = input_raw.chars().count();
+    let len_raw = if input_raw.is_ascii() { input_raw.len() } else { input_raw.chars().count() };
 
     // Однобуквенные флаги (-x, -h, -a) не подвергаются нечеткому поиску, чтобы не менять флаг ошибочно
     if len_raw <= 1 {
@@ -142,13 +203,12 @@ pub fn fuzzy_match_flag<'a>(
             &cand[1..]
         };
 
-        let len_cand = cand_raw.chars().count();
+        let len_cand = if cand_raw.is_ascii() { cand_raw.len() } else { cand_raw.chars().count() };
         if len_cand <= 1 {
             continue;
         }
 
-        let sim = flag_similarity(input_raw, cand_raw);
-        let dist = damerau_levenshtein(input_raw, cand_raw);
+        let (sim, dist) = flag_similarity_and_dist(input_raw, cand_raw);
 
         let is_prefix = cand_raw.starts_with(input_raw) && len_raw >= 3 && (len_cand >= len_raw) && (len_cand - len_raw) <= 3;
         let valid_dist = is_prefix || match len_cand {
@@ -200,31 +260,31 @@ pub fn fuzzy_match_entity<'a>(
     candidates: &[&'a str],
     threshold: f64,
 ) -> Option<&'a str> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
+    let q_trimmed = query.trim();
+    if q_trimmed.is_empty() {
         return None;
     }
+    let q = to_lower_cow(q_trimmed);
 
     // 1. Точное совпадение
     for &cand in candidates {
-        if q == cand.to_lowercase() {
+        if q == to_lower_cow(cand) {
             return Some(cand);
         }
     }
 
-    let len_q = q.chars().count();
+    let len_q = if q.is_ascii() { q.len() } else { q.chars().count() };
     let mut best_candidate: Option<&'a str> = None;
     let mut best_score = 0.0;
     let mut second_best_score = 0.0;
 
     for &cand in candidates {
-        let c = cand.to_lowercase();
-        let len_c = c.chars().count();
+        let c = to_lower_cow(cand);
+        let len_c = if c.is_ascii() { c.len() } else { c.chars().count() };
 
-        let sim = flag_similarity(&q, &c);
-        let dist = damerau_levenshtein(&q, &c);
+        let (sim, dist) = flag_similarity_and_dist(&q, &c);
 
-        let is_prefix = c.starts_with(&q) && len_q >= 2 && (len_c >= len_q) && (len_c - len_q) <= 3;
+        let is_prefix = c.starts_with(q.as_ref()) && len_q >= 2 && (len_c >= len_q) && (len_c - len_q) <= 3;
         let valid_dist = is_prefix || match len_c {
             0..=3 => dist <= 1,
             4..=6 => dist <= 1,
@@ -268,11 +328,11 @@ pub const GLOBAL_GRIME_FLAGS: &[&str] = &[
 /// Нормализация отдельного токена флага:
 /// Если токен распознан как флаг с опечаткой — возвращается канонический флаг,
 /// иначе исходный токен без изменений.
-pub fn normalize_flag(token: &str, known_flags: &[&str]) -> String {
+pub fn normalize_flag<'a>(token: &'a str, known_flags: &[&'a str]) -> &'a str {
     if let Some(canonical) = fuzzy_match_flag(token, known_flags, 0.75) {
-        canonical.to_string()
+        canonical
     } else {
-        token.to_string()
+        token
     }
 }
 
@@ -282,7 +342,12 @@ pub fn normalize_cli_flags(args: &[String], known_flags: &[&str]) -> Vec<String>
     args.iter()
         .map(|tok| {
             if tok.starts_with('-') && tok != "--" {
-                normalize_flag(tok, known_flags)
+                let norm = normalize_flag(tok, known_flags);
+                if norm == tok {
+                    tok.clone()
+                } else {
+                    norm.to_string()
+                }
             } else {
                 tok.clone()
             }

@@ -502,4 +502,32 @@ async fn test_long_pipeline_multistep_chain() {
     assert_eq!(res.unwrap().unwrap(), "alpha:beta:gamma:delta");
 }
 
+#[tokio::test]
+async fn test_command_list_and_aliases() {
+    // 1. Проверка алиасов в парсере конвейера
+    let p_list = parse_pipeline_args(&["list".to_string()]);
+    assert_eq!(p_list.steps.len(), 1);
+    assert_eq!(p_list.steps[0].module, "list");
+
+    let p_ls = parse_pipeline_args(&["ls".to_string()]);
+    assert_eq!(p_ls.steps.len(), 1);
+    assert_eq!(p_ls.steps[0].module, "list");
+
+    let p_modules = parse_pipeline_args(&["modules".to_string()]);
+    assert_eq!(p_modules.steps.len(), 1);
+    assert_eq!(p_modules.steps[0].module, "list");
+
+    // 2. Исполнение модуля list.lua в локальной директории modules
+    let local_mods = PathBuf::from("modules");
+    if local_mods.exists() {
+        let orch = Orchestrator::new(Some(local_mods), None).unwrap();
+        let res = orch.run_pipeline(&p_list).await;
+        assert!(res.is_ok(), "Выполнение grime list завершилось ошибкой: {:?}", res);
+        let ret = res.unwrap().unwrap();
+        let count: usize = ret.parse().unwrap_or(0);
+        assert!(count >= 10, "Ожидалось не менее 10 модулей, найдено: {}", count);
+    }
+}
+
+
 

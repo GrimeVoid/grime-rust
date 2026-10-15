@@ -251,6 +251,30 @@ impl GrimeLuaEngine {
         // 3. Регистрация API процессов (grime.process)
         api_process::register_process_api(lua, &grime_tbl)?;
 
+        // 3.1. Регистрация API высокоточного времени (grime.time)
+        let time_tbl = lua.create_table()?;
+        time_tbl.set(
+            "now_ns",
+            lua.create_function(|_, ()| {
+                let ns = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_nanos() as u64,
+                    Err(_) => 0,
+                };
+                Ok(ns)
+            })?,
+        )?;
+        time_tbl.set(
+            "now_ms",
+            lua.create_function(|_, ()| {
+                let ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_secs_f64() * 1000.0,
+                    Err(_) => 0.0,
+                };
+                Ok(ms)
+            })?,
+        )?;
+        grime_tbl.set("time", time_tbl)?;
+
         // 4. Регистрация API файловой системы (grime.fs)
         api_fs::register_fs_api(lua, &grime_tbl)?;
 
@@ -890,4 +914,24 @@ mod tests {
         let res: bool = lua.load(script).eval().expect("fuzzy fs ctx native eval");
         assert!(res);
     }
+
+    #[test]
+    fn test_lua_time_and_memory_api() {
+        let engine = GrimeLuaEngine::new(None, None).expect("Инициализация lua engine");
+        let lua = &engine.lua;
+
+        let script = r#"
+            local ns = grime.time.now_ns()
+            local ms = grime.time.now_ms()
+            assert(ns > 0, "now_ns must be positive")
+            assert(ms > 0, "now_ms must be positive")
+
+            local rss = grime.process.memory_rss_kb()
+            assert(rss >= 0, "memory_rss_kb must be non-negative")
+            return true
+        "#;
+        let res: bool = lua.load(script).eval().expect("time and memory api eval");
+        assert!(res);
+    }
 }
+

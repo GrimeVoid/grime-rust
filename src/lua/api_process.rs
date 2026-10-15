@@ -89,6 +89,23 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
         })?,
     )?;
 
+    // grime.process.memory_rss_kb() -> usize
+    proc_tbl.set(
+        "memory_rss_kb",
+        lua.create_function(|_, ()| {
+            if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+                let parts: Vec<&str> = content.split_whitespace().collect();
+                if parts.len() > 1 {
+                    if let Ok(pages) = parts[1].parse::<usize>() {
+                        let page_size_kb = 4;
+                        return Ok(pages * page_size_kb);
+                    }
+                }
+            }
+            Ok(0)
+        })?,
+    )?;
+
     grime_tbl.set("process", proc_tbl)?;
     Ok(())
 }

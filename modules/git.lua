@@ -294,6 +294,12 @@ function M.main()
         return
     end
 
+    if subcmd ~= "init" and not M.is_git_repo(target_dir) then
+        print(ANSI.YELLOW .. "[Grime Git] Каталог не является Git-репозиторием" .. ANSI.RESET)
+        ctx.success("not_a_git_repo")
+        return
+    end
+
     if subcmd == "status" then
         local st, err = M.status(target_dir)
         if not st then

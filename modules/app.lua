@@ -733,7 +733,7 @@ function main()
     local segments = {}
     local cur_seg = {}
     for _, tok in ipairs(filtered) do
-        if tok == "->" then
+        if tok == "->" or tok == ":" or tok == "to" or tok == "::" then
             if #cur_seg > 0 then table.insert(segments, cur_seg); cur_seg = {} end
         else
             table.insert(cur_seg, tok)

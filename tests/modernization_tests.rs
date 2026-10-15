@@ -692,6 +692,46 @@ async fn test_project_overwrite_protection() {
     }
 }
 
+#[tokio::test]
+async fn test_module_returning_table_with_functions_not_leaked_as_json() {
+    let tmp = TestTempDir::new("grime_module_leak");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    // Модуль, аналогичный app.lua: определяет main(), выводящую UI и завершающуюся с nil,
+    // и возвращающий в конце скрипта таблицу функций модуля (для require).
+    fs::write(
+        mod_dir.join("ui_module.lua"),
+        r#"
+        local M = {
+            helper_fn = function() return 123 end,
+            another_fn = function() return "abc" end,
+        }
+
+        function main()
+            -- Модуль просто выводит что-то в терминал и не возвращает полезных данных конвейеру
+            print("Rendered UI successfully")
+            return
+        end
+
+        M.main = main
+        return M
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["ui_module".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_ok(), "Выполнение ui_module упало: {:?}", res);
+    let output = res.unwrap();
+    assert!(
+        output.is_none(),
+        "Ожидался None, но получен паразитный вывод: {:?}",
+        output
+    );
+}
+
 
 
 

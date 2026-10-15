@@ -535,16 +535,26 @@ impl GrimeLuaEngine {
             }
         }
 
-        // Если модуль экспортирует функцию main(), вызываем её
+        // Если модуль экспортирует функцию main() (в globals или в возвращенной таблице), вызываем её
         let globals = lua.globals();
-        if let Ok(main_fn) = globals.get::<mlua::Function>("main") {
+        let main_fn_opt = globals
+            .get::<mlua::Function>("main")
+            .ok()
+            .or_else(|| {
+                if let Some(Value::Table(ref tbl)) = direct_return_value {
+                    tbl.get::<mlua::Function>("main").ok()
+                } else {
+                    None
+                }
+            });
+
+        if let Some(main_fn) = main_fn_opt {
             let res: Result<Value, mlua::Error> = main_fn.call(());
             let _ = globals.set("main", Value::Nil);
             match res {
                 Ok(v) => {
-                    if v != Value::Nil {
-                        direct_return_value = Some(v);
-                    }
+                    // Возвращаемое значение модуля определяется результатом выполнения main()
+                    direct_return_value = if v != Value::Nil { Some(v) } else { None };
                 }
                 Err(e) => {
                     return Ok(StepExecutionResult {
@@ -591,14 +601,29 @@ impl GrimeLuaEngine {
                             status = false;
                             let msg: Option<String> = tbl.get("error").ok().or_else(|| tbl.get("message").ok());
                             error_msg = msg.or_else(|| Some(format!("Модуль '{}' завершился со статусом ошибки", module_name)));
-                        } else if let Ok(json_val) = crate::state_bus::lua_to_json(val.clone()) {
-                            let s = serde_json::to_string(&json_val).unwrap_or_else(|_| format!("{:?}", val));
-                            ret_payload = Some(PipelinePayload::from_string(s.clone()));
-                            ret_val = Some(s);
                         } else {
-                            let s = format!("{:?}", val);
-                            ret_payload = Some(PipelinePayload::from_string(s.clone()));
-                            ret_val = Some(s);
+                            // Проверяем, не является ли таблица Lua-модулем с экспортированными функциями
+                            let mut contains_function = false;
+                            for pair in tbl.pairs::<Value, Value>() {
+                                if let Ok((_, v)) = pair {
+                                    if let Value::Function(_) = v {
+                                        contains_function = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !contains_function {
+                                if let Ok(json_val) = crate::state_bus::lua_to_json(val.clone()) {
+                                    let s = serde_json::to_string(&json_val).unwrap_or_else(|_| format!("{:?}", val));
+                                    ret_payload = Some(PipelinePayload::from_string(s.clone()));
+                                    ret_val = Some(s);
+                                } else {
+                                    let s = format!("{:?}", val);
+                                    ret_payload = Some(PipelinePayload::from_string(s.clone()));
+                                    ret_val = Some(s);
+                                }
+                            }
                         }
                     }
                     _ => {

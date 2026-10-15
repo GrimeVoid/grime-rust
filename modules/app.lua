@@ -5,6 +5,37 @@ local box = require("box")
 local git = require("git")
 local log = require("log")
 
+if grime and not grime.call then
+    grime.call = function(...)
+        local args = { ... }
+        local cmd = { "grime" }
+        for _, a in ipairs(args) do
+            if type(a) == "table" then
+                for _, sub in ipairs(a) do table.insert(cmd, tostring(sub)) end
+            else
+                table.insert(cmd, tostring(a))
+            end
+        end
+        return ctx.run_process(cmd)
+    end
+end
+
+if grime and not grime.capture then
+    grime.capture = function(...)
+        local args = { ... }
+        local cmd = { "grime" }
+        for _, a in ipairs(args) do
+            if type(a) == "table" then
+                for _, sub in ipairs(a) do table.insert(cmd, tostring(sub)) end
+            else
+                table.insert(cmd, tostring(a))
+            end
+        end
+        return ctx.capture(cmd)
+    end
+end
+
+
 local DEFAULT_NIX = {
     cpp = { "cmake", "ninja", "gcc" },
     rust = { "cargo", "rustc" },
@@ -49,8 +80,17 @@ local function check_artifact_status(app_dir, m)
     if not m.artifact or m.artifact == "" then return "no_artifact", "Артефакт не указан" end
     local apath = app_dir .. "/" .. m.artifact
     if not ctx.exists(apath) then return "not_built", "Не собран" end
-    local chk = ctx.exists(app_dir .. "/src") and (app_dir .. "/src") or app_dir
-    if ctx.is_newer(chk, apath) then return "needs_rebuild", "Требует пересборки" end
+    if m.sources and type(m.sources) == "table" then
+        for _, s in ipairs(m.sources) do
+            local spath = app_dir .. "/" .. s
+            if ctx.exists(spath) and ctx.is_newer(spath, apath) then
+                return "needs_rebuild", "Требует пересборки"
+            end
+        end
+        return "built", "Собран"
+    end
+    local chk = ctx.exists(app_dir .. "/src") and (app_dir .. "/src") or nil
+    if chk and ctx.is_newer(chk, apath) then return "needs_rebuild", "Требует пересборки" end
     return "built", "Собран"
 end
 
@@ -125,7 +165,17 @@ end
 local function build_app(app_name, m, app_dir)
     if not m.build or m.build == "" then return true end
     ctx.log(string.format("==> Сборка приложения '%s'...", app_name))
-    local code = exec_cmd(m, m.build, app_dir, { GRIME_APP_NAME = app_name })
+    local code = 0
+    if type(m.build) == "function" then
+        local ok, res = pcall(m.build, app_dir, m)
+        if not ok then
+            ctx.fail(string.format("Ошибка сборки приложения '%s': %s", app_name, tostring(res)))
+            return false
+        end
+        code = (type(res) == "number") and res or (res == false and 1 or 0)
+    else
+        code = exec_cmd(m, m.build, app_dir, { GRIME_APP_NAME = app_name })
+    end
     if code ~= 0 then
         ctx.fail(string.format("Ошибка сборки приложения '%s' (код %d)", app_name, code))
         return false
@@ -163,6 +213,15 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
         end
     end
 
+    if type(m.run) == "function" then
+        local ok, res = pcall(m.run, app_dir, run_args, is_detach, m)
+        if not ok then
+            ctx.fail(string.format("Ошибка выполнения приложения '%s': %s", app_name, tostring(res)))
+            return 1
+        end
+        return (type(res) == "number") and res or (res == false and 1 or 0)
+    end
+
     local socket_path = os.getenv("GRIME_SOCKET") or (os.getenv("XDG_RUNTIME_DIR") and (os.getenv("XDG_RUNTIME_DIR") .. "/grime.sock") or "/tmp/grime.sock")
     local env = { GRIME_SOCKET = socket_path, GRIME_APP_NAME = app_name }
     local cmd_tokens = resolve_cmd_tokens(m, run_args)
@@ -182,7 +241,15 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
             cmd_str = string.format("distrobox enter %s -- sh -c %q", m.box, cmd_str)
         end
         local res = ctx.capture(string.format("nohup %s > %q 2>&1 & echo $!", cmd_str, log), app_dir, env)
-        ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", res.stdout:match("%d+") or "?", log))
+        local pid = res.stdout:match("%d+")
+        if pid then
+            local pf = io.open(app_dir .. "/app.pid", "w")
+            if pf then
+                pf:write(pid .. "\n")
+                pf:close()
+            end
+        end
+        ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log))
         return 0
     end
 
@@ -332,6 +399,11 @@ local function list_apps(apps_root)
     table.sort(dirs)
     if #dirs == 0 then
         print(string.format("В каталоге %s нет установленных приложений.\nИспользуйте 'grime app new <имя>' для создания.", apps_root))
+        return
+    end
+
+    if ctx.has_next_step then
+        ctx.success(table.concat(dirs, "\n"))
         return
     end
 
@@ -693,7 +765,10 @@ function main()
         local dir = apps_root .. "/" .. app_name
         local m, err = load_manifest(dir, app_name)
         if not m then ctx.fail(err or "Манифест не найден"); return end
-        build_app(app_name, m, dir)
+        local ok = build_app(app_name, m, dir)
+        if ok and ctx.has_next_step then
+            ctx.success(dir)
+        end
         return
     elseif subcmd == "commit" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app commit <app_name> [сообщение]"); return end
@@ -711,12 +786,66 @@ function main()
         return
     elseif subcmd == "status" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app status <app_name>"); return end
+        local app_name = resolve_app_name(apps_root, filtered[2])
+        local dir = apps_root .. "/" .. app_name
+        local m, _ = load_manifest(dir, app_name)
+        if m and type(m.status) == "function" then
+            m.status(dir, m)
+            return
+        end
         status_app(apps_root, filtered[2])
+        return
+    elseif subcmd == "test" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app test <app_name>"); return end
+        local app_name = resolve_app_name(apps_root, filtered[2])
+        local dir = apps_root .. "/" .. app_name
+        local m, err = load_manifest(dir, app_name)
+        if not m then ctx.fail(err or "Манифест не найден"); return end
+        if type(m.test) == "function" then
+            local ok, res = pcall(m.test, dir, m)
+            if not ok or res == false or (type(res) == "number" and res ~= 0) then
+                ctx.fail(string.format("Тесты приложения '%s' завершились с ошибкой: %s", app_name, tostring(res)))
+                return
+            end
+            ctx.log(string.format("✓ Все тесты приложения '%s' успешно пройдены.", app_name))
+        elseif type(m.test) == "string" and m.test ~= "" then
+            local code = exec_cmd(m, m.test, dir)
+            if code ~= 0 then ctx.fail(string.format("Тесты завершились с кодом %d", code)); return end
+            ctx.log(string.format("✓ Все тесты приложения '%s' успешно пройдены.", app_name))
+        else
+            ctx.log(string.format("Тесты для приложения '%s' не определены в app.lua.", app_name))
+        end
         return
     elseif subcmd == "rm" or subcmd == "remove" or subcmd == "delete" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app rm <app_name>"); return end
         local app_name = resolve_app_name(apps_root, filtered[2])
         rm_app(apps_root, app_name)
+        return
+    elseif subcmd == "stop" or subcmd == "kill" then
+        if not filtered[2] then ctx.fail("Укажите имя приложения: grime app stop <app_name>"); return end
+        local app_name = resolve_app_name(apps_root, filtered[2])
+        local dir = apps_root .. "/" .. app_name
+        local m, _ = load_manifest(dir, app_name)
+        if m and type(m.stop) == "function" then
+            local ok, err = pcall(m.stop, dir, m)
+            if not ok then ctx.log("Предупреждение при выполнении m.stop: " .. tostring(err)) end
+            return
+        end
+        local pid_file = dir .. "/app.pid"
+        local f = io.open(pid_file, "r")
+        if not f then
+            ctx.fail(string.format("PID-файл не найден для приложения '%s' (%s). Возможно, оно не запущено.", app_name, pid_file))
+            return
+        end
+        local pid = f:read("*l")
+        f:close()
+        if pid and pid:match("^%d+$") then
+            ctx.capture(string.format("kill -TERM %s 2>/dev/null", pid))
+            ctx.delete(pid_file, true)
+            ctx.log(string.format("✓ Фоновое приложение '%s' (PID: %s) успешно остановлено.", app_name, pid))
+        else
+            ctx.fail(string.format("Некорректный PID в файле: %s", tostring(pid)))
+        end
         return
     end
 
@@ -759,7 +888,7 @@ function main()
         if code ~= 0 then
             ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code))
         else
-            if not ctx.has_next_step then
+            if ctx.has_next_step then
                 ctx.success(dir)
             end
         end

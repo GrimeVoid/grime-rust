@@ -2,6 +2,7 @@
 
 # GRIME (Next Generation / Grime-RS) 🦀🌙
 
+[![Release: v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/ValetJk010/Grime_Project/releases/tag/v1.1.0)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust%202021-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Runtime: LuaJIT](https://img.shields.io/badge/Runtime-LuaJIT%20%2F%20mlua-blue.svg?logo=lua)](https://luajit.org/)
 [![Ecosystem: Nix Flakes](https://img.shields.io/badge/Ecosystem-Nix%20Flakes-5277C3.svg?logo=nixos)](https://nixos.org/)
@@ -13,17 +14,19 @@
 
 **GRIME** кардинально решает проблему «работает на моей машине», фрагментации сборочных инструментов и тяжеловесности контейнеризации. Он объединяет герметичность **Nix Flakes**, гибкость изолированных дистрибутивов **Distrobox** и скорость нативного ядра **Rust** в единый декларативный конвейер данных с субмиллисекундным временем реакции.
 
+Начиная с версии **v1.1.0**, ядро GRIME эволюционировало в **промышленное сверхнадёжное микроядро (Production-Grade Resilient Microkernel)**. Вся предметная логика, адаптеры языков и сборочные стратегии полностью вынесены в декларативные динамические модули LuaJIT, а ядро Rust сфокусировано исключительно на управлении жизненным циклом, асинхронном пайплайнинге, супервизии задач, IPC и бескомпромиссной безопасности исполнения.
+
 ---
 
 ## 🎯 Технологический стек
 
 | Компонент | Технология | Обоснование выбора |
 | :--- | :--- | :--- |
-| **Системное ядро** | **Rust (Edition 2021)**, Tokio, mlua | Полная типобезопасность, Zero-Cost Abstractions, отсутствие сборщика мусора и минимальный footprint памяти (~4.2 МБ RAM в простое). |
+| **Системное микроядро** | **Rust (Edition 2021)**, Tokio, mlua | Полная типобезопасность, Zero-Cost Abstractions, отсутствие сборщика мусора и минимальный footprint памяти (~4.2 МБ RAM в простое). Чистая микроядерная архитектура. |
 | **Скриптовый движок** | **LuaJIT FFI / mlua** | Моментальное исполнение логики модулей, безопасность песочницы, поддержка Hot-Reload без перезапуска процессов. |
 | **Герметичные окружения** | **Nixpkgs / Nix Flakes** | Математически воспроизводимые зависимости, дедупликация на уровне жестких ссылок и нулевое загрязнение хост-системы. |
 | **Контейнеризация** | **Distrobox / Podman / Docker** | Бесшовная интеграция с любыми Linux-дистрибутивами (Fedora, Ubuntu, Arch, Alpine) с разделением X11/Wayland, PipeWire и сокетов. |
-| **Межпроцессное взаимодействие** | **Unix Domain Sockets (UDS)** + StateBus | Отклик 1–2 мс между CLI-клиентом и фоновым демоном, передача бинарных буферов через Zero-Copy (`bytes::Bytes`). |
+| **Межпроцессное взаимодействие** | **Unix Domain Sockets (UDS)** + StateBus | Отклик 1–2 мс между CLI-клиентом и фоновым демоном, защита от DoS/OOM (лимит сообщений 32 МБ) и Zero-Copy передача буферов (`bytes::Bytes`). |
 
 ---
 
@@ -66,22 +69,50 @@ grime project cpp init MyGame : box fedora-box : project build : host : project 
 - **Двойной аудит**: Команда `grime app diff <app>` одновременно инспектирует как изменения в исходном коде через `git diff`, так и расхождения в структуре собранных пакетов и замыканий Nix через `nix store diff-closures`.
 - **Снимки и мгновенный откат**: `grime app snapshot <app> "ревизия"` и `grime app rollback <app>`.
 
+### 7. Сверхнадёжное промышленное микроядро (Hardened Resilient Microkernel v1.1.0)
+В ядре реализован комплекс критических защитных механизмов операционного уровня:
+- **Защита IPC от DoS и OOM**: строгий лимит размера передаваемых сообщений 32 МБ с мгновенным отсечением повреждённых сокетных фреймов и защитой от исчерпания памяти хоста.
+- **Интеллектуальный супервизор задач (`TaskSupervisor`)**:
+  - Защита от ложных таймаутов на долгих шагах сборки (`is_step_active`): пока компилятор или шаг конвейера активно работает, таймаут не прерывает задачу.
+  - Автоматическая очистка завершённых задач старше 1 часа (Retention Policy) для предотвращения утечек дескрипторов и памяти.
+  - Самовосстановление после отравления блокировок (Mutex Poison Recovery) — сбой отдельного потока не приводит к падению фонового демона `grimed`.
+- **Суверенитет файловой системы и защита системных путей**: безусловный запрет любых деструктивных файловых операций над системными директориями (`/`, `/etc`, `/usr`, `/nix`, `/var`, `/boot`, `/root`), а также запрет разыменования симлинков при изменении прав (`chmod`), предотвращающий privilege escalation и атаки по ссылкам.
+- **Защита от переполнения стека (Stack Overflow Guard)**: жёсткое ограничение глубины обхода при сериализации графов таблиц Lua в JSON (`max_depth = 64`), предотвращающее краши из-за циклических ссылок.
+- **Нативная поддержка TUI и PTY**: канонический проброс дескрипторов псевдотерминала (`Stdio::inherit`) обеспечивает 100% совместимость с интерактивными TUI-утилитами (`cava`, `btop`, `nvim`, `less`, сплит-интерфейсами).
+
+### 8. Интерактивный Command-Not-Found для Fish Shell (`grime pkg not-found`)
+Интеллектуальный хук командной оболочки Fish, превращающий терминал в самовосстанавливающуюся среду разработки:
+1. **Прозрачная локальная проверка**: при вводе команды GRIME мгновенно проверяет установленные пакеты Flatpak, изолированные приложения Grime Apps (`~/.config/grime/apps/<cmd>`), бинарники Nix Profile (`~/.nix-profile/bin/`) и Cargo (`~/.cargo/bin/`). Если утилита обнаружена локально — она запускается немедленно без дополнительных подтверждений.
+2. **Интерактивный запуск через Nix**: если утилита отсутствует на хосте, но доступна в репозитории Nixpkgs, GRIME вежливо выводит запрос:
+   ```text
+   [Grime] Команда 'htop' не найдена на хосте.
+   Найдена в репозитории Nixpkgs. Запустить в изолированном окружении? [Y/n]: 
+   ```
+   При согласии команда мгновенно запускается в эфемерном окружении `nix-shell` без загрязнения хост-системы.
+3. **Нечёткий поиск при опечатках (Fuzzy Did-You-Mean)**: если утилита не найдена нигде, алгоритм Дамерау-Левенштейна моментально подбирает наиболее близкую по звучанию команду среди установленных в системе бинарников:
+   ```text
+   [Grime] Команда 'carg' не найдена.
+   💡 Возможно, вы имели в виду: cargo?
+   ```
+
 ---
 
 ## 🏗️ Архитектура системы
 
 ```mermaid
 flowchart TD
-    subgraph ClientLayer ["CLI & Interface Layer"]
+    subgraph ClientLayer ["CLI & Shell Interface"]
         CLI["grime (CLI Client / Rust)"]
-        Fish["Shell Pipelines (: syntax)"]
+        Fish["Fish Shell (Pipelines ':' & CNF Hook)"]
     end
 
-    subgraph CoreLayer ["Native Rust Core (grimed / in-process)"]
+    subgraph CoreLayer ["Native Rust Microkernel (grimed / in-process)"]
         UDS["Unix Domain Socket (/run/user/UID/grime.sock)"]
+        IPCGuard["IPC DoS & OOM Guard (32 MB Limit)"]
         Router["Pipeline Dispatcher & Async Engine (Tokio)"]
+        Supervisor["TaskSupervisor (Heartbeats & Retention)"]
+        FSGuard["FS Sovereign Guard (System Path Protect)"]
         StateBus["Shared StateBus (RAM Zero-Copy)"]
-        Sandbox["Security Guard & RAII Watcher"]
     end
 
     subgraph LuaLayer ["LuaJIT Dynamic Modules (~/.config/grime/modules/)"]
@@ -89,7 +120,8 @@ flowchart TD
         M_Proj["project.lua (Build Cascades)"]
         M_Nix["nix.lua (Ephemeral Flakes)"]
         M_Box["box.lua (Distrobox Warmup)"]
-        M_Pkg["pkg.lua (Meta Package Manager)"]
+        M_Pkg["pkg.lua (Meta Pkg & CNF)"]
+        M_Aider["aider.lua (AI Coding Agent)"]
         M_Scan["languages/scanner.lua (Auto-Toolchain)"]
     end
 
@@ -99,14 +131,18 @@ flowchart TD
         DBox["Distrobox Containers (Fedora / Ubuntu)"]
     end
 
-    CLI -->|1-2 ms UDS IPC| UDS
     Fish --> CLI
-    UDS --> Router
+    CLI -->|UDS IPC| UDS
+    UDS --> IPCGuard
+    IPCGuard --> Router
+    Router --> Supervisor
+    Router --> FSGuard
     Router --> StateBus
-    Router --> Sandbox
     Router --> LuaLayer
     LuaLayer --> Targets
 ```
+
+---
 
 ---
 
@@ -252,7 +288,9 @@ return {
 - [`modules/languages/`](modules/languages/) — Адаптеры для C++, Rust, Python, Java с интеллектуальным сканером структуры [`scanner.lua`](modules/languages/scanner.lua).
 - [`modules/nix.lua`](modules/nix.lua) — Декларативные и эфемерные окружения Nix Flake/DevShell, сборка мусора (`gc`), дедупликация (`optimise`).
 - [`modules/box.lua`](modules/box.lua) — Оркестрация и выполнение команд внутри изолированных Distrobox-контейнеров.
-- [`modules/pkg.lua`](modules/pkg.lua) — Унифицированный мульти-менеджер пакетов (Pacman, Flatpak, Nix, Distrobox, Cargo).
+- [`modules/pkg.lua`](modules/pkg.lua) — Унифицированный мульти-менеджер пакетов (Pacman, Flatpak, Nix, Distrobox, Cargo), нечёткий поиск и интерактивный Command-Not-Found.
+- [`modules/daemon.lua`](modules/daemon.lua) — Управление фоновым сервисом `grimed`: статус, мониторинг памяти, проверка сокета, перезапуск и сбор диагностических логов.
+- [`modules/aider.lua`](modules/aider.lua) — Интеграция автономного AI-агента кодогенерации и рефакторинга Aider непосредственно в пайплайн Grime.
 - [`modules/bus.lua`](modules/bus.lua) — Разделяемая память StateBus между шагами конвейера.
 - [`modules/git.lua`](modules/git.lua) — Высокоуровневые операции Git, аудит изменений и снапшоты.
 - [`modules/doctor.lua`](modules/doctor.lua) — Глубокая диагностика доступных системных инструментов и контейнеров.
@@ -260,13 +298,25 @@ return {
 
 ---
 
-## 🐚 Совместимость с командными оболочками (Fish / Bash / Zsh)
+## 🐚 Совместимость с командными оболочками и интеграция с Fish Shell
 
+### 1. Синтаксис конвейеров
 Конвейеры GRIME используют двоеточие `:` как универсальный разделитель шагов:
 ```fish
 grime host : bus set system.mode production : git status : log INFO "Аудит завершен"
 ```
 > **Совет для пользователей Fish Shell:** Символ `:` предотвращает перехват токена `->` оболочкой Fish (который в Fish интерпретируется как перенаправление потока в файл).
+
+### 2. Подключение Command-Not-Found в Fish Shell
+Чтобы Fish автоматически подхватывал отсутствующие команды через изолированный Nix-рантайм или подсказывал правильное имя утилиты:
+```fish
+# Создание функции перехвата в Fish Shell:
+mkdir -p ~/.config/fish/functions
+echo 'function fish_command_not_found
+    grime pkg not-found $argv
+end' > ~/.config/fish/functions/fish_command_not_found.fish
+```
+После этого любая неизвестная команда в шелле будет обрабатываться интерактивным менеджером GRIME с предложением запуска через Nix `[Y/n]` или нечёткими подсказками при опечатках.
 
 ---
 

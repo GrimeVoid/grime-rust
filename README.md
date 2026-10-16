@@ -1,3 +1,5 @@
+**[ 🇷🇺 Русский ](README.md) • [ 🇬🇧 English ](README.en.md)**
+
 # GRIME (Next Generation / Grime-RS) 🦀🌙
 
 [![Language: Rust](https://img.shields.io/badge/Language-Rust%202021-orange.svg?logo=rust)](https://www.rust-lang.org/)
@@ -5,7 +7,7 @@
 [![Ecosystem: Nix Flakes](https://img.shields.io/badge/Ecosystem-Nix%20Flakes-5277C3.svg?logo=nixos)](https://nixos.org/)
 [![Containers: Distrobox](https://img.shields.io/badge/Containers-Distrobox%20%2F%20Podman-purple.svg)](https://distrobox.it/)
 [![Response: 1--2 ms](https://img.shields.io/badge/Latency-1--2%20ms%20(Socket)-brightgreen.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: Dual Non-Commercial / Commercial](https://img.shields.io/badge/License-Dual%20Personal%20%2F%20Commercial-blue.svg)](LICENSE)
 
 > **Высокопроизводительный системный оркестратор проектов, контейнеров и эфемерных Nix-окружений на стыке нативного Rust и встраиваемого LuaJIT.**
 
@@ -270,5 +272,9 @@ grime host : bus set system.mode production : git status : log INFO "Аудит 
 
 ## 📄 Лицензия
 
-Проект распространяется под открытой лицензией [MIT](LICENSE).
+Проект распространяется под двойной лицензией **[GRIME Dual License](LICENSE)**:
+- **Личное, образовательное и исследовательское использование:** Полностью бесплатно, бессрочно и без ограничений ([PolyForm Noncommercial 1.0](LICENSE)).
+- **Коммерческое использование:** Роялти 1% от валового дохода, с льготным порогом до $50,000/год для независимых разработчиков и малых стартапов (бесплатно до превышения порога).
+
+Подробные условия и юридический текст доступны в файле [LICENSE](LICENSE).  
 Автор: **ValetJk010**

@@ -7,11 +7,12 @@ local ACTIONS = {
     run = "run", r = "run", ["try"] = "run",
     init = "init", shell = "init", sh = "init", new = "init",
     search = "search", find = "search", s = "search", f = "search",
+    ["not-found"] = "not_found", ["not_found"] = "not_found", cnf = "not_found",
     help = "help",
 }
 
 local CANONICAL_MANAGERS = {
-    "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx", "dnf", "apt"
+    "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx", "dnf", "apt", "host"
 }
 
 local MANAGER_ALIASES = {
@@ -24,6 +25,7 @@ local MANAGER_ALIASES = {
     pipx = "pipx", pip = "pipx", python = "pipx",
     dnf = "dnf", fedora = "dnf",
     apt = "apt", debian = "apt", ubuntu = "apt",
+    host = "host", sys = "host", system = "host",
 }
 
 local MANAGER_BINARIES = {
@@ -778,76 +780,590 @@ local function handle_install(manager, packages)
     end
 end
 
--- 5. Изолированный запуск
+-- Маппинг распространенных консольных утилит в их пакеты в nixpkgs
+local NIX_PACKAGE_MAPPINGS = {
+    -- coreutils
+    du = "coreutils", df = "coreutils", ls = "coreutils", cat = "coreutils",
+    cp = "coreutils", mv = "coreutils", rm = "coreutils", mkdir = "coreutils",
+    rmdir = "coreutils", touch = "coreutils", chmod = "coreutils", chown = "coreutils",
+    head = "coreutils", tail = "coreutils", wc = "coreutils", sort = "coreutils",
+    uniq = "coreutils", cut = "coreutils", tr = "coreutils", tee = "coreutils",
+    env = "coreutils", echo = "coreutils", date = "coreutils", sleep = "coreutils",
+    uname = "coreutils", whoami = "coreutils", basename = "coreutils", dirname = "coreutils",
+    realpath = "coreutils", readlink = "coreutils", stat = "coreutils", sync = "coreutils",
+    truncate = "coreutils", ln = "coreutils", md5sum = "coreutils", sha256sum = "coreutils",
+    base64 = "coreutils", nproc = "coreutils", timeout = "coreutils",
+
+    -- findutils
+    find = "findutils", xargs = "findutils", locate = "findutils",
+
+    -- diffutils
+    diff = "diffutils", cmp = "diffutils",
+
+    -- procps & psmisc
+    ps = "procps", top = "procps", free = "procps", uptime = "procps",
+    kill = "procps", pgrep = "procps", pkill = "procps", watch = "procps",
+    killall = "psmisc", pstree = "psmisc",
+
+    -- util-linux
+    lsblk = "util-linux", fdisk = "util-linux", mount = "util-linux",
+    umount = "util-linux", dmesg = "util-linux",
+
+    -- net-tools & iproute2
+    ifconfig = "net-tools", netstat = "net-tools", ip = "iproute2", ss = "iproute2",
+
+    -- grep / sed / gawk / архиваторы
+    grep = "gnugrep", egrep = "gnugrep", fgrep = "gnugrep",
+    sed = "gnused", awk = "gawk",
+    tar = "gnutar", gzip = "gzip", gunzip = "gzip", bzip2 = "bzip2", xz = "xz",
+
+    -- Популярные CLI инструменты
+    nvim = "neovim", rg = "ripgrep", fd = "fd", bat = "bat", eza = "eza",
+    btm = "bottom", htop = "htop", btop = "btop", jq = "jq",
+    curl = "curl", wget = "wget", git = "git", tmux = "tmux", zellij = "zellij",
+    fzf = "fzf", tree = "tree", gh = "gh", dig = "bind", nslookup = "bind",
+    ping = "iputils", traceroute = "traceroute", strace = "strace", lsof = "lsof",
+    ncdu = "ncdu", duf = "duf", dust = "dust", tokei = "tokei",
+    hyperfine = "hyperfine", cowsay = "cowsay", sl = "sl", figlet = "figlet",
+    lolcat = "lolcat", fastfetch = "fastfetch", neofetch = "neofetch",
+}
+
+-- Поиск системного бинарника на хосте (с исключением ~/.nix-profile и ~/.cargo для чистого разделения)
+local function find_host_binary(bin)
+    if not bin or bin == "" then return nil end
+    local candidate_paths = {
+        "/usr/bin/" .. bin,
+        "/usr/local/bin/" .. bin,
+        "/bin/" .. bin,
+        "/usr/sbin/" .. bin,
+        "/sbin/" .. bin,
+    }
+    for _, p in ipairs(candidate_paths) do
+        if ctx.exists(p) then return p end
+    end
+
+    local res = ctx.capture({ "which", bin })
+    if res.code == 0 and res.stdout then
+        local p = res.stdout:match("^(%S+)")
+        if p and p ~= "" and ctx.exists(p) then
+            local home = os.getenv("HOME") or ""
+            if not (home ~= "" and (p:find(home .. "/.nix-profile", 1, true) or p:find(home .. "/.cargo", 1, true))) then
+                return p
+            end
+        end
+    end
+    return nil
+end
+
+-- Поиск установленного Flatpak-приложения по имени или app_id
+local function find_flatpak_app(target_name)
+    if not has_binary("flatpak") then return nil end
+    local pkgs = get_flatpak_packages(false)
+    if not pkgs then return nil end
+    local t_lower = target_name:lower()
+
+    -- 1. Точное совпадение с app_id или именем (без учета регистра)
+    for _, item in ipairs(pkgs) do
+        local app_id = item.details or ""
+        local name = item.name or ""
+        if app_id:lower() == t_lower or name:lower() == t_lower then
+            return app_id, name
+        end
+    end
+
+    -- 2. Совпадение суффикса app_id (например, "obsidian" -> "md.obsidian.Obsidian")
+    for _, item in ipairs(pkgs) do
+        local app_id = item.details or ""
+        local name = item.name or ""
+        if app_id:lower():match("%." .. t_lower .. "$") or app_id:lower():match("%." .. t_lower .. "%..*") then
+            return app_id, name
+        end
+    end
+
+    -- 3. Подстрока в имени или app_id
+    for _, item in ipairs(pkgs) do
+        local app_id = item.details or ""
+        local name = item.name or ""
+        if name:lower():find(t_lower, 1, true) or app_id:lower():find(t_lower, 1, true) then
+            return app_id, name
+        end
+    end
+
+    -- 4. Нечеткий поиск (fuzzy)
+    local best_item = nil
+    local best_score = 0
+    for _, item in ipairs(pkgs) do
+        local m1, s1 = fuzzy_match(t_lower, item.name or "")
+        local m2, s2 = fuzzy_match(t_lower, item.details or "")
+        local score = math.max(m1 and s1 or 0, m2 and s2 or 0)
+        if score > best_score and score >= 300 then
+            best_score = score
+            best_item = item
+        end
+    end
+    if best_item then
+        return best_item.details, best_item.name
+    end
+
+    return nil
+end
+
+-- Поиск бинарника в Nix-профиле
+local function find_nix_profile_binary(bin)
+    if not bin or bin == "" then return nil end
+    local p = (os.getenv("HOME") or "") .. "/.nix-profile/bin/" .. bin
+    if ctx.exists(p) then return p end
+    return nil
+end
+
+-- Поиск бинарника в Cargo / Pipx / Local bin
+local function find_cargo_or_pipx_binary(bin)
+    if not bin or bin == "" then return nil, nil end
+    local cargo_bin = (os.getenv("HOME") or "") .. "/.cargo/bin/" .. bin
+    if ctx.exists(cargo_bin) then return cargo_bin, "cargo" end
+    local local_bin = (os.getenv("HOME") or "") .. "/.local/bin/" .. bin
+    if ctx.exists(local_bin) then return local_bin, "local" end
+    return nil, nil
+end
+
+-- Запуск локального микросервиса Grime App
+local function run_grime_app(target_name, run_args)
+    local apps_root = get_apps_root()
+    local app_dir = apps_root .. "/" .. target_name
+    if not ctx.exists(app_dir) or not ctx.is_dir(app_dir) then
+        return false, string.format("Приложение '%s' не найдено в %s", target_name, apps_root)
+    end
+    ctx.log(string.format("[Grime Pkg] Запуск локального Grime App: %s...", target_name))
+    local ok, app_mod = pcall(require, "app")
+    if ok and type(app_mod) == "table" and app_mod.run_app and app_mod.load_manifest then
+        local m, err = app_mod.load_manifest(app_dir, target_name)
+        if not m then
+            return false, err or ("Не удалось загрузить манифест приложения: " .. target_name)
+        end
+        local ret = app_mod.run_app(target_name, m, app_dir, run_args, false)
+        if ret ~= 0 then
+            return false, string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret)
+        end
+        return true
+    else
+        local proc = { "grime", "app", target_name }
+        for _, a in ipairs(run_args) do
+            table.insert(proc, a)
+        end
+        local ret = ctx.run_process(proc)
+        if ret ~= 0 then
+            return false, string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret)
+        end
+        return true
+    end
+end
+
+-- Изолированный запуск через nix-shell с умным маппингом пакетов
+local function run_nix_shell(target_name, run_args)
+    local nix_pkg = NIX_PACKAGE_MAPPINGS[target_name] or target_name
+    local inner_parts = { target_name }
+    for _, a in ipairs(run_args) do
+        table.insert(inner_parts, "'" .. tostring(a):gsub("'", "'\\''") .. "'")
+    end
+    local inner_cmd = table.concat(inner_parts, " ")
+    local cmd = { "nix-shell", "-p", nix_pkg, "--run", inner_cmd }
+
+    ctx.log(string.format("[Grime Pkg] Изолированный запуск [%s]: %s...", nix_pkg, inner_cmd))
+    local ret = ctx.run_process(cmd)
+    if ret ~= 0 then
+        ctx.fail(string.format("Выполнение утилиты '%s' через nix-shell завершилось ошибкой (код %d)", target_name, ret))
+    end
+    return ret
+end
+
+-- Справка по запуску утилит
+local function print_run_help()
+    print(string.format([[
+%s%sGrime Pkg Run%s — Мультипакетный запуск утилит, приложений и сред
+
+%sИСПОЛЬЗОВАНИЕ:%s
+    grime pkg run <утилита> [аргументы...]     # Сквозной автопоиск по приоритету
+    grime pkg run <менеджер> <утилита> [args] # Запуск через конкретный менеджер
+
+%sПРИОРИТЕТ АВТОПОИСКА:%s
+    1. Локальные Grime Apps (~/.config/grime/apps/<имя>)
+    2. Системный PATH на хосте (Pacman/Host: /usr/bin, /usr/local/bin)
+    3. Flatpak-приложения (поиск по имени или app_id)
+    4. Nix Profile (~/.nix-profile/bin/<имя>)
+    5. Cargo / Pipx (~/.cargo/bin, ~/.local/bin)
+    6. Изолированный Nix-shell (с умным маппингом coreutils/findutils/etc.)
+
+%sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ ДЛЯ ЯВНОГО ЗАПУСКА:%s
+    • host / pacman  — Запуск системной утилиты хоста через $PATH
+    • flatpak        — Запуск Flatpak-приложения по имени или app_id
+    • apps / app     — Запуск локального микросервиса Grime App
+    • nix            — Запуск из ~/.nix-profile/bin либо через nix-shell
+    • cargo          — Запуск установленного бинарника Cargo (~/.cargo/bin)
+    • box / distrobox— Запуск внутри контейнера Distrobox
+
+%sПРИМЕРЫ:%s
+    grime pkg run du -h                       # Системный du на хосте
+    grime pkg run btop                        # Системный btop на хосте
+    grime pkg run obsidian                    # Flatpak md.obsidian.Obsidian
+    grime pkg run flatpak Obsidian            # Явный запуск Flatpak
+    grime pkg run box htop                    # Запуск htop внутри Distrobox
+    grime pkg run host git status             # Явный запуск git с хоста
+    grime pkg run glow README.md              # Запуск утилиты с nix fallback
+]],
+    "\27[1m", "\27[32m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m"
+    ))
+end
+
+-- 5. Мультипакетный запуск утилит и приложений
 local function handle_run(manager, packages, command_tokens)
     if not packages or #packages == 0 then
-        ctx.fail("Укажите имя пакета или приложения для запуска")
+        ctx.fail("Укажите имя пакета или приложения для запуска\nИспользование: grime pkg run [менеджер] <утилита> [аргументы...]\nДля подробной справки: grime pkg run --help")
         return
     end
 
     local target_name = packages[1]
-    local apps_root = get_apps_root()
-    local app_dir = apps_root .. "/" .. target_name
-    local is_app = (manager == "apps" or manager == "app") or (ctx.exists(app_dir) and ctx.is_dir(app_dir))
+    local run_args = {}
+    for i = 2, #packages do
+        table.insert(run_args, packages[i])
+    end
+    for _, ct in ipairs(command_tokens or {}) do
+        table.insert(run_args, ct)
+    end
 
-    if is_app then
-        if not ctx.exists(app_dir) then
-            ctx.fail(string.format("Приложение '%s' не найдено в %s", target_name, apps_root))
-            return
-        end
-
-        local run_args = {}
-        for i = 2, #packages do
-            table.insert(run_args, packages[i])
-        end
-        for _, ct in ipairs(command_tokens or {}) do
-            table.insert(run_args, ct)
-        end
-
-        local ok, app_mod = pcall(require, "app")
-        if ok and type(app_mod) == "table" and app_mod.run_app and app_mod.load_manifest then
-            local m, err = app_mod.load_manifest(app_dir, target_name)
-            if not m then
-                ctx.fail(err or ("Не удалось загрузить манифест приложения: " .. target_name))
-                return
-            end
-            local ret = app_mod.run_app(target_name, m, app_dir, run_args, false)
-            if ret ~= 0 then
-                ctx.fail(string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret))
-            end
-        else
-            local proc = { "grime", "app", target_name }
+    -- Если менеджер явно указан
+    if manager then
+        if manager == "flatpak" then
+            local flatpak_id = find_flatpak_app(target_name) or target_name
+            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+            ctx.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", flatpak_id, flatpak_id, args_str))
+            local proc = { "flatpak", "run", flatpak_id }
             for _, a in ipairs(run_args) do
                 table.insert(proc, a)
             end
             local ret = ctx.run_process(proc)
             if ret ~= 0 then
-                ctx.fail(string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret))
+                ctx.fail(string.format("Flatpak-приложение '%s' завершилось с ошибкой (код %d)", flatpak_id, ret))
             end
+            return
+        elseif manager == "apps" or manager == "app" then
+            local ok, err = run_grime_app(target_name, run_args)
+            if not ok then
+                ctx.fail(err)
+            end
+            return
+        elseif manager == "pacman" or manager == "host" then
+            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+            ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target_name, args_str))
+            local proc = { target_name }
+            for _, a in ipairs(run_args) do
+                table.insert(proc, a)
+            end
+            local ret = ctx.run_process(proc)
+            if ret ~= 0 then
+                ctx.fail(string.format("Системная утилита '%s' завершилась с ошибкой (код %d)", target_name, ret))
+            end
+            return
+        elseif manager == "nix" then
+            local nix_bin = find_nix_profile_binary(target_name)
+            if nix_bin then
+                local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+                ctx.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s]: %s%s...", nix_bin, target_name, args_str))
+                local proc = { nix_bin }
+                for _, a in ipairs(run_args) do
+                    table.insert(proc, a)
+                end
+                local ret = ctx.run_process(proc)
+                if ret ~= 0 then
+                    ctx.fail(string.format("Утилита Nix '%s' завершилась с ошибкой (код %d)", target_name, ret))
+                end
+                return
+            else
+                run_nix_shell(target_name, run_args)
+                return
+            end
+        elseif manager == "cargo" then
+            local cargo_bin = (os.getenv("HOME") or "") .. "/.cargo/bin/" .. target_name
+            local local_bin = (os.getenv("HOME") or "") .. "/.local/bin/" .. target_name
+            local target_bin = ctx.exists(cargo_bin) and cargo_bin or (ctx.exists(local_bin) and local_bin or nil)
+            if target_bin then
+                local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+                ctx.log(string.format("[Grime Pkg] Запуск утилиты Cargo [%s]: %s%s...", target_bin, target_name, args_str))
+                local proc = { target_bin }
+                for _, a in ipairs(run_args) do
+                    table.insert(proc, a)
+                end
+                local ret = ctx.run_process(proc)
+                if ret ~= 0 then
+                    ctx.fail(string.format("Утилита '%s' завершилась с ошибкой (код %d)", target_name, ret))
+                end
+                return
+            else
+                ctx.fail(string.format("Утилита Cargo '%s' не найдена в ~/.cargo/bin или ~/.local/bin", target_name))
+                return
+            end
+        elseif manager == "distrobox" or manager == "box" then
+            local target_box = get_distrobox_target()
+            if not target_box then
+                ctx.fail("Активный контейнер Distrobox не найден")
+                return
+            end
+            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+            ctx.log(string.format("[Grime Pkg] Запуск утилиты в Distrobox [%s]: %s%s...", target_box, target_name, args_str))
+            local proc = { "distrobox", "enter", target_box, "--", target_name }
+            for _, a in ipairs(run_args) do
+                table.insert(proc, a)
+            end
+            local ret = ctx.run_process(proc)
+            if ret ~= 0 then
+                ctx.fail(string.format("Выполнение утилиты '%s' в Distrobox завершилось с ошибкой (код %d)", target_name, ret))
+            end
+            return
+        else
+            ctx.fail("Неизвестный менеджер для запуска: " .. tostring(manager))
+            return
+        end
+    end
+
+    -- Менеджер НЕ указан (сквозной мультипакетный поиск по приоритету)
+    -- 1. Локальные Grime Apps
+    local apps_root = get_apps_root()
+    local app_dir = apps_root .. "/" .. target_name
+    if ctx.exists(app_dir) and ctx.is_dir(app_dir) then
+        local ok, err = run_grime_app(target_name, run_args)
+        if not ok then
+            ctx.fail(err)
         end
         return
     end
 
-    local pkg = target_name
-    local cmd = { "nix-shell", "-p", pkg, "--run" }
-    local inner_tokens = {}
-    for i = 2, #packages do
-        table.insert(inner_tokens, packages[i])
+    -- 2. Системный PATH / Pacman (Хост)
+    local host_bin = find_host_binary(target_name)
+    if host_bin then
+        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+        ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target_name, args_str))
+        local proc = { target_name }
+        for _, a in ipairs(run_args) do
+            table.insert(proc, a)
+        end
+        local ret = ctx.run_process(proc)
+        if ret ~= 0 then
+            ctx.fail(string.format("Системная утилита '%s' завершилась с кодом ошибки %d", target_name, ret))
+        end
+        return
     end
-    for _, ct in ipairs(command_tokens or {}) do
-        table.insert(inner_tokens, ct)
-    end
-    local inner = (#inner_tokens > 0) and table.concat(inner_tokens, " ") or pkg
-    table.insert(cmd, inner)
 
-    ctx.log(string.format("Изолированный запуск [%s]: %s...", pkg, inner))
-    local ret = ctx.run_process(cmd)
-    if ret ~= 0 then
-        ctx.fail("Выполнение завершилось ошибкой")
+    -- 3. Flatpak
+    local flatpak_id, flatpak_name = find_flatpak_app(target_name)
+    if flatpak_id then
+        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+        ctx.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", flatpak_id, flatpak_id, args_str))
+        local proc = { "flatpak", "run", flatpak_id }
+        for _, a in ipairs(run_args) do
+            table.insert(proc, a)
+        end
+        local ret = ctx.run_process(proc)
+        if ret ~= 0 then
+            ctx.fail(string.format("Flatpak-приложение '%s' завершилось с кодом ошибки %d", flatpak_id, ret))
+        end
+        return
     end
+
+    -- 4. Nix Profile
+    local nix_bin = find_nix_profile_binary(target_name)
+    if nix_bin then
+        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+        ctx.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s]: %s%s...", nix_bin, target_name, args_str))
+        local proc = { nix_bin }
+        for _, a in ipairs(run_args) do
+            table.insert(proc, a)
+        end
+        local ret = ctx.run_process(proc)
+        if ret ~= 0 then
+            ctx.fail(string.format("Утилита Nix '%s' завершилась с кодом ошибки %d", target_name, ret))
+        end
+        return
+    end
+
+    -- 5. Cargo / Pipx
+    local user_bin, bin_type = find_cargo_or_pipx_binary(target_name)
+    if user_bin then
+        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+        ctx.log(string.format("[Grime Pkg] Запуск утилиты [%s]: %s%s...", bin_type, user_bin, args_str))
+        local proc = { user_bin }
+        for _, a in ipairs(run_args) do
+            table.insert(proc, a)
+        end
+        local ret = ctx.run_process(proc)
+        if ret ~= 0 then
+            ctx.fail(string.format("Утилита '%s' завершилась с кодом ошибки %d", target_name, ret))
+        end
+        return
+    end
+
+    -- 6. Fallback в изолированный Nix (только если нигде в системе не найдено)
+    ctx.log(string.format("[Grime Pkg] Утилита '%s' не найдена среди установленных пакетов. Запуск в изолированном Nix-окружении...", target_name))
+    run_nix_shell(target_name, run_args)
 end
 
--- 6. Справка
+-- ============================================================================
+-- 6. Обработчик Command-Not-Found (Умный перехват отсутствующих команд)
+-- ============================================================================
+
+local function get_all_host_executables()
+    local cmds = {}
+    local seen = {}
+    local path_env = os.getenv("PATH") or ""
+    for dir in path_env:gmatch("[^:]+") do
+        if dir ~= "" and ctx.is_dir(dir) then
+            local entries = grime.fs and grime.fs.list and grime.fs.list(dir)
+            if entries then
+                for _, name in ipairs(entries) do
+                    if not seen[name] then
+                        seen[name] = true
+                        table.insert(cmds, name)
+                    end
+                end
+            end
+        end
+    end
+    -- Добавим имена установленных Flatpak
+    local flatpaks = get_flatpak_packages(false)
+    if flatpaks then
+        for _, fp in ipairs(flatpaks) do
+            if fp.name and not seen[fp.name] then
+                seen[fp.name] = true
+                table.insert(cmds, fp.name)
+            end
+        end
+    end
+    return cmds
+end
+
+local function handle_not_found(args, run_ctx)
+    local context = run_ctx or ctx
+    if not args or #args == 0 then
+        io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
+        os.exit(127)
+    end
+
+    local cmd = args[1]
+    local cmd_args = {}
+    for i = 2, #args do
+        table.insert(cmd_args, args[i])
+    end
+
+    -- 1. Первым делом проверить локальные менеджеры: Flatpak, Grime Apps, Nix Profile, Cargo.
+    -- Если утилита уже есть на компьютере -> запустить немедленно без вопросов!
+
+    -- 1.1 Flatpak
+    local flatpak_id, _ = find_flatpak_app(cmd)
+    if flatpak_id then
+        local proc = { "flatpak", "run", flatpak_id }
+        for _, a in ipairs(cmd_args) do
+            table.insert(proc, a)
+        end
+        local code = context.run_interactive(proc)
+        os.exit(code)
+    end
+
+    -- 1.2 Grime Apps (~/.config/grime/apps/<cmd>)
+    local apps_root = get_apps_root()
+    local app_dir = apps_root .. "/" .. cmd
+    if context.exists(app_dir) and context.is_dir(app_dir) then
+        local ok, err = run_grime_app(cmd, cmd_args)
+        if not ok and err then
+            io.stderr:write(string.format("[Grime] Ошибка запуска Grime App '%s': %s\n", cmd, err))
+            os.exit(1)
+        end
+        os.exit(0)
+    end
+
+    -- 1.3 Nix Profile (~/.nix-profile/bin/<cmd>)
+    local nix_bin = find_nix_profile_binary(cmd)
+    if nix_bin then
+        local proc = { nix_bin }
+        for _, a in ipairs(cmd_args) do
+            table.insert(proc, a)
+        end
+        local code = context.run_interactive(proc)
+        os.exit(code)
+    end
+
+    -- 1.4 Cargo (~/.cargo/bin/<cmd>)
+    local cargo_bin = (os.getenv("HOME") or "") .. "/.cargo/bin/" .. cmd
+    if context.exists(cargo_bin) then
+        local proc = { cargo_bin }
+        for _, a in ipairs(cmd_args) do
+            table.insert(proc, a)
+        end
+        local code = context.run_interactive(proc)
+        os.exit(code)
+    end
+
+    -- 2. Если утилиты нет локально:
+    -- Проверить наличие утилиты в репозитории Nixpkgs (через маппинг coreutils, findutils, procps или быструю проверку)
+    local nix_pkg = NIX_PACKAGE_MAPPINGS[cmd]
+    if not nix_pkg and has_binary("nix-instantiate") then
+        local check_expr = string.format('builtins.hasAttr "%s" (import <nixpkgs> {})', cmd)
+        local check_res = context.capture({ "nix-instantiate", "--eval", "-E", check_expr })
+        if check_res.code == 0 and check_res.stdout and check_res.stdout:match("true") then
+            nix_pkg = cmd
+        end
+    end
+
+    if nix_pkg then
+        -- Найдено в Nixpkgs -> запросить интерактивное подтверждение у пользователя
+        io.stdout:write(string.format("[Grime] Команда '%s' не найдена на хосте.\nНайдена в репозитории Nixpkgs. Запустить в изолированном окружении? [Y/n]: ", cmd))
+        io.stdout:flush()
+
+        local ans = io.read()
+        if ans == nil then
+            io.stdout:write("\n[Grime] Запуск отменён.\n")
+            os.exit(127)
+        end
+
+        local trimmed = ans:match("^%s*(.-)%s*$"):lower()
+        if trimmed == "" or trimmed == "y" or trimmed == "yes" or trimmed == "да" or trimmed == "д" then
+            local inner_parts = { cmd }
+            for _, a in ipairs(cmd_args) do
+                table.insert(inner_parts, "'" .. tostring(a):gsub("'", "'\\''") .. "'")
+            end
+            local inner_cmd = table.concat(inner_parts, " ")
+            local proc = { "nix-shell", "-p", nix_pkg, "--run", inner_cmd }
+            local code = context.run_interactive(proc)
+            os.exit(code)
+        else
+            io.stdout:write("[Grime] Запуск отменён.\n")
+            os.exit(127)
+        end
+    end
+
+    -- 3. Если утилита не найдена ни на хосте, ни в Nixpkgs:
+    -- Задействовать модуль нечёткого поиска grime.fuzzy по списку установленных в системе утилит/команд (из $PATH или Flatpak)
+    local candidates = get_all_host_executables()
+    local best_match = nil
+    if grime.fuzzy and grime.fuzzy.find_best_match then
+        local matched = grime.fuzzy.find_best_match(cmd, candidates, 0.65)
+        if matched and matched ~= "" then
+            best_match = matched
+        end
+    end
+    if not best_match and grime.fuzzy and grime.fuzzy.match_best then
+        best_match = grime.fuzzy.match_best(cmd, candidates)
+    end
+
+    io.stdout:write(string.format("[Grime] Команда '%s' не найдена.\n", cmd))
+    if best_match and best_match ~= "" and best_match ~= cmd then
+        io.stdout:write(string.format("💡 Возможно, вы имели в виду: %s?\n", best_match))
+    end
+    os.exit(127)
+end
+
+-- 7. Справка
 local function print_help()
     print(string.format([[
 %s%sGrime Pkg%s — Унифицированное управление пакетами хоста, контейнеров и окружений
@@ -858,7 +1374,10 @@ local function print_help()
     grime pkg <пакет> [-a]                  # Сквозной нечеткий поиск пакета (по умолчанию: пользовательские; -a: все)
     grime pkg search <запрос> [-a]          # Явный сквозной нечеткий поиск
     grime pkg install <менеджер> <пакеты...># Установка пакетов через выбранный менеджер
-    grime pkg run <пакет_или_приложение>    # Изолированный запуск приложения или пакета
+    grime pkg run <утилита> [аргументы...]  # Сквозной мультипакетный запуск утилиты или приложения
+    grime pkg run <менеджер> <утилита>      # Явный запуск утилиты через конкретный менеджер
+    grime pkg run --help                    # Справка по правилам запуска
+    grime pkg not-found <команда> [args]    # Умный обработчик command-not-found (системный шелл)
     grime pkg help, -h, --help              # Показать эту справку
 
 %sФЛАГИ:%s
@@ -868,7 +1387,7 @@ local function print_help()
                                             # (по умолчанию отображаются только установленные и активные)
 
 %sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ (и их нечеткие алиасы):%s
-    • pacman    (pac, arch)                 # Pacman: pacman -Qe (по умолчанию) vs pacman -Q (-a)
+    • host      (pacman, arch, sys)         # Хост / Системный PATH (/usr/bin, pacman)
     • flatpak   (flat, flt, fp)             # Flatpak: только приложения (по умолчанию) vs с runtime (-a)
     • nix       (nixpkgs, nx)               # Nix: nix profile (по умолчанию) vs все замыкания (-a)
     • distrobox (box, dbox, dist, distro)   # Distrobox: dnf userinstalled (по умолчанию) vs rpm -qa (-a)
@@ -878,19 +1397,14 @@ local function print_help()
 
 %sПРИМЕРЫ:%s
     grime pkg                               # Сводная таблица активных менеджеров
-    grime pkg -v                            # Сводная таблица всех поддерживаемых менеджеров (включая не установленные)
-    grime pkg -a                            # Сводная таблица ВСЕХ пакетов хоста и контейнеров
-    grime pkg -a -v                         # Все менеджеры со всеми пакетами и зависимостями
     grime pkg pacman                        # Список пакетов, явно установленных в pacman
-    grime pkg pacman -a                     # Список всех пакетов pacman (включая зависимости)
-    grime pkg box                           # Пользовательские пакеты в Distrobox (dnf userinstalled)
-    grime pkg box -a                        # Все RPM-пакеты контейнера Distrobox (rpm -qa)
     grime pkg flat                          # Установленные Flatpak-приложения
-    grime pkg flat -a                       # Все Flatpak пакеты (приложения + runtime + платформы)
-    grime pkg git                           # Сквозной поиск 'git' среди пользовательских пакетов
-    grime pkg git -a                        # Сквозной поиск 'git' по всем пакетам и зависимостям
-    grime pkg install pac ripgrep           # Установка ripgrep через pacman
-    grime pkg run htop                      # Изолированный запуск через nix-shell
+    grime pkg run du -h                     # Системный du на хосте
+    grime pkg run btop                      # Системный btop на хосте
+    grime pkg run obsidian                  # Запуск Flatpak-приложения Obsidian
+    grime pkg run host htop                 # Явный запуск утилиты на хосте
+    grime pkg run box btop                  # Запуск утилиты внутри контейнера Distrobox
+    grime pkg run nix glow                  # Запуск утилиты из Nix-профиля / nix-shell
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -901,10 +1415,70 @@ local function print_help()
 end
 
 function main()
-    for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" then
+    local raw_args = ctx.args or {}
+
+    -- Проверка явного вызова общей справки: grime pkg help, grime pkg -h, grime pkg --help
+    if #raw_args > 0 then
+        local first = raw_args[1]
+        if first == "help" or first == "-h" or first == "--help" then
             print_help()
+            return
+        end
+    end
+
+    -- Специальная изолированная обработка действия 'not-found' / 'cnf'
+    if #raw_args > 0 then
+        local first_action = ACTIONS[raw_args[1]:lower()]
+        if first_action == "not_found" then
+            local not_found_args = {}
+            for i = 2, #raw_args do
+                table.insert(not_found_args, raw_args[i])
+            end
+            handle_not_found(not_found_args, ctx)
+            return
+        end
+    end
+
+    -- Специальная изолированная обработка действия 'run'
+    -- (гарантирует, что флаги утилиты вроде -h, -a, -v не перехватываются как флаги Grime Pkg)
+    if #raw_args > 0 then
+        local first_action = ACTIONS[raw_args[1]:lower()]
+        if first_action == "run" then
+            if #raw_args == 1 then
+                handle_run(nil, {}, {})
+                return
+            end
+
+            local second = raw_args[2]
+            if second == "--help" or second == "-h" or second == "help" then
+                print_run_help()
+                return
+            end
+
+            -- Разделение на токены до '--' и после '--'
+            local run_tokens = {}
+            local cmd_tokens = {}
+            local after_dash = false
+            for i = 2, #raw_args do
+                local tok = raw_args[i]
+                if not after_dash and tok == "--" then
+                    after_dash = true
+                elseif after_dash then
+                    table.insert(cmd_tokens, tok)
+                else
+                    table.insert(run_tokens, tok)
+                end
+            end
+
+            -- Проверяем, является ли первый токен именем менеджера
+            local mgr = nil
+            local resolved = resolve_manager(run_tokens[1])
+            if resolved and #run_tokens > 1 then
+                mgr = resolved
+                table.remove(run_tokens, 1)
+            end
+
+            handle_run(mgr, run_tokens, cmd_tokens)
             return
         end
     end
@@ -918,7 +1492,7 @@ function main()
         },
     })
 
-    local parsed = cls:parse(ctx.args)
+    local parsed = cls:parse(raw_args)
     local action = parsed.action or "list"
 
     if action == "help" then
@@ -980,7 +1554,6 @@ function main()
 
     -- Обработка действия list / вызова без аргументов / вызова по имени менеджера или поиску пакета
     if #raw_tokens == 0 then
-        -- Вызов grime pkg или grime pkg -a / grime pkg list без аргументов -> сводная таблица
         local shown_mgrs = handle_summary(all_mode, show_all_managers)
         if ctx.has_next_step then
             ctx.module_return(table.concat(shown_mgrs, "\n"))
@@ -993,11 +1566,14 @@ function main()
     local resolved_mgr = resolve_manager(first_tok)
 
     if resolved_mgr then
-        -- Первый аргумент — менеджер пакетов (например: grime pkg pacman, grime pkg box, grime pkg flat)
         table.remove(raw_tokens, 1)
+        if #raw_tokens > 0 and ACTIONS[raw_tokens[1]:lower()] == "run" then
+            table.remove(raw_tokens, 1)
+            handle_run(resolved_mgr, raw_tokens, parsed.command_tokens)
+            return
+        end
         handle_detailed_list(resolved_mgr, raw_tokens, all_mode)
     else
-        -- Первый аргумент не совпал с менеджером — выполняем сквозной нечеткий поиск пакета
         handle_search(raw_tokens, all_mode)
     end
 end

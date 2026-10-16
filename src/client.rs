@@ -7,7 +7,36 @@ use crate::daemon::{get_socket_path, ClientMessage, DaemonResponse};
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::parse_pipeline_args;
 
-fn print_global_help() {
+fn print_global_help(config: &crate::config::GrimeConfig) {
+    let modules = crate::pipeline::discover_available_modules(config);
+    let mut mod_lines = String::new();
+    if modules.is_empty() {
+        mod_lines.push_str("          (модули не обнаружены в директориях поиска)\n");
+    } else {
+        for m in &modules {
+            let desc = match m.as_str() {
+                "project" => "Жизненный цикл проектов (C++, Rust, Python, Java)",
+                "pkg" => "Универсальный мета-менеджер пакетов (pacman, nix, flatpak...)",
+                "app" => "Изолированные легковесные приложения",
+                "box" => "Оркестрация Distrobox-контейнеров",
+                "nix" => "Воспроизводимые Nix-окружения и Flakes",
+                "aider" => "AI-ассистент разработчика",
+                "cmd" => "Выполнение системных команд и TUI-утилит",
+                "host" => "Модуль-рубеж возврата на хост-машину",
+                "list" => "Список всех доступных модулей (алиасы: ls, modules)",
+                "doctor" => "Диагностика окружения, путей и зависимостей Grime",
+                "bus" => "Шина разделяемого состояния (StateBus) и событий",
+                "daemon" => "Управление фоновым сервисом-демоном (grimed)",
+                "git" => "Полноценное управление Git-репозиториями и версионированием",
+                "log" => "Централизованный сбор, хранение и фильтрация логов",
+                "benchmark" => "Стресс-тестирование, бенчмаркинг конвейеров и замеры задержек",
+                "polyglot" => "Полиглотный межъязыковой клей и бенчмарк IPC (Python <-> Grime <-> C)",
+                _ => "Модуль расширения Grime",
+            };
+            mod_lines.push_str(&format!("          \x1b[32m{:<20}\x1b[0m {}\n", m, desc));
+        }
+    }
+
     println!(
         "\x1b[1mGrime Next Generation (Grime-RS)\x1b[0m 🦀🌙\n\
         Модульный оркестратор конвейеров, контейнеров и окружений разработчика.\n\n\
@@ -23,25 +52,16 @@ fn print_global_help() {
           -p, --path <путь>    Задать базовую рабочую директорию конвейера\n  \
           -h, --help           Показать эту справку\n  \
           -v, --version        Показать версию программы\n\n\
-        \x1b[1mДоступные модули:\x1b[0m\n  \
-          \x1b[32mproject\x1b[0m              Жизненный цикл проектов (C++, Rust, Python, Java)\n  \
-          \x1b[32mpkg\x1b[0m                  Универсальный мета-менеджер пакетов (pacman, nix, flatpak...)\n  \
-          \x1b[32mapp\x1b[0m                  Изолированные легковесные приложения\n  \
-          \x1b[32mbox\x1b[0m                  Оркестрация Distrobox-контейнеров\n  \
-          \x1b[32mnix\x1b[0m                  Воспроизводимые Nix-окружения и Flakes\n  \
-          \x1b[32maider\x1b[0m                AI-ассистент разработчика\n  \
-          \x1b[32mcmd\x1b[0m                  Выполнение системных команд и TUI-утилит\n  \
-          \x1b[32mhost\x1b[0m                 Модуль-рубеж возврата на хост-машину\n  \
-          \x1b[32mlist\x1b[0m                 Список всех доступных модулей (алиасы: ls, modules)\n  \
-          \x1b[32mdoctor\x1b[0m               Диагностика окружения, путей и зависимостей Grime\n  \
-          \x1b[32mbus\x1b[0m                  Шина разделяемого состояния (StateBus) и событий\n  \
-          \x1b[32mdaemon\x1b[0m               Управление фоновым сервисом-демоном (grimed)\n\n\
-        \x1b[90mДля справки по конкретному модулю: grime <модуль> --help\x1b[0m"
+        \x1b[1mДоступные модули:\x1b[0m\n\
+        {}\n\n\
+        \x1b[90mДля справки по конкретному модулю: grime <модуль> --help\x1b[0m",
+        mod_lines.trim_end()
     );
 }
 
 pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, config_path: Option<&Path>) -> i32 {
     let parsed = parse_pipeline_args(raw_args);
+    let config = crate::config::GrimeConfig::load_or_default(config_path);
 
     let normalized = crate::args::normalize_cli_flags(raw_args, crate::args::GLOBAL_GRIME_FLAGS);
 
@@ -51,12 +71,12 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
     }
 
     if normalized.iter().any(|a| a == "--help" || a == "-h") && parsed.steps.is_empty() {
-        print_global_help();
+        print_global_help(&config);
         return 0;
     }
 
     if parsed.steps.is_empty() {
-        print_global_help();
+        print_global_help(&config);
         return 0;
     }
 

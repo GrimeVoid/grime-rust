@@ -10,7 +10,6 @@ pub use lua as lua_engine;
 pub mod orchestrator;
 pub mod payload;
 pub mod pipeline;
-pub mod preflight;
 pub mod process;
 pub mod state_bus;
 pub mod supervisor;

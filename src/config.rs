@@ -58,6 +58,12 @@ impl GrimeConfig {
             crate::fs_ops::normalize_path(&cfg_dir).to_string_lossy().to_string(),
         );
 
+        let modules_dir = home.join(".config").join("grime").join("modules");
+        map.insert(
+            "modules".to_string(),
+            crate::fs_ops::normalize_path(&modules_dir).to_string_lossy().to_string(),
+        );
+
         let projects_dir = home.join("Projects");
         map.insert(
             "projects".to_string(),
@@ -168,6 +174,7 @@ impl GrimeConfig {
     fn generate_default(&mut self, path: &Path) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let default_config = crate::fs_ops::normalize_path(&home.join(".config").join("grime"));
+        let default_modules = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("modules"));
         let default_projects = crate::fs_ops::normalize_path(&home.join("Projects"));
         let default_templates = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("templates"));
         let default_apps = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("apps"));
@@ -175,12 +182,12 @@ impl GrimeConfig {
         let default_content = format!(
             "# Конфигурация путей GrimeProject\n\
              config={}\n\
+             modules={}\n\
              projects={}\n\
              templates={}\n\
-             apps={}\n\
-             aider=auto\n\
-             distrobox_default=fedora-box\n",
+             apps={}\n",
             default_config.display(),
+            default_modules.display(),
             default_projects.display(),
             default_templates.display(),
             default_apps.display()
@@ -227,6 +234,14 @@ impl GrimeConfig {
             })
     }
 
+    pub fn modules_dir(&self) -> PathBuf {
+        self.get_path("modules")
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("modules"))
+            })
+    }
+
     pub fn projects_root(&self) -> PathBuf {
         self.get_path("projects")
             .unwrap_or_else(|| {
@@ -260,6 +275,7 @@ mod tests {
     fn test_default_paths_exist() {
         let defaults = GrimeConfig::default_paths();
         assert!(defaults.contains_key("config"));
+        assert!(defaults.contains_key("modules"));
         assert!(defaults.contains_key("projects"));
         assert!(defaults.contains_key("templates"));
         assert!(defaults.contains_key("apps"));
@@ -282,9 +298,10 @@ mod tests {
         assert_eq!(config.get("projects", None), "/custom/projects");
         // my_custom_cache должен сохраниться
         assert_eq!(config.get("my_custom_cache", None), "/var/cache/my_app");
-        // templates, apps, config должны дополниться дефолтами
+        // templates, apps, config, modules должны дополниться дефолтами
         assert!(!config.get("templates", None).is_empty());
         assert!(!config.get("apps", None).is_empty());
         assert!(!config.get("config", None).is_empty());
+        assert!(!config.get("modules", None).is_empty());
     }
 }

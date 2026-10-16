@@ -8,7 +8,6 @@ use crate::event_bus::EventBus;
 use crate::lua_engine::GrimeLuaEngine;
 use crate::payload::PipelinePayload;
 use crate::pipeline::{canonical_module_name, ParsedPipeline};
-use crate::preflight::PreflightInspector;
 use crate::state_bus::StateBus;
 
 pub struct Orchestrator {
@@ -17,7 +16,6 @@ pub struct Orchestrator {
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
     canceller: PipelineCanceller,
-    preflight: PreflightInspector,
 }
 
 impl Orchestrator {
@@ -25,7 +23,6 @@ impl Orchestrator {
         let state_bus = Arc::new(StateBus::new());
         let event_bus = Arc::new(EventBus::default());
         let canceller = PipelineCanceller::new();
-        let preflight = PreflightInspector::new();
 
         let engine = GrimeLuaEngine::new_with_bus(
             modules_dir,
@@ -42,7 +39,6 @@ impl Orchestrator {
             state_bus,
             event_bus,
             canceller,
-            preflight,
         })
     }
 
@@ -74,9 +70,6 @@ impl Orchestrator {
 
         // 2. Сброс состояния прерывания
         self.canceller.reset();
-
-        // 3. Упреждающая инициализация и валидация шагов (Pre-flight Inspection)
-        self.preflight.inspect_and_warmup(parsed, &self.config);
 
         let raw_work_path = parsed
             .work_path

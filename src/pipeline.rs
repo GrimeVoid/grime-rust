@@ -22,13 +22,20 @@ const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
 const SEPARATORS: &[&str] = &["--", ":", "->", "|"];
 
 /// Динамическое сканирование директорий модулей Grime на диске
-pub fn discover_available_modules() -> Vec<String> {
+pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<String> {
     let mut modules = Vec::new();
     let mut search_dirs = Vec::new();
     search_dirs.push(PathBuf::from("modules"));
+    search_dirs.push(config.modules_dir());
     if let Some(home) = crate::fs_ops::get_cached_home_dir() {
         search_dirs.push(home.join(".config").join("grime").join("modules"));
         search_dirs.push(home.join("dotfiles").join("grime").join("modules"));
+    }
+    if let Ok(exe_p) = std::env::current_exe() {
+        if let Some(parent) = exe_p.parent() {
+            search_dirs.push(parent.join("../share/grime/modules"));
+            search_dirs.push(parent.join("modules"));
+        }
     }
 
     for dir in search_dirs {
@@ -46,6 +53,7 @@ pub fn discover_available_modules() -> Vec<String> {
             }
         }
     }
+    modules.sort();
     modules
 }
 
@@ -59,7 +67,8 @@ pub fn canonical_module_name(name: &str) -> String {
         _ => lower,
     };
 
-    let available = discover_available_modules();
+    let config = crate::config::GrimeConfig::load_or_default(None);
+    let available = discover_available_modules(&config);
     let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
 
     if available_refs.contains(&alias_resolved.as_str()) {

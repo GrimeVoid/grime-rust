@@ -89,12 +89,20 @@ pub fn detach_lua_cancellation_hook(lua: &Lua) {
     lua.remove_hook();
 }
 
-/// Асинхронный слушатель сигнала Ctrl+C для установки флага отмены.
+/// Асинхронный двухэтапный слушатель сигнала Ctrl+C:
+/// 1. При первом сигнале — мягкая отмена активных шагов конвейера.
+/// 2. При повторном сигнале — немедленное принудительное завершение (код 130).
 pub fn spawn_ctrl_c_watcher(canceller: PipelineCanceller) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\n[Grime] Получен сигнал прерывания (Ctrl+C). Остановка конвейера...");
-            canceller.cancel("Прерывание пользователем по сигналу SIGINT / Ctrl+C");
+            eprintln!("\n[Grime] Получен сигнал прерывания. Завершение активных шагов (нажмите Ctrl+C повторно для принудительного выхода)...");
+            canceller.cancel("Прервано пользователем (Ctrl+C)");
+
+            // Ожидание повторного нажатия Ctrl+C для немедленного принудительного завершения
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("\n[Grime] Повторный сигнал Ctrl+C. Принудительное завершение процесса...");
+                std::process::exit(130);
+            }
         }
     })
 }

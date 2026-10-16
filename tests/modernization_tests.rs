@@ -732,6 +732,114 @@ async fn test_module_returning_table_with_functions_not_leaked_as_json() {
     );
 }
 
+#[tokio::test]
+async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
+    let temp = TestTempDir::new("grime_stage3_test");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    let accidental = temp.path().join("accidental_dir");
+    fs::create_dir_all(&accidental).unwrap();
+
+    // Модуль 1
+    fs::write(
+        mod_dir.join("step_one.lua"),
+        r#"
+        function main()
+            grime.ctx.success("first_step_done")
+        end
+        "#,
+    )
+    .unwrap();
+
+    // Модуль 2: возвращает путь к accidental, но НЕ меняет target_dir явно.
+    // Так как это шаг 2 (step_idx == 1), target_dir НЕ должен случайно перезаписываться!
+    fs::write(
+        mod_dir.join("step_two.lua"),
+        format!(
+            r#"
+            function main()
+                grime.ctx.success("{path}")
+            end
+            "#,
+            path = accidental.to_string_lossy().escape_default()
+        ),
+    )
+    .unwrap();
+
+    // Модуль 3: проверяем, что target_dir остался прежним
+    fs::write(
+        mod_dir.join("step_three.lua"),
+        format!(
+            r#"
+            function main()
+                local target = grime.ctx.target_dir
+                local acc = "{path}"
+                assert(target ~= acc, "target_dir was erroneously changed to output string: " .. tostring(target))
+                grime.ctx.success("stage3_ok")
+            end
+            "#,
+            path = accidental.to_string_lossy().escape_default()
+        ),
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir.clone()), None).unwrap();
+    let parsed = parse_pipeline_args(&[
+        "-p".to_string(),
+        temp.path().to_string_lossy().to_string(),
+        "step_one".to_string(),
+        ":".to_string(),
+        "step_two".to_string(),
+        ":".to_string(),
+        "step_three".to_string(),
+    ]);
+
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_ok(), "Пайплайн stage3 упал: {:?}", res);
+    assert_eq!(res.unwrap().unwrap(), "stage3_ok");
+
+    // Тест явного set_target_dir
+    fs::write(
+        mod_dir.join("step_explicit_dir.lua"),
+        format!(
+            r#"
+            function main()
+                grime.ctx.set_target_dir("{path}")
+                grime.ctx.success("explicit_done")
+            end
+            "#,
+            path = accidental.to_string_lossy().escape_default()
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        mod_dir.join("step_check_explicit.lua"),
+        format!(
+            r#"
+            function main()
+                local target = grime.ctx.target_dir
+                local acc = "{path}"
+                assert(target == acc, "target_dir did not match explicit change: " .. tostring(target))
+                grime.ctx.success("explicit_verified")
+            end
+            "#,
+            path = grime::fs_ops::normalize_path(&accidental).to_string_lossy().escape_default()
+        ),
+    )
+    .unwrap();
+
+    let parsed_explicit = parse_pipeline_args(&[
+        "step_explicit_dir".to_string(),
+        ":".to_string(),
+        "step_check_explicit".to_string(),
+    ]);
+    let res_explicit = orch.run_pipeline(&parsed_explicit).await;
+    assert!(res_explicit.is_ok(), "Пайплайн с явным set_target_dir упал: {:?}", res_explicit);
+    assert_eq!(res_explicit.unwrap().unwrap(), "explicit_verified");
+}
+
 
 
 

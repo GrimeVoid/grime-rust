@@ -58,6 +58,16 @@ impl Orchestrator {
         &self.config
     }
 
+    pub fn set_environment(&self, env: &std::collections::HashMap<String, String>) -> Result<(), mlua::Error> {
+        self.engine.set_environment(env)
+    }
+
+    fn run_cleanup(engine: &GrimeLuaEngine, executed_modules: &[String]) {
+        for m in executed_modules.iter().rev() {
+            engine.call_cleanup(m);
+        }
+    }
+
     pub async fn run_pipeline(&self, parsed: &ParsedPipeline) -> Result<Option<String>, String> {
         let steps = &parsed.steps;
         if steps.is_empty() {
@@ -102,9 +112,7 @@ impl Orchestrator {
                     .unwrap_or_else(|| "Конвейер прерван пользователем".to_string());
                 eprintln!("{} {}", "[Grime Cancelled]".yellow().bold(), reason);
 
-                for m in &executed_modules {
-                    self.engine.call_cleanup(m);
-                }
+                Self::run_cleanup(&self.engine, &executed_modules);
 
                 self.engine.emit_event(
                     "pipeline.failed",
@@ -119,27 +127,6 @@ impl Orchestrator {
             let step = &steps[step_idx];
             let mod_name = canonical_module_name(&step.module);
 
-            // Выполнение шага Lua модуля: авто-определение рабочей директории из выхода прошлого шага
-            if let Some(ref data) = pipeline_data {
-                let trimmed = data.trim();
-                if !trimmed.is_empty()
-                    && trimmed.len() < 4096
-                    && !trimmed.contains('\n')
-                    && !trimmed.starts_with('{')
-                    && !trimmed.starts_with('[')
-                {
-                    let candidate = PathBuf::from(trimmed);
-                    if candidate.exists() {
-                        let dir = if candidate.is_file() {
-                            candidate.parent().unwrap_or(&candidate).to_path_buf()
-                        } else {
-                            candidate
-                        };
-                        current_target_dir = crate::fs_ops::normalize_path(&dir);
-                    }
-                }
-            }
-
             // Установка контекста шага с передачей PipelinePayload (Zero-Copy bytes::Bytes) и флага force
             if let Err(e) = self.engine.set_step_context(
                 step,
@@ -150,9 +137,7 @@ impl Orchestrator {
                 pipeline_payload.as_ref(),
                 parsed.force,
             ) {
-                for m in &executed_modules {
-                    self.engine.call_cleanup(m);
-                }
+                Self::run_cleanup(&self.engine, &executed_modules);
                 return Err(format!("Ошибка установки контекста для '{}': {}", mod_name, e));
             }
 
@@ -171,9 +156,7 @@ impl Orchestrator {
             let result = match self.engine.execute_module(&mod_name) {
                 Ok(res) => res,
                 Err(e) => {
-                    for m in &executed_modules {
-                        self.engine.call_cleanup(m);
-                    }
+                    Self::run_cleanup(&self.engine, &executed_modules);
                     self.engine.emit_event(
                         "pipeline.failed",
                         serde_json::json!({
@@ -191,10 +174,8 @@ impl Orchestrator {
                     .unwrap_or_else(|| format!("Модуль '{}' завершился со статусом ошибки", mod_name));
                 eprintln!("{} {}", "[Grime Error]".red().bold(), err_msg);
 
-                // Вызов функции cleanup() у задействованных модулей
-                for m in &executed_modules {
-                    self.engine.call_cleanup(m);
-                }
+                // Вызов функции cleanup() у задействованных модулей в порядке LIFO
+                Self::run_cleanup(&self.engine, &executed_modules);
 
                 self.engine.emit_event(
                     "pipeline.failed",
@@ -206,6 +187,32 @@ impl Orchestrator {
 
                 if !parsed.force {
                     return Err(err_msg);
+                }
+            }
+
+            // Смена рабочей директории: ТОЛЬКО если шаг явно запросил это через ctx.set_target_dir()
+            // или если это первый шаг конвейера (step_idx == 0), вернувший существующий путь/директорию
+            if let Some(new_dir) = result.changed_target_dir {
+                current_target_dir = crate::fs_ops::normalize_path(&new_dir);
+            } else if step_idx == 0 {
+                if let Some(ref data) = result.return_value {
+                    let trimmed = data.trim();
+                    if !trimmed.is_empty()
+                        && trimmed.len() < 4096
+                        && !trimmed.contains('\n')
+                        && !trimmed.starts_with('{')
+                        && !trimmed.starts_with('[')
+                    {
+                        let candidate = PathBuf::from(trimmed);
+                        if candidate.exists() {
+                            let dir = if candidate.is_file() {
+                                candidate.parent().unwrap_or(&candidate).to_path_buf()
+                            } else {
+                                candidate
+                            };
+                            current_target_dir = crate::fs_ops::normalize_path(&dir);
+                        }
+                    }
                 }
             }
 

@@ -128,8 +128,21 @@ impl Drop for PipelineSessionGuard {
     }
 }
 
-/// Конвертация `mlua::Value` в `serde_json::Value`.
+pub const MAX_RECURSION_DEPTH: usize = 64;
+
+/// Конвертация `mlua::Value` в `serde_json::Value` с защитой от переполнения стека.
 pub fn lua_to_json(val: Value) -> Result<JsonValue, mlua::Error> {
+    lua_to_json_depth(val, 0, MAX_RECURSION_DEPTH)
+}
+
+/// Рекурсивная конвертация `mlua::Value` в `serde_json::Value` с ограничением максимальной глубины.
+pub fn lua_to_json_depth(val: Value, depth: usize, max_depth: usize) -> Result<JsonValue, mlua::Error> {
+    if depth > max_depth {
+        return Err(mlua::Error::runtime(
+            "Превышена максимальная глубина вложенности таблицы Lua (возможна циклическая ссылка)",
+        ));
+    }
+
     match val {
         Value::Nil => Ok(JsonValue::Null),
         Value::Boolean(b) => Ok(JsonValue::Bool(b)),
@@ -151,7 +164,7 @@ pub fn lua_to_json(val: Value) -> Result<JsonValue, mlua::Error> {
                 for i in 1..=len {
                     match tbl.raw_get::<Value>(i as i64) {
                         Ok(v) if v != Value::Nil => {
-                            arr.push(lua_to_json(v)?);
+                            arr.push(lua_to_json_depth(v, depth + 1, max_depth)?);
                         }
                         _ => {
                             is_array = false;
@@ -175,7 +188,7 @@ pub fn lua_to_json(val: Value) -> Result<JsonValue, mlua::Error> {
                     Value::Boolean(b) => b.to_string(),
                     _ => format!("{:?}", k),
                 };
-                obj.insert(key_str, lua_to_json(v)?);
+                obj.insert(key_str, lua_to_json_depth(v, depth + 1, max_depth)?);
             }
             Ok(JsonValue::Object(obj))
         }
@@ -332,5 +345,22 @@ mod tests {
         assert!(!bus.has("pipeline.test_val"));
         // modules.* должен остаться
         assert!(bus.has("modules.aider.model"));
+    }
+
+    #[test]
+    fn test_lua_to_json_recursion_limit() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        // Создаем циклическую ссылку t.self = t
+        t.set("self", t.clone()).unwrap();
+
+        let res = lua_to_json(Value::Table(t));
+        assert!(res.is_err(), "Ожидалась ошибка при циклической ссылке в таблице");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Превышена максимальная глубина вложенности таблицы Lua"),
+            "Сообщение об ошибке не содержит ожидаемый текст: {}",
+            err_msg
+        );
     }
 }

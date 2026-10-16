@@ -2,30 +2,93 @@ local ctx = grime.ctx
 
 local GRIME_CONVENTIONS = [[
 
-[GRIME AGENT CONVENTIONS]:
-1. ВЫПОЛНЕНИЕ СИСТЕМНЫХ ДЕЙСТВИЙ (ОБЯЗАТЕЛЬНО):
-При запросах на системные действия (копирование 'cp', перемещение 'mv', создание директорий 'mkdir', удаление, архивация, запуск утилит) модель ОБЯЗАНА не просто советовать команду текстом, а РЕАЛЬНО ВЫПОЛНИТЬ её в одну строку через системный тег:
-<grime_spawn module="cmd">cp -r . /home/danny/Temp</grime_spawn>
-или
-<grime_exec>cp -r . /home/danny/Temp</grime_exec>
-ВНИМАНИЕ: Команда выполняется непосредственно в текущей рабочей директории ('.'). Указывайте пути относительно текущей директории '.' или абсолютные пути внутри $HOME. Команды формируйте компактно в одну строку. Использование sudo и изменение системных файлов за пределами $HOME строго запрещены!
-
-2. Для сохранения структурированных данных или состояния в шину Grime используйте тег:
-<grime_bus key="pipeline.<key>" type="json">
-{"field": "value"}
-</grime_bus>
-(Допустимые пространства имен: 'pipeline.*', 'modules.<name>.*').
-
-3. Для порождения субагента Grime (вызова другого модуля) используйте тег:
-<grime_spawn module="<module_name>" cwd="<optional_cwd>">
-инструкция или аргументы для модуля
-</grime_spawn>
-
-4. Для передачи промпта следующему шагу конвейера:
-<next_agent_prompt>
-инструкция для следующего агента
-</next_agent_prompt>
+[GRIME CONVENTIONS]:
+1. ДЕЙСТВИЯ: Не предлагай команды текстом — выполняй их через:
+   <grime_exec>команда</grime_exec> или <grime_spawn module="cmd">команда</grime_spawn>
+   Запрещены sudo и выход за пределы $HOME.
+2. ШИНА: Сохранение данных в StateBus:
+   <grime_bus key="pipeline.<key>" type="json">{"k":"v"}</grime_bus>
+3. МОДУЛИ: Вызов субагента Grime:
+   <grime_spawn module="<mod>" cwd="<dir>">аргументы</grime_spawn>
+4. КОНВЕЙЕР: Передача промпта следующему шагу:
+   <next_agent_prompt>инструкция</next_agent_prompt>
 ]]
+
+local TERMINAL_DIAGNOSTIC_RULES = [[
+
+[ПРАВИЛА АНАЛИЗА ОШИБОК И ТЕРМИНАЛА]:
+1. ИССЛЕДОВАНИЕ ФАЙЛОВ (ОБЯЗАТЕЛЬНО): Если в выводе терминала/компилятора есть пути к файлам и номера строк, ты ОБЯЗАН изучить эти файлы и проблемные строки перед внесением правок. Запрещено гадать без проверки реального кода.
+2. ЭВРИСТИКА УСПЕХА: Если в истории терминала команда падала, но позже аналогичная команда завершилась успешно (exit code 0), считай проблему уже решенной пользователем и не пытайся её чинить повторно.
+]]
+
+--- Получение текущего дампа терминального контекста из StateBus или state.json
+local function get_terminal_dump()
+    local val = nil
+    if grime and grime.bus and grime.bus.get then
+        local ok, res = pcall(grime.bus.get, "daemon.terminal_dump")
+        if ok and res ~= nil then
+            val = res
+        end
+    end
+    if val == nil then
+        local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
+        local sfile = dir .. "/state.json"
+        if ctx.exists(sfile) then
+            local content = grime.fs.read(sfile)
+            if content and #content > 0 then
+                local ok, data = pcall(grime.json.decode, content)
+                if ok and type(data) == "table" and data["daemon.terminal_dump"] ~= nil then
+                    val = data["daemon.terminal_dump"]
+                end
+            end
+        end
+    end
+    if type(val) == "string" and (val:sub(1,1) == "{" or val:sub(1,1) == "[") then
+        local ok, parsed = pcall(grime.json.decode, val)
+        if ok and type(parsed) == "table" then
+            val = parsed
+        end
+    end
+    return val
+end
+
+--- Проверка актуальности терминального контекста по временной метке
+local function is_term_data_fresh(term_data, max_age_seconds)
+    if not term_data or type(term_data) ~= "table" then return false end
+    local ts = tonumber(term_data.timestamp)
+    if not ts then return false end
+    max_age_seconds = max_age_seconds or 300
+    return (os.time() - ts) <= max_age_seconds
+end
+
+--- Форматирование чистого блока контекста активного терминала
+local function format_terminal_context(term_data)
+    if not term_data or type(term_data) ~= "table" or not term_data.cmd then
+        return nil
+    end
+
+    local parts = {
+        "\n[КОНТЕКСТ АКТИВНОГО ТЕРМИНАЛА ПОЛЬЗОВАТЕЛЯ]:",
+        string.format("- Последняя команда: %s", term_data.cmd),
+        string.format("- Код возврата: %s%s", tostring(term_data.status or 0), (term_data.status and term_data.status ~= 0) and " [ОШИБКА]" or " [УСПЕХ]"),
+        string.format("- Рабочая директория: %s", term_data.cwd or "."),
+    }
+
+    if term_data.time_str then
+        table.insert(parts, string.format("- Время вызова: %s", term_data.time_str))
+    end
+
+    if term_data.resolved and term_data.resolved_target then
+        table.insert(parts, string.format("- СТАТУС: Предыдущая ошибка команды '%s' была УСПЕШНО УСТРАНЕНА пользователем в последующем запуске. Проблема закрыта, повторно чинить её не нужно.", term_data.resolved_target))
+    end
+
+    if term_data.output and #term_data.output > 0 then
+        table.insert(parts, "- Вывод/ошибка терминала:\n```\n" .. term_data.output .. "\n```")
+    end
+
+    table.insert(parts, TERMINAL_DIAGNOSTIC_RULES)
+    return table.concat(parts, "\n")
+end
 
 --- Проверка, является ли директория частью Git-репозитория
 local function is_git_repo(dir)
@@ -898,11 +961,26 @@ function main()
         end
     end
 
+    -- Сбор терминального контекста для прямых интерактивных вызовов (изоляция для субагентов и конвейеров)
+    local is_direct_interactive_call = (not ctx.pipeline_input) and (not ctx.has_next_step) and (os.getenv("GRIME_SUBAGENT") ~= "1")
+    local terminal_context_block = nil
+    local active_term_dump = nil
+
+    if is_direct_interactive_call then
+        active_term_dump = get_terminal_dump()
+        if active_term_dump and is_term_data_fresh(active_term_dump, 300) then
+            terminal_context_block = format_terminal_context(active_term_dump)
+        end
+    end
+
     -- Добавление системных конвенций Grime (<grime_bus>, <grime_spawn>, <next_agent_prompt>)
     if is_headless then
         for i, a in ipairs(remaining_args) do
             if a == "-m" and remaining_args[i + 1] then
                 remaining_args[i + 1] = remaining_args[i + 1] .. GRIME_CONVENTIONS
+                if terminal_context_block then
+                    remaining_args[i + 1] = remaining_args[i + 1] .. "\n" .. terminal_context_block
+                end
                 break
             end
         end
@@ -1013,7 +1091,25 @@ function main()
             ctx.fail("Aider завершился с кодом " .. tostring(res.code))
         end
     else
+        local tmp_term_file = nil
+        if terminal_context_block and active_term_dump then
+            tmp_term_file = "/tmp/grime_term_context.md"
+            local f = io.open(tmp_term_file, "w")
+            if f then
+                f:write(terminal_context_block)
+                f:close()
+                table.insert(aider_cmd, "--read")
+                table.insert(aider_cmd, tmp_term_file)
+                grime.ui.info(string.format("Подключен контекст терминала: '%s' (код %s)", active_term_dump.cmd or "", tostring(active_term_dump.status or 0)))
+            end
+        end
+
         local ret = ctx.run_process(aider_cmd, working_dir)
+
+        if tmp_term_file and ctx.exists(tmp_term_file) then
+            pcall(ctx.delete, tmp_term_file, true)
+        end
+
         if ret == 0 then
             if is_app_mode then
                 ctx.log(string.format("✓ Приложение '%s' настроено в %s", app_name, app_dir))

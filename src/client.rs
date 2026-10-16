@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::daemon::{get_socket_path, ClientMessage, DaemonResponse};
+use crate::daemon::{get_socket_path, ClientMessage, DaemonResponse, MAX_IPC_PAYLOAD_SIZE};
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::parse_pipeline_args;
 
@@ -108,6 +108,13 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
                         let mut len_buf = [0u8; 4];
                         if stream.read_exact(&mut len_buf).await.is_ok() {
                             let resp_len = u32::from_be_bytes(len_buf) as usize;
+                            if resp_len > MAX_IPC_PAYLOAD_SIZE {
+                                eprintln!(
+                                    "[Grime Security] Ошибка: размер ответа демона превышает максимально допустимый лимит ({} > {})",
+                                    resp_len, MAX_IPC_PAYLOAD_SIZE
+                                );
+                                return 1;
+                            }
                             let mut resp_buf = vec![0u8; resp_len];
                             if stream.read_exact(&mut resp_buf).await.is_ok() {
                                 if let Ok(resp) = rmp_serde::from_slice::<DaemonResponse>(&resp_buf) {

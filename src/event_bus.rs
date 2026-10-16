@@ -111,11 +111,11 @@ pub fn register_event_bus_api(lua: &Lua, event_bus: Arc<EventBus>) -> Result<(),
             // Диспетчеризируем слушателям в текущей Lua VM
             let globals = lua.globals();
             if let Ok(listeners) = globals.get::<mlua::Table>("_grime_event_listeners") {
+                let lua_arg = crate::state_bus::json_to_lua(lua, &json_payload)?;
                 let call_list = |tbl: mlua::Table| -> Result<(), mlua::Error> {
                     for cb in tbl.sequence_values::<Function>() {
                         if let Ok(func) = cb {
-                            let lua_arg = crate::state_bus::json_to_lua(lua, &json_payload)?;
-                            let _ = func.call::<()>(lua_arg);
+                            let _ = func.call::<()>(lua_arg.clone());
                         }
                     }
                     Ok(())
@@ -141,11 +141,11 @@ pub fn register_event_bus_api(lua: &Lua, event_bus: Arc<EventBus>) -> Result<(),
 pub fn dispatch_event_to_lua(lua: &Lua, event_name: &str, payload: &JsonValue) -> Result<(), mlua::Error> {
     let globals = lua.globals();
     if let Ok(listeners) = globals.get::<mlua::Table>("_grime_event_listeners") {
+        let lua_arg = crate::state_bus::json_to_lua(lua, payload)?;
         let call_list = |tbl: mlua::Table| -> Result<(), mlua::Error> {
             for cb in tbl.sequence_values::<Function>() {
                 if let Ok(func) = cb {
-                    let lua_arg = crate::state_bus::json_to_lua(lua, payload)?;
-                    let _ = func.call::<()>(lua_arg);
+                    let _ = func.call::<()>(lua_arg.clone());
                 }
             }
             Ok(())

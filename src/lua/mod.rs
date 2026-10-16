@@ -32,6 +32,7 @@ pub struct StepExecutionResult {
     pub return_value: Option<String>,
     pub payload: Option<PipelinePayload>,
     pub error_message: Option<String>,
+    pub changed_target_dir: Option<PathBuf>,
 }
 
 /// Основной исполнительный движок Lua Grime.
@@ -450,6 +451,11 @@ impl GrimeLuaEngine {
         )
     }
 
+    /// Устанавливает переменные окружения контекста конвейера.
+    pub fn set_environment(&self, env: &std::collections::HashMap<String, String>) -> Result<(), mlua::Error> {
+        context::set_environment(&self.lua, env)
+    }
+
     /// Выполняет модуль по имени (с поиском, fuzzy match, вызовом main и обработкой возвращаемых значений).
     pub fn execute_module(&self, module_name: &str) -> Result<StepExecutionResult, mlua::Error> {
         // Проверка отмены перед запуском модуля
@@ -463,6 +469,7 @@ impl GrimeLuaEngine {
                 return_value: None,
                 payload: None,
                 error_message: Some(format!("Конвейер отменен: {}", reason)),
+                changed_target_dir: None,
             });
         }
 
@@ -502,6 +509,7 @@ impl GrimeLuaEngine {
                         "Модуль '{}.lua' не найден в {:?}",
                         module_name, self.modules_dir
                     )),
+                    changed_target_dir: None,
                 });
             }
         }
@@ -531,6 +539,7 @@ impl GrimeLuaEngine {
                     return_value: None,
                     payload: None,
                     error_message: Some(format!("Ошибка исполнения модуля '{}': {}", module_name, e)),
+                    changed_target_dir: None,
                 });
             }
         }
@@ -562,6 +571,7 @@ impl GrimeLuaEngine {
                         return_value: None,
                         payload: None,
                         error_message: Some(format!("Ошибка в main() модуля '{}': {}", module_name, e)),
+                        changed_target_dir: None,
                     });
                 }
             }
@@ -647,11 +657,22 @@ impl GrimeLuaEngine {
             }
         }
 
+        let changed: bool = ctx.get("_target_dir_changed").unwrap_or(false);
+        let changed_target_dir = if changed {
+            ctx.get::<Option<String>>("_requested_target_dir")
+                .ok()
+                .flatten()
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+
         Ok(StepExecutionResult {
             success: status,
             return_value: ret_val,
             payload: ret_payload,
             error_message: error_msg,
+            changed_target_dir,
         })
     }
 

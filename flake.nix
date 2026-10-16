@@ -14,7 +14,7 @@
       makeGrimePackage = pkgs:
         pkgs.rustPlatform.buildRustPackage {
           pname = "grime";
-          version = "0.1.0";
+          version = "1.1.0";
 
           src = ./.;
 

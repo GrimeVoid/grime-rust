@@ -55,18 +55,61 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     components.into_iter().collect()
 }
 
-pub fn is_system_or_root_path(path: &Path) -> bool {
-    let canonical = match path.canonicalize() {
-        Ok(c) => c,
-        Err(_) => path.to_path_buf(),
-    };
+pub static SYSTEM_PROTECTED_DIRS: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/var",
+    "/boot",
+    "/opt",
+    "/root",
+    "/nix",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/run",
+];
 
-    if canonical == Path::new("/") {
+/// Проверяет, является ли путь разрешенным подкаталогом/файлом в XDG_RUNTIME_DIR (например `/run/user/<uid>/grime*`)
+fn is_allowed_runtime_path(path: &Path) -> bool {
+    let uid = unsafe { libc::getuid() };
+    let default_runtime = PathBuf::from(format!("/run/user/{}", uid));
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(default_runtime);
+
+    let runtime_canon = runtime_dir.canonicalize().unwrap_or(runtime_dir);
+    if let Ok(rel) = path.strip_prefix(&runtime_canon) {
+        if let Some(first) = rel.components().next() {
+            if let Component::Normal(name) = first {
+                return name.to_string_lossy().starts_with("grime");
+            }
+        }
+    }
+    false
+}
+
+fn check_path_against_system_rules(p: &Path) -> bool {
+    if p == Path::new("/") {
         return true;
     }
 
+    if let Some(home) = get_cached_home_dir() {
+        if p == home {
+            return true;
+        }
+    }
     if let Some(home_canon) = get_cached_canonical_home() {
-        if canonical == home_canon {
+        if p == home_canon {
+            return true;
+        }
+    }
+
+    for &sys in SYSTEM_PROTECTED_DIRS {
+        let sys_path = Path::new(sys);
+        if p == sys_path || p.starts_with(sys_path) {
+            if sys == "/run" && is_allowed_runtime_path(p) {
+                continue;
+            }
             return true;
         }
     }
@@ -74,43 +117,72 @@ pub fn is_system_or_root_path(path: &Path) -> bool {
     false
 }
 
-pub fn delete_safe(path: &Path, missing_ok: bool) -> Result<bool, String> {
-    if !path.exists() {
-        if missing_ok {
-            return Ok(false);
+/// Проверяет, является ли путь системным каталогом, корнем `/` или `$HOME`, удаление которых запрещено.
+pub fn is_system_or_root_path(path: &Path) -> bool {
+    // 1. Проверяем канонический путь
+    if let Ok(canonical) = path.canonicalize() {
+        if check_path_against_system_rules(&canonical) {
+            return true;
         }
-        return Err(format!("Путь не существует: {}", path.display()));
     }
+
+    // 2. Проверяем нормализованный абсолютный путь на случай несуществующего пути
+    let normalized = if path.is_absolute() {
+        normalize_path(path)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        normalize_path(&cwd.join(path))
+    } else {
+        normalize_path(path)
+    };
+
+    check_path_against_system_rules(&normalized)
+}
+
+/// Безопасное удаление файла, директории или символической ссылки.
+pub fn delete_safe(path: &Path, missing_ok: bool) -> Result<bool, String> {
+    let root_meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            if missing_ok {
+                return Ok(false);
+            }
+            return Err(format!("Путь не существует: {}", path.display()));
+        }
+    };
 
     if is_system_or_root_path(path) {
         return Err(format!(
-            "Защита безопасности: попытка удаления системного/домашнего пути '{}'!",
+            "Попытка удаления защищенного системного каталога: '{}'!",
             path.display()
         ));
     }
 
-    // Если это директория
-    if path.is_dir() {
-        // Снимаем защиту от записи со всех вложенных файлов
+    if root_meta.file_type().is_symlink() {
+        // Символическую ссылку удаляем напрямую БЕЗ изменения прав целевого файла!
+        fs::remove_file(path)
+            .map_err(|e| format!("Ошибка удаления симлинка '{}': {}", path.display(), e))?;
+    } else if root_meta.is_dir() {
+        // Снимаем защиту от записи со всех вложенных файлов (исключая симлинки!)
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
             if let Ok(metadata) = fs::symlink_metadata(p) {
-                let mut perms = metadata.permissions();
-                if perms.readonly() {
-                    perms.set_mode(0o755);
-                    let _ = fs::set_permissions(p, perms);
+                // Если файл является символической ссылкой, НЕ вызывать set_permissions!
+                if !metadata.file_type().is_symlink() {
+                    let mut perms = metadata.permissions();
+                    if perms.readonly() {
+                        perms.set_mode(if metadata.is_dir() { 0o755 } else { 0o644 });
+                        let _ = fs::set_permissions(p, perms);
+                    }
                 }
             }
         }
         fs::remove_dir_all(path)
             .map_err(|e| format!("Ошибка удаления каталога '{}': {}", path.display(), e))?;
     } else {
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            let mut perms = metadata.permissions();
-            if perms.readonly() {
-                perms.set_mode(0o644);
-                let _ = fs::set_permissions(path, perms);
-            }
+        let mut perms = root_meta.permissions();
+        if perms.readonly() {
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(path, perms);
         }
         fs::remove_file(path)
             .map_err(|e| format!("Ошибка удаления файла '{}': {}", path.display(), e))?;
@@ -279,6 +351,112 @@ mod tests {
         }
         assert_eq!(expand_tilde(Path::new("/abs/path")).as_ref(), Path::new("/abs/path"));
         assert_eq!(expand_tilde(Path::new("rel/path")).as_ref(), Path::new("rel/path"));
+    }
+
+    #[test]
+    fn test_is_system_or_root_path_and_delete_protection() {
+        // Проверка корневых системных путей
+        assert!(is_system_or_root_path(Path::new("/")));
+        assert!(is_system_or_root_path(Path::new("/etc")));
+        assert!(is_system_or_root_path(Path::new("/etc/passwd")));
+        assert!(is_system_or_root_path(Path::new("/usr")));
+        assert!(is_system_or_root_path(Path::new("/usr/bin")));
+        assert!(is_system_or_root_path(Path::new("/var")));
+        assert!(is_system_or_root_path(Path::new("/boot")));
+        assert!(is_system_or_root_path(Path::new("/opt")));
+        assert!(is_system_or_root_path(Path::new("/root")));
+        assert!(is_system_or_root_path(Path::new("/nix")));
+        assert!(is_system_or_root_path(Path::new("/sys")));
+        assert!(is_system_or_root_path(Path::new("/proc")));
+        assert!(is_system_or_root_path(Path::new("/dev")));
+        assert!(is_system_or_root_path(Path::new("/run")));
+
+        if let Some(home) = get_cached_home_dir() {
+            assert!(is_system_or_root_path(home));
+        }
+
+        // Попытка удаления системного каталога через delete_safe
+        let res_etc = delete_safe(Path::new("/etc"), false);
+        assert!(res_etc.is_err());
+        assert!(res_etc.unwrap_err().contains("Попытка удаления защищенного системного каталога"));
+
+        let res_usr = delete_safe(Path::new("/usr"), false);
+        assert!(res_usr.is_err());
+        assert!(res_usr.unwrap_err().contains("Попытка удаления защищенного системного каталога"));
+
+        // Проверка резолва через симлинк на системный каталог
+        let test_dir = std::env::temp_dir().join(format!("grime_sys_protect_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&test_dir);
+        let link_to_etc = test_dir.join("link_to_etc");
+        let _ = std::os::unix::fs::symlink("/etc", &link_to_etc);
+
+        let res_link = delete_safe(&link_to_etc, false);
+        assert!(res_link.is_err(), "Симлинк, ведущий в /etc, должен быть заблокирован от удаления через delete_safe");
+        assert!(res_link.unwrap_err().contains("Попытка удаления защищенного системного каталога"));
+
+        // Обычная поддиректория удаляется успешно
+        let normal_dir = test_dir.join("normal_dir");
+        fs::create_dir_all(&normal_dir).unwrap();
+        assert!(delete_safe(&normal_dir, false).is_ok());
+
+        let _ = fs::remove_file(&link_to_etc);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_symlink_deletion_without_modifying_target_permissions() {
+        let test_root = std::env::temp_dir().join(format!("grime_symlink_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&test_root);
+
+        // 1. Создаем целевой файл с правами readonly (0o444)
+        let target_file = test_root.join("target_file.txt");
+        fs::write(&target_file, "read-only payload").unwrap();
+        let mut perms = fs::metadata(&target_file).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&target_file, perms).unwrap();
+
+        assert_eq!(
+            fs::metadata(&target_file).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "Целевой файл должен быть readonly"
+        );
+
+        // 2. Тестируем прямое удаление симлинка
+        let single_symlink = test_root.join("single_symlink");
+        std::os::unix::fs::symlink(&target_file, &single_symlink).unwrap();
+
+        let del_res = delete_safe(&single_symlink, false);
+        assert!(del_res.is_ok(), "delete_safe должен успешно удалить одиночный симлинк: {:?}", del_res);
+        assert!(fs::symlink_metadata(&single_symlink).is_err(), "Симлинк должен быть удален");
+        assert!(target_file.exists(), "Целевой файл не должен быть удален");
+        assert_eq!(
+            fs::metadata(&target_file).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "Права целевого файла не должны измениться после удаления одиночного симлинка"
+        );
+
+        // 3. Тестируем удаление каталога, содержащего симлинк на readonly файл
+        let nested_dir = test_root.join("nested_dir");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let symlink_in_dir = nested_dir.join("link_inside");
+        std::os::unix::fs::symlink(&target_file, &symlink_in_dir).unwrap();
+
+        let del_dir_res = delete_safe(&nested_dir, false);
+        assert!(del_dir_res.is_ok(), "delete_safe должен успешно удалить каталог с симлинком");
+        assert!(!nested_dir.exists(), "Каталог должен быть удален");
+        assert!(target_file.exists(), "Целевой файл должен остаться");
+        assert_eq!(
+            fs::metadata(&target_file).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "Права целевого файла не должны измениться после рекурсивного удаления каталога с симлинком"
+        );
+
+        // Cleanup
+        let mut cleanup_perms = fs::metadata(&target_file).unwrap().permissions();
+        cleanup_perms.set_mode(0o644);
+        let _ = fs::set_permissions(&target_file, cleanup_perms);
+        let _ = fs::remove_file(&target_file);
+        let _ = fs::remove_dir_all(&test_root);
     }
 }
 

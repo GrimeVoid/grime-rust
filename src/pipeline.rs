@@ -57,6 +57,15 @@ pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<St
     modules
 }
 
+static MODULES_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn cached_available_modules() -> &'static [String] {
+    MODULES_CACHE.get_or_init(|| {
+        let config = crate::config::GrimeConfig::load_or_default(None);
+        discover_available_modules(&config)
+    })
+}
+
 pub fn canonical_module_name(name: &str) -> String {
     let lower = name.to_lowercase();
     let alias_resolved = match lower.as_str() {
@@ -67,14 +76,12 @@ pub fn canonical_module_name(name: &str) -> String {
         _ => lower,
     };
 
-    let config = crate::config::GrimeConfig::load_or_default(None);
-    let available = discover_available_modules(&config);
-    let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
-
-    if available_refs.contains(&alias_resolved.as_str()) {
+    let available = cached_available_modules();
+    if available.iter().any(|s| s == &alias_resolved) {
         return alias_resolved;
     }
 
+    let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
     if let Some(matched) = crate::args::fuzzy_match_entity(&alias_resolved, &available_refs, 0.75) {
         return matched.to_string();
     }

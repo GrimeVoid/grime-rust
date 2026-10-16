@@ -12,6 +12,9 @@ use crate::orchestrator::Orchestrator;
 use crate::pipeline::parse_pipeline_args;
 use crate::supervisor::{TaskStatus, TaskSupervisor};
 
+/// Максимально допустимый размер полезной нагрузки IPC-сообщения (32 MB) для защиты от OOM и DoS.
+pub const MAX_IPC_PAYLOAD_SIZE: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum ClientMessage {
     Run {
@@ -144,6 +147,28 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                         return;
                     }
                     let payload_len = u32::from_be_bytes(len_buf) as usize;
+                    if payload_len > MAX_IPC_PAYLOAD_SIZE {
+                        eprintln!(
+                            "{} Превышен максимальный размер IPC-сообщения: {} байт (лимит: {} байт)",
+                            "[grimed Security]".red().bold(),
+                            payload_len,
+                            MAX_IPC_PAYLOAD_SIZE
+                        );
+                        let resp = DaemonResponse {
+                            success: false,
+                            exit_code: 1,
+                            result: None,
+                            error: Some(format!(
+                                "Payload size exceeds MAX_IPC_PAYLOAD_SIZE limit ({} > {})",
+                                payload_len, MAX_IPC_PAYLOAD_SIZE
+                            )),
+                            detached: false,
+                            task_id: None,
+                        };
+                        let _ = send_msgpack_response(&mut socket, &resp).await;
+                        return;
+                    }
+
                     let mut payload = vec![0u8; payload_len];
                     if socket.read_exact(&mut payload).await.is_err() {
                         return;
@@ -167,13 +192,16 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                     };
 
                     match msg {
-                        ClientMessage::Run { args, detach, .. } => {
-                            let parsed = parse_pipeline_args(&args);
+                        ClientMessage::Run { cwd, args, env, detach } => {
+                            let mut parsed = parse_pipeline_args(&args);
+                            if parsed.work_path.is_none() && !cwd.is_empty() {
+                                parsed.work_path = Some(PathBuf::from(&cwd));
+                            }
 
                             if detach || parsed.detach {
-                                // Запуск открепленной задачи в супервизоре с Heartbeat
+                                // Запуск открепленной задачи в супервизоре с Heartbeat, cwd и env
                                 let task_id = sup
-                                    .spawn_detached_pipeline(parsed, m_dir, c_path)
+                                    .spawn_detached_pipeline(parsed, m_dir, c_path, Some(cwd), Some(env))
                                     .await;
 
                                 let resp = DaemonResponse {
@@ -188,6 +216,9 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                             } else {
                                 // Сервисное выполнение через демон
                                 let orch_lock = orch.read().await;
+                                if !env.is_empty() {
+                                    let _ = orch_lock.set_environment(&env);
+                                }
                                 let resp = match orch_lock.run_pipeline(&parsed).await {
                                     Ok(res) => DaemonResponse {
                                         success: true,

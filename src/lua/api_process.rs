@@ -97,7 +97,14 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
                 let parts: Vec<&str> = content.split_whitespace().collect();
                 if parts.len() > 1 {
                     if let Ok(pages) = parts[1].parse::<usize>() {
-                        let page_size_kb = 4;
+                        let page_size_kb = {
+                            let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                            if sz > 0 {
+                                (sz as usize) / 1024
+                            } else {
+                                4
+                            }
+                        };
                         return Ok(pages * page_size_kb);
                     }
                 }

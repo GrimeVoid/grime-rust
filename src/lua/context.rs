@@ -39,10 +39,30 @@ pub fn init_context_table(
     let flags_init = lua.create_table()?;
     flags_init.set("force", false)?;
     ctx_tbl.set("flags", flags_init)?;
+    ctx_tbl.set("env", lua.create_table()?)?;
     ctx_tbl.set("_status", true)?;
     ctx_tbl.set("_error_message", Value::Nil)?;
     ctx_tbl.set("_return_value", Value::Nil)?;
     ctx_tbl.set("_return_payload", Value::Nil)?;
+    ctx_tbl.set("_target_dir_changed", false)?;
+    ctx_tbl.set("_requested_target_dir", Value::Nil)?;
+
+    // Явная установка рабочей директории модуля (ctx.set_target_dir)
+    ctx_tbl.set(
+        "set_target_dir",
+        lua.create_function(|lua_ctx, path: String| {
+            let globals = lua_ctx.globals();
+            let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let fs_tbl: Table = g.get("fs")?;
+            let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+            let normalized: String = norm_fn.call(path)?;
+            c.set("target_dir", normalized.clone())?;
+            c.set("_target_dir_changed", true)?;
+            c.set("_requested_target_dir", normalized)?;
+            Ok(())
+        })?,
+    )?;
 
     // Получение payload в виде UserData
     ctx_tbl.set(
@@ -188,6 +208,64 @@ pub fn init_context_table(
         })?,
     )?;
 
+    // Вспомогательная функция для извлечения эффективного окружения
+    fn extract_effective_env(c: &Table, explicit_env: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+        if explicit_env.is_some() {
+            return explicit_env;
+        }
+        let env_tbl: Table = c.get("env").ok()?;
+        let mut map = HashMap::new();
+        for pair in env_tbl.pairs::<String, String>() {
+            if let Ok((k, v)) = pair {
+                map.insert(k, v);
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
+    }
+
+    // Вспомогательная функция для разрешения путей относительно target_dir
+    fn resolve_ctx_path(c: &Table, path: &str) -> String {
+        let p = Path::new(path);
+        if p.is_absolute() || path.starts_with('~') {
+            path.to_string()
+        } else if let Ok(target_dir) = c.get::<String>("target_dir") {
+            if !target_dir.is_empty() && target_dir != "." {
+                let expanded_base = crate::fs_ops::expand_tilde(&target_dir);
+                expanded_base.as_ref().join(p).to_string_lossy().to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            path.to_string()
+        }
+    }
+
+    // Вспомогательная функция для разрешения рабочего каталога (cwd) относительно target_dir
+    fn resolve_ctx_cwd(c: &Table, cwd: Option<String>) -> Option<String> {
+        match cwd {
+            Some(c_str) => {
+                let p = Path::new(&c_str);
+                if p.is_absolute() || c_str.starts_with('~') {
+                    Some(c_str)
+                } else if let Ok(target_dir) = c.get::<String>("target_dir") {
+                    if !target_dir.is_empty() && target_dir != "." {
+                        let expanded_base = crate::fs_ops::expand_tilde(&target_dir);
+                        Some(expanded_base.as_ref().join(p).to_string_lossy().to_string())
+                    } else {
+                        Some(c_str)
+                    }
+                } else {
+                    Some(c_str)
+                }
+            }
+            None => c.get::<Option<String>>("target_dir").ok().flatten(),
+        }
+    }
+
     // Запуск процессов через ctx
     ctx_tbl.set(
         "run_process",
@@ -197,9 +275,10 @@ pub fn init_context_table(
                 let g: Table = globals.get("grime")?;
                 let c: Table = g.get("ctx")?;
                 let proc_tbl: Table = g.get("process")?;
-                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let effective_cwd = resolve_ctx_cwd(&c, cwd);
+                let effective_env = extract_effective_env(&c, env);
                 let run_fn: mlua::Function = proc_tbl.get("run_interactive")?;
-                run_fn.call::<i32>((cmd, effective_cwd, env))
+                run_fn.call::<i32>((cmd, effective_cwd, effective_env))
             },
         )?,
     )?;
@@ -213,9 +292,10 @@ pub fn init_context_table(
                 let g: Table = globals.get("grime")?;
                 let c: Table = g.get("ctx")?;
                 let proc_tbl: Table = g.get("process")?;
-                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let effective_cwd = resolve_ctx_cwd(&c, cwd);
+                let effective_env = extract_effective_env(&c, env);
                 let run_fn: mlua::Function = proc_tbl.get("run")?;
-                run_fn.call::<i32>((cmd, effective_cwd, env))
+                run_fn.call::<i32>((cmd, effective_cwd, effective_env))
             },
         )?,
     )?;
@@ -228,22 +308,25 @@ pub fn init_context_table(
                 let g: Table = globals.get("grime")?;
                 let c: Table = g.get("ctx")?;
                 let proc_tbl: Table = g.get("process")?;
-                let effective_cwd = cwd.or_else(|| c.get::<Option<String>>("target_dir").ok().flatten());
+                let effective_cwd = resolve_ctx_cwd(&c, cwd);
+                let effective_env = extract_effective_env(&c, env);
                 let cap_fn: mlua::Function = proc_tbl.get("capture")?;
-                cap_fn.call::<Value>((cmd, effective_cwd, env, stdin_input))
+                cap_fn.call::<Value>((cmd, effective_cwd, effective_env, stdin_input))
             },
         )?,
     )?;
 
-    // Файловые операции через ctx
+    // Файловые операции через ctx (с прозрачным разрешением относительно target_dir)
     ctx_tbl.set(
         "exists",
         lua.create_function(|lua_ctx, path: String| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("exists")?;
-            f.call::<bool>(path)
+            f.call::<bool>(resolved)
         })?,
     )?;
     ctx_tbl.set(
@@ -251,9 +334,11 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, path: String| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("is_dir")?;
-            f.call::<bool>(path)
+            f.call::<bool>(resolved)
         })?,
     )?;
     ctx_tbl.set(
@@ -261,9 +346,11 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, path: String| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("is_file")?;
-            f.call::<bool>(path)
+            f.call::<bool>(resolved)
         })?,
     )?;
     ctx_tbl.set(
@@ -271,9 +358,11 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, path: String| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("mkdir_p")?;
-            f.call::<bool>(path)
+            f.call::<bool>(resolved)
         })?,
     )?;
     ctx_tbl.set(
@@ -281,9 +370,11 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, (path, missing_ok): (String, Option<bool>)| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("delete")?;
-            f.call::<bool>((path, missing_ok))
+            f.call::<bool>((resolved, missing_ok))
         })?,
     )?;
     ctx_tbl.set("remove", ctx_tbl.get::<Value>("delete")?)?;
@@ -293,9 +384,12 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, (src, dst): (String, String)| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let s = resolve_ctx_path(&c, &src);
+            let d = resolve_ctx_path(&c, &dst);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("copy")?;
-            f.call::<String>((src, dst))
+            f.call::<String>((s, d))
         })?,
     )?;
     ctx_tbl.set(
@@ -303,21 +397,52 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, (src, dst): (String, String)| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let s = resolve_ctx_path(&c, &src);
+            let d = resolve_ctx_path(&c, &dst);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("move")?;
-            f.call::<String>((src, dst))
+            f.call::<String>((s, d))
         })?,
     )?;
     ctx_tbl.set("rename", ctx_tbl.get::<Value>("move")?)?;
+
+    ctx_tbl.set(
+        "read",
+        lua.create_function(|lua_ctx, path: String| {
+            let globals = lua_ctx.globals();
+            let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
+            let fs_tbl: Table = g.get("fs")?;
+            let f: mlua::Function = fs_tbl.get("read")?;
+            f.call::<Option<String>>(resolved)
+        })?,
+    )?;
+
+    ctx_tbl.set(
+        "write",
+        lua.create_function(|lua_ctx, (path, content): (String, String)| {
+            let globals = lua_ctx.globals();
+            let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
+            let fs_tbl: Table = g.get("fs")?;
+            let f: mlua::Function = fs_tbl.get("write")?;
+            f.call::<bool>((resolved, content))
+        })?,
+    )?;
 
     ctx_tbl.set(
         "mtime",
         lua.create_function(|lua_ctx, path: String| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let resolved = resolve_ctx_path(&c, &path);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("mtime")?;
-            f.call::<f64>(path)
+            f.call::<f64>(resolved)
         })?,
     )?;
     ctx_tbl.set(
@@ -325,9 +450,12 @@ pub fn init_context_table(
         lua.create_function(|lua_ctx, (src, target): (String, String)| {
             let globals = lua_ctx.globals();
             let g: Table = globals.get("grime")?;
+            let c: Table = g.get("ctx")?;
+            let s = resolve_ctx_path(&c, &src);
+            let t = resolve_ctx_path(&c, &target);
             let fs_tbl: Table = g.get("fs")?;
             let f: mlua::Function = fs_tbl.get("is_newer")?;
-            f.call::<bool>((src, target))
+            f.call::<bool>((s, t))
         })?,
     )?;
     ctx_tbl.set("needs_rebuild", ctx_tbl.get::<Value>("is_newer")?)?;
@@ -543,6 +671,8 @@ pub fn update_step_context(
     ctx.set("_error_message", Value::Nil)?;
     ctx.set("_return_value", Value::Nil)?;
     ctx.set("_return_payload", Value::Nil)?;
+    ctx.set("_target_dir_changed", false)?;
+    ctx.set("_requested_target_dir", Value::Nil)?;
 
     // Устанавливаем и input, и pipeline_input для сквозной передачи данных
     if let Some(pipe_in) = pipeline_input {
@@ -559,6 +689,20 @@ pub fn update_step_context(
         ctx.set("payload", Value::Nil)?;
     }
 
+    globals.set("ctx", ctx)?;
+    Ok(())
+}
+
+/// Устанавливает переданные переменные окружения в контексте Lua (`ctx.env`).
+pub fn set_environment(lua: &Lua, env: &HashMap<String, String>) -> Result<(), mlua::Error> {
+    let globals = lua.globals();
+    let grime: Table = globals.get("grime")?;
+    let ctx: Table = grime.get("ctx")?;
+    let env_tbl = lua.create_table_with_capacity(0, env.len())?;
+    for (k, v) in env {
+        env_tbl.set(k.as_str(), v.as_str())?;
+    }
+    ctx.set("env", env_tbl)?;
     globals.set("ctx", ctx)?;
     Ok(())
 }

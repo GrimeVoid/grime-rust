@@ -135,13 +135,9 @@ impl UserData for PipelinePayload {
             Ok(this.slice(start, len))
         });
 
-        // Преобразование байтов в таблицу Lua (массив чисел)
+        // Преобразование байтов в бинарную строку Lua (Zero-copy / компактное представление)
         methods.add_method("to_bytes", |lua, this, ()| {
-            let tbl = lua.create_table()?;
-            for (idx, byte) in this.as_slice().iter().enumerate() {
-                tbl.set(idx + 1, *byte)?;
-            }
-            Ok(tbl)
+            lua.create_string(this.as_slice())
         });
     }
 }
@@ -228,5 +224,11 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(slice_val.as_str().unwrap(), "Hello");
+
+        let bytes_val: mlua::String = lua
+            .load("return payload:to_bytes()")
+            .eval()
+            .unwrap();
+        assert_eq!(bytes_val.as_bytes(), b"Hello from Rust");
     }
 }

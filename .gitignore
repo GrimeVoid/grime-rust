@@ -5,4 +5,14 @@
 /result
 /result-*
 /dist/
+*.log
+*.class
+__pycache__/
+/apps/AppA/
+/apps/AppB/
+/apps/TestApp/
+/apps/cppfilter/
+/apps/javaworker/
+/apps/polyapp/
+/apps/pyworker/
 

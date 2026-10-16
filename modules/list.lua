@@ -16,23 +16,37 @@ local DEFAULT_DESCRIPTIONS = {
     git = "Полноценное управление Git-репозиториями и версионированием",
     log = "Централизованный сбор, хранение и фильтрация логов",
     benchmark = "Стресс-тестирование, бенчмаркинг конвейеров и замеры задержек",
+    polyglot = "Полиглотный межъязыковой клей и бенчмарк IPC (Python <-> Grime <-> C)",
+    ["languages/base"] = "Базовый абстрактный класс адаптеров языков",
+    ["languages/cpp"] = "Адаптер языка C++ (CMake, Ninja, сборка и запуск)",
+    ["languages/rust"] = "Адаптер языка Rust (Cargo, сборка и запуск)",
+    ["languages/python"] = "Адаптер языка Python (Venv, pip, pytest, запуск)",
+    ["languages/java"] = "Адаптер языка Java (Maven, JDK, сборка и запуск)",
+    ["languages/argparse"] = "Вспомогательный модуль парсинга аргументов командной строки",
 }
 
 local function print_help()
     print(string.format([[
-%s%sGrime Modules List%s — Вывод полного списка зарегистрированных модулей
+%s%sGrime Modules List%s — Вывод списка зарегистрированных модулей
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime list [фильтр]
-    grime ls [фильтр]
-    grime modules [фильтр]
+    grime list [фильтр] [флаги]
+    grime ls [фильтр] [флаги]
+    grime modules [фильтр] [флаги]
+
+%sФЛАГИ:%s
+    %s-a, --all%s             Показать абсолютно все модули (включая languages/* и вспомогательные)
+    %s-h, --help%s            Показать эту справку
 
 %sОПИСАНИЕ:%s
-    Сканирует директории модулей Grime, отображает их статус,
-    краткое описание и физический путь к файлу реализации.
+    По умолчанию отображает основные пользовательские модули оркестратора Grime.
+    С флагом --all отображает расширенный состав, включая адаптеры языков и внутренние модули.
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
+    "\27[1m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
     "\27[1m", "\27[0m"
     ))
 end
@@ -44,7 +58,6 @@ local function extract_summary(file_path, mod_name)
 
     local content = grime.fs.read(file_path)
     if content then
-        -- Поиск строки вида "-- Summary: ..." или "-- Описание: ..."
         local summary = content:match("%-%-%s*[Ss]ummary:%s*([^\r\n]+)")
         if not summary then
             summary = content:match("%-%-%s*Описание:%s*([^\r\n]+)")
@@ -53,19 +66,27 @@ local function extract_summary(file_path, mod_name)
             return grime.str.trim(summary)
         end
     end
-    return "Пользовательский модуль конвейера"
+    return "Модуль Grime"
 end
 
 function main()
     local args = ctx.args or {}
+    local show_all = false
+    local filtered_args = {}
+
     for _, a in ipairs(args) do
-        if a == "--help" or a == "-h" or a == "help" then
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--all", "-a", "--help", "-h" }, 0.75) or a
+        if matched == "--all" or matched == "-a" then
+            show_all = true
+        elseif matched == "--help" or matched == "-h" or a == "help" then
             print_help()
             return
+        else
+            table.insert(filtered_args, a)
         end
     end
 
-    local query = args[1]
+    local query = filtered_args[1]
     if query then
         query = grime.str.trim(query:lower())
     end
@@ -84,20 +105,43 @@ function main()
         if grime.fs.is_dir(norm_dir) then
             local files = grime.fs.list(norm_dir) or {}
             for _, f in ipairs(files) do
+                local full_path = grime.fs.join(norm_dir, f)
                 if f:sub(-4) == ".lua" then
                     local name = f:sub(1, -5)
                     if not seen[name] then
                         seen[name] = true
-                        local full_path = grime.fs.join(norm_dir, f)
                         local is_valid_file = grime.fs.is_file(full_path)
                         local status = is_valid_file and "Активен" or "Поврежденный симлинк"
                         local desc = is_valid_file and extract_summary(full_path, name) or "Файл или симлинк недоступен"
+                        local is_internal = (name == "polyglot")
                         table.insert(found_modules, {
                             name = name,
                             desc = desc,
                             path = full_path,
                             status = status,
+                            is_internal = is_internal,
                         })
+                    end
+                elseif grime.fs.is_dir(full_path) and not f:match("^%.") then
+                    local subfiles = grime.fs.list(full_path) or {}
+                    for _, sf in ipairs(subfiles) do
+                        if sf:sub(-4) == ".lua" then
+                            local mod_name = f .. "/" .. sf:sub(1, -5)
+                            if not seen[mod_name] then
+                                seen[mod_name] = true
+                                local sub_full_path = grime.fs.join(full_path, sf)
+                                local is_valid_file = grime.fs.is_file(sub_full_path)
+                                local status = is_valid_file and "Адаптер" or "Поврежденный симлинк"
+                                local desc = is_valid_file and extract_summary(sub_full_path, mod_name) or "Языковой адаптер"
+                                table.insert(found_modules, {
+                                    name = mod_name,
+                                    desc = desc,
+                                    path = sub_full_path,
+                                    status = status,
+                                    is_internal = true,
+                                })
+                            end
+                        end
                     end
                 end
             end
@@ -108,11 +152,13 @@ function main()
     for name, desc in pairs(DEFAULT_DESCRIPTIONS) do
         if not seen[name] then
             seen[name] = true
+            local is_internal = name:find("/") ~= nil or name == "polyglot"
             table.insert(found_modules, {
                 name = name,
                 desc = desc,
                 path = "встроенный",
-                status = "Доступен",
+                status = is_internal and "Адаптер" or "Доступен",
+                is_internal = is_internal,
             })
         end
     end
@@ -121,31 +167,40 @@ function main()
 
     local rows = {}
     for _, m in ipairs(found_modules) do
-        local match = true
-        if query and #query > 0 then
-            local name_l = m.name:lower()
-            local desc_l = m.desc:lower()
-            if not name_l:find(query, 1, true) and not desc_l:find(query, 1, true) then
-                local sim = grime.fuzzy.similarity(query, name_l)
-                if sim < 0.65 then
-                    match = false
+        if show_all or not m.is_internal then
+            local match = true
+            if query and #query > 0 then
+                local name_l = m.name:lower()
+                local desc_l = m.desc:lower()
+                if not name_l:find(query, 1, true) and not desc_l:find(query, 1, true) then
+                    local sim = grime.fuzzy.similarity(query, name_l)
+                    if sim < 0.65 then
+                        match = false
+                    end
                 end
             end
-        end
 
-        if match then
-            table.insert(rows, { m.name, m.status, m.desc, m.path })
+            if match then
+                table.insert(rows, { m.name, m.status, m.desc, m.path })
+            end
         end
     end
 
-    grime.ui.log(string.format("Зарегистрировано модулей Grime: %d", #rows))
+    local title_extra = show_all and " [ВСЕ МОДУЛИ И АДАПТЕРЫ]" or " [ОСНОВНЫЕ]"
+    grime.ui.log(string.format("Зарегистрировано модулей Grime%s: %d", title_extra, #rows))
     local headers = { "Модуль", "Статус", "Описание", "Путь к файлу" }
     grime.ui.print_table(rows, headers)
+
+    if not show_all then
+        io.stdout:write("\n\27[90mПодсказка: Для отображения абсолютно всех модулей (включая адаптеры languages/*): \27[36mgrime list -a\27[0m\n\n")
+    else
+        io.stdout:write("\n\27[90mОтображены все модули Grime, включая адаптеры languages/* и внутренние утилиты.\27[0m\n\n")
+    end
 
     if ctx.has_next_step then
         local lines = {}
         for _, r in ipairs(rows) do
-            table.insert(lines, string.format("%-12s %s", r[1], r[3]))
+            table.insert(lines, string.format("%-16s %s", r[1], r[3]))
         end
         ctx.done(true, table.concat(lines, "\n"))
     else

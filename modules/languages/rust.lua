@@ -8,7 +8,7 @@ function RustAdapter.new()
         name = "rust",
         aliases = { "rust", "rs" },
         src_dir = "src",
-        required_binaries = {},
+        required_binaries = { "cargo", "rustc" },
         extensions = { ".rs" },
         build_files = { "Cargo.toml" },
         entry_files = { "main.rs" },

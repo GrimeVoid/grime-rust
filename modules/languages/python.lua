@@ -16,11 +16,18 @@ function PythonAdapter.new()
     return self
 end
 
+local function file_exists(p)
+    if grime and grime.fs and grime.fs.exists then return grime.fs.exists(p) end
+    local f = io.open(p, "r")
+    if f then f:close(); return true end
+    return false
+end
+
 function PythonAdapter:get_nix_packages(root)
-    if grime.fs.exists(root .. "/pyproject.toml") then
+    if file_exists(root .. "/pyproject.toml") then
         return { "python3", "uv" }
     end
-    if grime.fs.exists(root .. "/requirements.txt") then
+    if file_exists(root .. "/requirements.txt") then
         return { "python3", "pip" }
     end
     return { "python3" }

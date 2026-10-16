@@ -1,9 +1,16 @@
 local argparse = require("languages.argparse")
+local scanner = require("languages.scanner")
 local ctx = grime.ctx
 
 local ACTIONS = {
     init = "init", create = "init", new = "init", make = "init",
     flake = "flake", f = "flake",
+    build = "build", b = "build", compile = "build",
+    history = "history", hist = "history", log = "history",
+    rollback = "rollback", revert = "rollback",
+    update = "update", up = "update",
+    bundle = "bundle", pack = "bundle",
+    diff = "diff", closures = "diff",
     gc = "gc", clean = "gc", cleanup = "gc", ["garbage-collect"] = "gc",
     optimise = "optimise", optimize = "optimise", opt = "optimise", dedup = "optimise",
     add = "add", append = "add", ["in"] = "add",
@@ -16,52 +23,170 @@ local ACTIONS = {
     help = "help",
 }
 
-local function detect_project_packages(root)
-    local adapters = {
-        require("languages.cpp"),
-        require("languages.python"),
-        require("languages.rust"),
-        require("languages.java"),
-    }
-    for _, adp in ipairs(adapters) do
-        if adp:detect(root) then
-            return adp:get_nix_packages(root)
+--- Разделение пакетов на тулчейн (nativeBuildInputs) и библиотеки (buildInputs)
+local function split_packages(packages)
+    local native = {}
+    local libs = {}
+    local native_set = {}
+    local libs_set = {}
+
+    for _, p in ipairs(packages or {}) do
+        local clean = p:gsub("^pkgs%.", "")
+        if scanner.is_toolchain_package(clean) then
+            if not native_set[clean] then
+                native_set[clean] = true
+                table.insert(native, clean)
+            end
+        else
+            if not libs_set[clean] then
+                libs_set[clean] = true
+                table.insert(libs, clean)
+            end
         end
     end
-    return { "bashInteractive" }
+
+    if #native == 0 then
+        table.insert(native, "bashInteractive")
+    end
+
+    return native, libs
 end
 
-local function generate_shell_nix(packages)
-    local pkgs_str = ""
-    for _, p in ipairs(packages) do
-        local name = p:gsub("^pkgs%.", "")
-        pkgs_str = pkgs_str .. "    " .. name .. "\n"
+--- Загрузка специальных зависимостей из app.lua (если есть)
+local function load_app_special_dependencies(root)
+    local app_file = root .. "/app.lua"
+    if not ctx.exists(app_file) then return {} end
+
+    local chunk, err = loadfile(app_file)
+    if not chunk then return {} end
+
+    local ok, m = pcall(chunk)
+    if not ok or type(m) ~= "table" then return {} end
+
+    local deps = {}
+    local function add_all(list)
+        if type(list) == "table" then
+            for _, v in ipairs(list) do
+                if type(v) == "string" and #v > 0 then
+                    table.insert(deps, v)
+                end
+            end
+        elseif type(list) == "string" then
+            for s in list:gmatch("%S+") do
+                table.insert(deps, s)
+            end
+        end
     end
-    if pkgs_str == "" then pkgs_str = "    bashInteractive\n" end
+
+    add_all(m.special_dependencies)
+    add_all(m.dependencies)
+    add_all(m.extra_packages)
+    if type(m.nix) == "table" then
+        add_all(m.nix.dependencies)
+        add_all(m.nix.packages)
+        add_all(m.nix.special_dependencies)
+    end
+
+    return deps
+end
+
+--- Комплексный сбор всех зависимостей проекта (Auto-Toolchain + Special Dependencies + CLI args)
+local function resolve_project_dependencies(target_dir, user_packages)
+    local scan = scanner.scan_project(target_dir, ctx)
+    local all_packages = {}
+
+    -- 1. Авто-тулчейн от сканера
+    for _, p in ipairs(scan.toolchain or {}) do
+        table.insert(all_packages, p)
+    end
+
+    -- 2. Специальные зависимости из app.lua
+    local special_deps = load_app_special_dependencies(target_dir)
+    for _, p in ipairs(special_deps) do
+        table.insert(all_packages, p)
+    end
+
+    -- 3. Пакеты, переданные пользователем через CLI
+    for _, p in ipairs(user_packages or {}) do
+        table.insert(all_packages, p)
+    end
+
+    return split_packages(all_packages)
+end
+
+local function generate_shell_nix(native_pkgs, lib_pkgs)
+    local native_str = ""
+    for _, p in ipairs(native_pkgs) do
+        local name = p:gsub("^pkgs%.", "")
+        native_str = native_str .. "    " .. name .. "\n"
+    end
+
+    local lib_str = ""
+    for _, p in ipairs(lib_pkgs) do
+        local name = p:gsub("^pkgs%.", "")
+        lib_str = lib_str .. "    " .. name .. "\n"
+    end
+
+    local hook_lines = {
+        'echo "⚡ [Grime Nix DevShell] Окружение разработки активировано"'
+    }
+    if #lib_pkgs > 0 then
+        table.insert(hook_lines, 'export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$LD_LIBRARY_PATH"')
+        table.insert(hook_lines, 'export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$PKG_CONFIG_PATH"')
+    end
+
+    local build_inputs_str = ""
+    if #lib_pkgs > 0 then
+        build_inputs_str = string.format([[
+  buildInputs = with pkgs; [
+%s  ];]], lib_str)
+    end
 
     return string.format([[{ pkgs ? import <nixpkgs> {} }:
 
 pkgs.mkShell {
-  buildInputs = with pkgs; [
-%s  ];
+  nativeBuildInputs = with pkgs; [
+%s  ];%s
 
   shellHook = ''
-    echo "⚡ [Grime Nix DevShell] Окружение разработки активировано"
+    %s
   '';
 }
-]], pkgs_str)
+]], native_str, build_inputs_str, table.concat(hook_lines, "\n    "))
 end
 
-local function generate_flake_nix(packages)
-    local pkgs_str = ""
-    for _, p in ipairs(packages) do
+local function generate_flake_nix(native_pkgs, lib_pkgs, desc)
+    desc = desc or "⚡ Окружение разработки Grime Flake DevShell"
+    local native_str = ""
+    for _, p in ipairs(native_pkgs) do
         local name = p:gsub("^pkgs%.", "")
-        pkgs_str = pkgs_str .. "            " .. name .. "\n"
+        native_str = native_str .. "            " .. name .. "\n"
     end
-    if pkgs_str == "" then pkgs_str = "            bashInteractive\n" end
+
+    local lib_str = ""
+    for _, p in ipairs(lib_pkgs) do
+        local name = p:gsub("^pkgs%.", "")
+        lib_str = lib_str .. "            " .. name .. "\n"
+    end
+
+    local hook_lines = {
+        'echo "⚡ [Grime Nix Flake DevShell] Окружение активировано"'
+    }
+    if #lib_pkgs > 0 then
+        table.insert(hook_lines, 'export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$LD_LIBRARY_PATH"')
+        table.insert(hook_lines, 'export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$PKG_CONFIG_PATH"')
+    end
+
+    local build_inputs_block = ""
+    if #lib_pkgs > 0 then
+        build_inputs_block = string.format([[
+
+          buildInputs = with pkgs; [
+%s          ];]], lib_str)
+    end
 
     return string.format([[{
-  description = "⚡ Окружение разработки Grime Flake DevShell";
+  description = "%s";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
@@ -75,17 +200,17 @@ local function generate_flake_nix(packages)
     {
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-%s          ];
+          nativeBuildInputs = with pkgs; [
+%s          ];%s
 
           shellHook = ''
-            echo "⚡ [Grime Nix Flake DevShell] Окружение активировано"
+            %s
           '';
         };
       });
     };
 }
-]], pkgs_str)
+]], desc, native_str, build_inputs_block, table.concat(hook_lines, "\n            "))
 end
 
 local function handle_init(target_dir, packages, force)
@@ -95,17 +220,18 @@ local function handle_init(target_dir, packages, force)
         return
     end
 
-    local pkgs = packages
-    if not pkgs or #pkgs == 0 then
-        pkgs = detect_project_packages(target_dir)
-    end
-
-    local content = generate_shell_nix(pkgs)
+    local native_pkgs, lib_pkgs = resolve_project_dependencies(target_dir, packages)
+    local content = generate_shell_nix(native_pkgs, lib_pkgs)
     local f = io.open(shell_path, "w")
     if f then
         f:write(content)
         f:close()
-        ctx.log("Создан shell.nix в " .. target_dir .. " со стеком: " .. table.concat(pkgs, ", "))
+        local total_count = #native_pkgs + #lib_pkgs
+        ctx.log(string.format("Создан shell.nix в %s (native: %s%s)",
+            target_dir,
+            table.concat(native_pkgs, ", "),
+            #lib_pkgs > 0 and (", libs: " .. table.concat(lib_pkgs, ", ")) or ""
+        ))
     else
         ctx.fail("Не удалось записать " .. shell_path)
     end
@@ -118,19 +244,114 @@ local function handle_flake(target_dir, packages, force)
         return
     end
 
-    local pkgs = packages
-    if not pkgs or #pkgs == 0 then
-        pkgs = detect_project_packages(target_dir)
-    end
-
-    local content = generate_flake_nix(pkgs)
+    local native_pkgs, lib_pkgs = resolve_project_dependencies(target_dir, packages)
+    local content = generate_flake_nix(native_pkgs, lib_pkgs)
     local f = io.open(flake_path, "w")
     if f then
         f:write(content)
         f:close()
-        ctx.log("Создан flake.nix в " .. target_dir .. " со стеком: " .. table.concat(pkgs, ", "))
+        ctx.log(string.format("Создан flake.nix в %s (native: %s%s)",
+            target_dir,
+            table.concat(native_pkgs, ", "),
+            #lib_pkgs > 0 and (", libs: " .. table.concat(lib_pkgs, ", ")) or ""
+        ))
     else
         ctx.fail("Не удалось записать " .. flake_path)
+    end
+end
+
+--- Сборка проекта в эфемерном Flake-окружении (без загрязнения рабочего дерева)
+local function handle_build(target_dir, extra_tokens)
+    target_dir = ctx.normalize_path(target_dir)
+
+    -- Анализ extra_tokens: отделяем команду сборки от пакетов зависимостей
+    local user_packages = {}
+    local custom_build_cmd = nil
+
+    if extra_tokens and #extra_tokens > 0 then
+        local is_command = false
+        for _, t in ipairs(extra_tokens) do
+            if type(t) == "string" then
+                if t:find("%s") or t:find("^%-") or t:find("&&") or t:find(";") or t:find("|") or t:find(">") or t:find("<") or t:find("^%./") or t:find("^/") then
+                    is_command = true
+                    break
+                end
+            end
+        end
+
+        if not is_command then
+            local first = extra_tokens[1]
+            local known_build_cmds = {
+                make = true, cmake = true, ninja = true, cargo = true,
+                ["g++"] = true, ["clang++"] = true, gcc = true, clang = true,
+                bash = true, sh = true, meson = true, gradle = true, mvn = true
+            }
+            if known_build_cmds[first] and #extra_tokens > 1 then
+                is_command = true
+            end
+        end
+
+        if is_command then
+            custom_build_cmd = table.concat(extra_tokens, " ")
+        else
+            user_packages = extra_tokens
+        end
+    end
+
+    -- Если в директории уже есть постоянный flake.nix, используем его
+    if ctx.exists(target_dir .. "/flake.nix") then
+        ctx.log("⚡ [Grime Nix Build] Сборка через локальный flake.nix в " .. target_dir .. "...")
+        local cmd_str = custom_build_cmd or "grime project build"
+        local cmd = { "nix", "develop", "--command", "bash", "-c", cmd_str }
+        local ret = ctx.run_process(cmd, target_dir)
+        ctx.module_return(target_dir)
+        if ret ~= 0 then
+            ctx.fail("Сборка внутри Nix завершилась с ошибкой (код " .. tostring(ret) .. ")")
+        end
+        return
+    end
+
+    -- Эфемерный режим: синтез flake в каталоге кэша ~/.cache/grime/flakes/<hash>/
+    local h = 5381
+    for i = 1, #target_dir do
+        h = ((h * 33) + target_dir:byte(i)) % 4294967296
+    end
+    local hash = string.format("%08x", h)
+    local cache_dir = ((os.getenv("HOME") or "") .. "/.cache/grime/flakes/" .. hash)
+    ctx.mkdir_p(cache_dir)
+
+    local native_pkgs, lib_pkgs = resolve_project_dependencies(target_dir, user_packages)
+    local flake_content = generate_flake_nix(native_pkgs, lib_pkgs, "Ephemeral DevShell for " .. target_dir)
+
+    local cache_flake_path = cache_dir .. "/flake.nix"
+    local f = io.open(cache_flake_path, "w")
+    if f then
+        f:write(flake_content)
+        f:close()
+    else
+        ctx.fail("Не удалось создать эфемерный Flake в " .. cache_flake_path)
+        return
+    end
+
+    ctx.log(string.format("⚡ [Grime Ephemeral Flake] Синтезирован тулчейн в кэше (%s%s)",
+        table.concat(native_pkgs, ", "),
+        #lib_pkgs > 0 and (", libs: " .. table.concat(lib_pkgs, ", ")) or ""
+    ))
+    ctx.log("⚡ [Grime Ephemeral Flake] Запуск чистой сборки (рабочее дерево проекта остается нетронутым)...")
+
+    local build_cmd = custom_build_cmd or ("grime project build \"" .. target_dir .. "\"")
+    local cmd = {
+        "nix", "develop", "path:" .. cache_dir,
+        "--command", "bash", "-c",
+        "cd \"" .. target_dir .. "\" && " .. build_cmd
+    }
+
+    local ret = ctx.run_process(cmd, target_dir)
+    ctx.module_return(target_dir)
+    if ret ~= 0 then
+        ctx.fail("Сборка в эфемерном Nix Flake завершилась с ошибкой (код " .. tostring(ret) .. ")")
+    else
+        ctx.log("✓ Сборка в изолированном Nix Flake успешно завершена!")
     end
 end
 
@@ -264,6 +485,186 @@ local function handle_check(target_dir)
     end
 end
 
+local function handle_history()
+    ctx.log("Получение истории поколений профиля Nix...")
+    local res = ctx.capture({ "nix", "profile", "history" })
+    if res.code ~= 0 then
+        ctx.fail("Ошибка получения истории профиля Nix: " .. (res.stderr or ""))
+        return
+    end
+
+    local stdout = res.stdout or ""
+    if #grime.str.trim(stdout) == 0 then
+        grime.ui.log("История поколений профиля Nix пуста.")
+        ctx.success("0 generations")
+        return
+    end
+
+    local lines = grime.str.split(stdout, "\n")
+    local generations = {}
+    local current_gen = nil
+
+    for _, raw_line in ipairs(lines) do
+        local line = raw_line:gsub("\27%[[%d;]*m", "")
+        local v, date = line:match("Version%s+(%d+)%s*%(([%d%-]+)%)")
+        if v then
+            current_gen = {
+                version = v,
+                date = date,
+                changes = {},
+            }
+            table.insert(generations, current_gen)
+        elseif current_gen and #grime.str.trim(line) > 0 then
+            table.insert(current_gen.changes, grime.str.trim(line))
+        end
+    end
+
+    if #generations == 0 then
+        print(stdout)
+        ctx.success(stdout)
+        return
+    end
+
+    local rows = {}
+    for _, g in ipairs(generations) do
+        local change_summary = tostring(#g.changes) .. " изм."
+        if #g.changes > 0 then
+            local first = g.changes[1]
+            local pkg = first:match("([^%s:]+):") or first:match("([^%s:]+)$") or first
+            pkg = pkg:match("([^%.]+)$") or pkg
+            change_summary = string.format("%d изм. (%s%s)", #g.changes, pkg, #g.changes > 1 and "..." or "")
+        end
+        table.insert(rows, { "v" .. g.version, g.date, change_summary })
+    end
+
+    print(string.format("\n\27[1mИстория поколений профиля Nix (%d поколений):\27[0m", #generations))
+    grime.ui.print_table(rows, { "Версия", "Дата", "Изменения" })
+    print()
+
+    if #generations > 0 then
+        local latest = generations[#generations]
+        print(string.format("\27[1;36mТекущее поколение v%s (%s):\27[0m", latest.version, latest.date))
+        for _, ch in ipairs(latest.changes) do
+            print(string.format("  \27[32m•\27[0m %s", ch))
+        end
+        print()
+    end
+
+    if ctx.has_next_step then
+        ctx.success(generations[#generations].version)
+    else
+        ctx.success(tostring(#generations))
+    end
+end
+
+local function handle_rollback(to_generation)
+    local cmd = { "nix", "profile", "rollback" }
+    local target_desc = "на предыдущее поколение"
+    if to_generation and tostring(to_generation):match("^%d+$") then
+        table.insert(cmd, "--to")
+        table.insert(cmd, tostring(to_generation))
+        target_desc = "на поколение " .. tostring(to_generation)
+    end
+
+    ctx.log(string.format("Откат профиля Nix %s...", target_desc))
+    local res = ctx.capture(cmd)
+    if res.code ~= 0 then
+        ctx.fail("Ошибка отката профиля Nix: " .. (res.stderr or res.stdout or ""))
+        return
+    end
+
+    grime.ui.success(string.format("Профиль Nix успешно откатан %s.", target_desc))
+    ctx.success(to_generation or "prev")
+end
+
+local function handle_update(target_dir)
+    target_dir = ctx.normalize_path(target_dir or ".")
+    local flake_path = target_dir .. "/flake.nix"
+    if not ctx.exists(flake_path) then
+        ctx.fail("Файл flake.nix не найден в " .. target_dir)
+        return
+    end
+
+    ctx.log(string.format("Обновление входных зависимостей флейка (nix flake update) в %s...", target_dir))
+    local res = ctx.capture({ "nix", "flake", "update" }, target_dir)
+    if res.code ~= 0 then
+        ctx.fail("Ошибка обновления flake: " .. (res.stderr or res.stdout or ""))
+        return
+    end
+
+    local out = (res.stderr or "") .. "\n" .. (res.stdout or "")
+    local updated_inputs = {}
+    for line in out:gmatch("[^\r\n]+") do
+        local input, from, to = line:match("Updated input '([^']+)':%s*'([^']+)'%s*%->%s*'([^']+)'")
+        if input then
+            table.insert(updated_inputs, { input = input, from = from, to = to })
+        end
+    end
+
+    if #updated_inputs > 0 then
+        print(string.format("\n\27[1;32m✓ Обновлены зависимости flake.lock (%d шт.):\27[0m", #updated_inputs))
+        for _, inp in ipairs(updated_inputs) do
+            print(string.format("  \27[1m%s\27[0m: \27[90m%s\27[0m -> \27[36m%s\27[0m", inp.input, inp.from, inp.to))
+        end
+        print()
+    else
+        grime.ui.success("Зависимости флейка уже находятся в актуальном состоянии.")
+    end
+
+    ctx.module_return(target_dir)
+end
+
+local function handle_bundle(target_dir, args, out_link)
+    target_dir = ctx.normalize_path(target_dir or ".")
+    local cmd = { "nix", "bundle" }
+
+    local installable = nil
+    if args and #args > 0 then
+        installable = args[1]
+    elseif ctx.exists(target_dir .. "/flake.nix") then
+        installable = "."
+    else
+        ctx.fail("Укажите цель для сборки бандла (например, '.' или nixpkgs#hello)")
+        return
+    end
+
+    table.insert(cmd, installable)
+    if out_link and #out_link > 0 then
+        table.insert(cmd, "-o")
+        table.insert(cmd, out_link)
+    end
+
+    ctx.log(string.format("⚡ [Grime Nix Bundle] Упаковка '%s' в переносимый бинарник...", installable))
+    local ret = ctx.run_process(cmd, target_dir)
+    if ret == 0 then
+        local bundle_name = out_link or installable:match("([^#/]+)$") or "bundle"
+        grime.ui.success(string.format("Автономный переносимый бандл успешно собран: %s", bundle_name))
+        ctx.module_return(out_link or target_dir)
+    else
+        ctx.fail("Ошибка сборки бандла nix bundle (код " .. tostring(ret) .. ")")
+    end
+end
+
+local function handle_diff()
+    ctx.log("Анализ изменений замыканий профиля Nix (diff-closures)...")
+    local res = ctx.capture({ "nix", "profile", "diff-closures" })
+    if res.code ~= 0 then
+        ctx.fail("Ошибка анализа diff-closures: " .. (res.stderr or ""))
+        return
+    end
+
+    local out = grime.str.trim(res.stdout or "")
+    if #out == 0 then
+        grime.ui.log("Изменений между версиями профиля Nix не обнаружено.")
+        ctx.success("no_diff")
+    else
+        print(string.format("\n\27[1mИзменения замыканий профиля Nix:\27[0m\n"))
+        print(out)
+        print()
+        ctx.success(out)
+    end
+end
+
 local function print_help()
     print(string.format([[
 %s%sGrime Nix%s — Управление Nix-окружениями разработки и профилями
@@ -272,14 +673,26 @@ local function print_help()
     grime nix [команда] [аргументы/пакеты...]
 
 %sКОМАНДЫ:%s
-    %sinit, create, new%s      Создать shell.nix для проекта (с автоопределением зависимостей)
+    %sbuild, b%s                Сборка проекта в изолированном Nix (эфемерно без изменения репозитория)
+                          grime nix build [проект/путь]
+    %sinit, create, new%s      Создать shell.nix для проекта (с автоопределением тулчейна)
                           grime nix init [пакеты...] [--force]
-    %sflake%s                  Создать flake.nix для проекта
+    %sflake%s                  Создать постоянный flake.nix в корне проекта
                           grime nix flake [пакеты...] [--force]
     %senter, shell, sh%s      Войти в изолированный devShell (nix develop / nix-shell)
                           grime nix enter [--pure]
     %srun, exec%s             Выполнить команду в Nix-окружении
                           grime nix run <команда...> [--pure]
+    %shistory, hist%s          История поколений профиля пользователя Nix
+                          grime nix history
+    %srollback%s               Откатить профиль Nix на предыдущее или указанное поколение
+                          grime nix rollback [--to <N>]
+    %supdate, up%s             Обновить входные зависимости флейка (nix flake update)
+                          grime nix update [каталог]
+    %sbundle%s                 Упаковать цель в автономный переносимый бинарник (nix bundle)
+                          grime nix bundle [цель] [-o вывод]
+    %sdiff%s                   Анализ изменений замыканий профиля (diff-closures)
+                          grime nix diff
     %sinstall, i%s            Установить пакеты в профиль пользователя Nix
                           grime nix install <пакеты...>
     %suninstall%s              Удалить пакеты из профиля пользователя Nix
@@ -295,12 +708,18 @@ local function print_help()
 %sФЛАГИ:%s
     %s--force, -f%s           Перезаписать существующий файл shell.nix / flake.nix
     %s--pure%s                Изолированный запуск без переменных хоста
+    %s--to <N>%s              Целевое поколение для отката (rollback)
+    %s-o, --out-link%s        Путь для сохранения бандла (bundle)
 
 %sПРИМЕРЫ:%s
-    grime nix init cmake ninja gcc          # Создание shell.nix для C++ проекта
+    grime nix build                         # Эфемерная сборка проекта в Nix Flake
+    grime nix history                       # Просмотр истории поколений профиля
+    grime nix rollback                      # Откат профиля на предыдущую версию
+    grime nix update                        # Обновление зависимостей flake.lock
+    grime nix bundle nixpkgs#hello          # Упаковка в автономный переносимый бинарник
+    grime nix diff                          # Анализ различий замыканий профиля
+    grime nix flake                         # Создание flake.nix с авто-тулчейном
     grime nix enter                         # Вход в devShell
-    grime nix run -- ninja build            # Сборка внутри devShell
-    grime nix gc                            # Очистка мусора Nix store
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -315,7 +734,15 @@ local function print_help()
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
     "\27[1m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
     "\27[1m", "\27[0m"
@@ -370,7 +797,15 @@ function main()
         table.insert(command_tokens, t)
     end
 
-    if action == "init" then
+    if parsed.target_dir and ctx.is_dir(parsed.target_dir) then
+        target_dir = ctx.normalize_path(parsed.target_dir)
+    elseif #command_tokens > 0 and ctx.is_dir(command_tokens[1]) then
+        target_dir = ctx.normalize_path(table.remove(command_tokens, 1))
+    end
+
+    if action == "build" then
+        handle_build(target_dir, command_tokens)
+    elseif action == "init" then
         handle_init(target_dir, command_tokens, parsed.flags.force)
         if ctx.has_next_step then
             ctx.module_return(target_dir)
@@ -397,6 +832,39 @@ function main()
         handle_uninstall(command_tokens)
     elseif action == "check" then
         handle_check(target_dir)
+    elseif action == "history" then
+        handle_history()
+    elseif action == "rollback" then
+        local to_gen = nil
+        for i, a in ipairs(command_tokens) do
+            if a == "--to" and command_tokens[i + 1] then
+                to_gen = command_tokens[i + 1]
+                break
+            elseif tostring(a):match("^%d+$") then
+                to_gen = a
+                break
+            end
+        end
+        handle_rollback(to_gen)
+    elseif action == "update" then
+        handle_update(target_dir)
+    elseif action == "bundle" then
+        local out_link = nil
+        local clean_tokens = {}
+        local skip_next = false
+        for i, a in ipairs(command_tokens) do
+            if skip_next then
+                skip_next = false
+            elseif (a == "-o" or a == "--out-link") and command_tokens[i + 1] then
+                out_link = command_tokens[i + 1]
+                skip_next = true
+            else
+                table.insert(clean_tokens, a)
+            end
+        end
+        handle_bundle(target_dir, clean_tokens, out_link)
+    elseif action == "diff" then
+        handle_diff()
     else
         ctx.fail("Неизвестное действие: " .. action)
     end

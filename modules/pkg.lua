@@ -330,11 +330,19 @@ local function get_distrobox_packages(box_name, all_mode)
     if not box_name then return nil, "Контейнер distrobox не найден" end
     local qcmd
     if not all_mode then
-        -- По умолчанию: только установленные пользователем пакеты
-        qcmd = 'dnf -C repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null || ' ..
-               'dnf repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null || ' ..
-               'pacman -Qe 2>/dev/null || ' ..
-               '(apt-mark showmanual 2>/dev/null)'
+        -- По умолчанию: только установленные непосредственно пользователем пакеты
+        local b64_script = "aW1wb3J0IHNxbGl0ZTMsIHN1YnByb2Nlc3MsIG9zCmRiID0gIi91c3IvbGliL3N5c2ltYWdlL2xpYmRuZjUvdHJhbnNhY3Rpb25faGlzdG9yeS5zcWxpdGUiCmlmIG9zLnBhdGguZXhpc3RzKGRiKToKICAgIHRyeToKICAgICAgICBjb24gPSBzcWxpdGUzLmNvbm5lY3QoZGIpCiAgICAgICAgY3VyID0gY29uLmN1cnNvcigpCiAgICAgICAgYmFzZV9pZHMgPSBbclswXSBmb3IgciBpbiBjdXIuZXhlY3V0ZSgiU0VMRUNUIGlkIEZST00gdHJhbnMgV0hFUkUgZGVzY3JpcHRpb24gTElLRSAnJWtpd2klJyBPUiBpZCA9IDEiKS5mZXRjaGFsbCgpXQogICAgICAgIGJhc2VfaWQgPSBtYXgoYmFzZV9pZHMpIGlmIGJhc2VfaWRzIGVsc2UgMQogICAgICAgIHEgPSAiU0VMRUNUIERJU1RJTkNUIHBuLm5hbWUgRlJPTSB0cmFucyB0IEpPSU4gdHJhbnNfaXRlbSB0aSBPTiB0aS50cmFuc19pZCA9IHQuaWQgSk9JTiB0cmFuc19pdGVtX2FjdGlvbiB0aWEgT04gdGlhLmlkID0gdGkuYWN0aW9uX2lkIEpPSU4gdHJhbnNfaXRlbV9yZWFzb24gdGlyIE9OIHRpci5pZCA9IHRpLnJlYXNvbl9pZCBKT0lOIGl0ZW0gaXQgT04gaXQuaWQgPSB0aS5pdGVtX2lkIEpPSU4gcnBtIHIgT04gci5pdGVtX2lkID0gaXQuaWQgSk9JTiBwa2dfbmFtZSBwbiBPTiBwbi5pZCA9IHIubmFtZV9pZCBXSEVSRSB0LmlkID4gPyBBTkQgdGlhLm5hbWUgPSAnSW5zdGFsbCcgQU5EIHRpci5uYW1lID0gJ1VzZXInIgogICAgICAgIHBrZ3MgPSBbclswXSBmb3IgciBpbiBjdXIuZXhlY3V0ZShxLCAoYmFzZV9pZCwpKS5mZXRjaGFsbCgpXQogICAgICAgIGlmIHBrZ3M6CiAgICAgICAgICAgIHJlcyA9IHN1YnByb2Nlc3MucnVuKFsicnBtIiwgIi1xIiwgIi0tcWYiLCAiJXtOQU1FfSAle1ZFUlNJT059XG4iXSArIHBrZ3MsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICAgICAgZm9yIGxpbmUgaW4gcmVzLnN0ZG91dC5zdHJpcCgpLnNwbGl0KCJcbiIpOgogICAgICAgICAgICAgICAgaWYgbGluZSBhbmQgIm5vdCBpbnN0YWxsZWQiIG5vdCBpbiBsaW5lOgogICAgICAgICAgICAgICAgICAgIHByaW50KGxpbmUpCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHBhc3MK"
+        qcmd = 'if [ -f /usr/lib/sysimage/libdnf5/transaction_history.sqlite ] && command -v python3 >/dev/null 2>&1; then ' ..
+               'echo "' .. b64_script .. '" | base64 -d | python3; ' ..
+               'elif command -v dnf >/dev/null 2>&1 && dnf history userinstalled >/dev/null 2>&1; then ' ..
+               'dnf history userinstalled 2>/dev/null; ' ..
+               'elif command -v pacman >/dev/null 2>&1; then ' ..
+               'pacman -Qe 2>/dev/null; ' ..
+               'elif command -v apt-mark >/dev/null 2>&1; then ' ..
+               '(apt-mark showmanual 2>/dev/null | xargs -r dpkg-query -W -f="${Package} ${Version}\n" 2>/dev/null); ' ..
+               'else ' ..
+               'dnf -C repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null || dnf repoquery --userinstalled --qf "%{NAME} %{VERSION}\n" 2>/dev/null; ' ..
+               'fi'
     else
         -- Если флаг -a / --all: все установленные пакеты
         qcmd = 'rpm -qa --qf "%{NAME} %{VERSION}-%{RELEASE}\n" 2>/dev/null || ' ..
@@ -452,8 +460,11 @@ local function get_packages_for_manager(mgr, all_mode)
 end
 
 -- 1. Сводная таблица активных пакетных менеджеров
-local function handle_summary(all_mode)
+local function handle_summary(all_mode, show_all_managers)
     local mode_badge = all_mode and "\27[33m[ВСЕ ПАКЕТЫ И ЗАВИСИМОСТИ]\27[0m" or "\27[32m[ПОЛЬЗОВАТЕЛЬСКИЕ]\27[0m"
+    if show_all_managers then
+        mode_badge = mode_badge .. " \27[36m[ВСЕ МЕНЕДЖЕРЫ]\27[0m"
+    end
     io.stdout:write(string.format("\n\27[1m📦 Обзор активных пакетных менеджеров системы %s:\27[0m\n", mode_badge))
     io.stdout:write(string.rep("─", 80) .. "\n")
     io.stdout:write(string.format("  \27[1m%s %s %s %s\27[0m\n",
@@ -465,6 +476,7 @@ local function handle_summary(all_mode)
 
     local managers = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local active_count = 0
+    local shown_managers = {}
 
     for _, mgr in ipairs(managers) do
         local bin = MANAGER_BINARIES[mgr]
@@ -473,44 +485,52 @@ local function handle_summary(all_mode)
             is_installed = has_binary(bin)
         end
 
-        local display_name = mgr
-        local status_raw = "Активен"
-        local status_color = "\27[32m"
-        local count_str = "-"
-        local preview_str = ""
+        if is_installed or show_all_managers then
+            local display_name = mgr
+            local status_raw = "Активен"
+            local status_color = "\27[32m"
+            local count_str = "-"
+            local preview_str = ""
 
-        if not is_installed then
-            status_raw = "Не установлен"
-            status_color = "\27[90m"
-        else
-            local pkgs, extra = get_packages_for_manager(mgr, all_mode)
-            if pkgs then
-                active_count = active_count + 1
-                local count = #pkgs
-                count_str = string.format("%d", count)
-                if mgr == "distrobox" and extra then
-                    display_name = string.format("distrobox (%s)", extra)
-                end
-
-                if count > 0 then
-                    local p_names = {}
-                    for i = 1, math.min(count, 4) do
-                        table.insert(p_names, pkgs[i].name)
-                    end
-                    preview_str = table.concat(p_names, ", ")
-                    if count > 4 then preview_str = preview_str .. "..." end
-                else
-                    preview_str = "\27[90m(нет пакетов)\27[0m"
-                end
+            if not is_installed then
+                status_raw = "Не установлен"
+                status_color = "\27[90m"
             else
-                status_raw = "Недоступен"
-                status_color = "\27[31m"
-                preview_str = "\27[90m" .. tostring(extra or "") .. "\27[0m"
-            end
-        end
+                local pkgs, extra = get_packages_for_manager(mgr, all_mode)
+                if pkgs then
+                    active_count = active_count + 1
+                    table.insert(shown_managers, mgr)
+                    local count = #pkgs
+                    count_str = string.format("%d", count)
+                    if mgr == "distrobox" and extra then
+                        display_name = string.format("distrobox (%s)", extra)
+                    end
 
-        local status_col = status_color .. pad_utf8(status_raw, 16) .. "\27[0m"
-        io.stdout:write(string.format("  %-24s %s %-10s %s\n", display_name, status_col, count_str, preview_str))
+                    if count > 0 then
+                        local p_names = {}
+                        for i = 1, math.min(count, 4) do
+                            table.insert(p_names, pkgs[i].name)
+                        end
+                        preview_str = table.concat(p_names, ", ")
+                        if count > 4 then preview_str = preview_str .. "..." end
+                    else
+                        preview_str = "\27[90m(нет пакетов)\27[0m"
+                    end
+                else
+                    status_raw = "Недоступен"
+                    status_color = "\27[31m"
+                    preview_str = "\27[90m" .. tostring(extra or "") .. "\27[0m"
+                    table.insert(shown_managers, mgr)
+                end
+            end
+
+            local status_col = status_color .. pad_utf8(status_raw, 16) .. "\27[0m"
+            io.stdout:write(string.format("  %-24s %s %-10s %s\n", display_name, status_col, count_str, preview_str))
+        end
+    end
+
+    if active_count == 0 and not show_all_managers then
+        io.stdout:write("  \27[90m(не обнаружено активных пакетных менеджеров)\27[0m\n")
     end
 
     io.stdout:write(string.rep("─", 80) .. "\n")
@@ -520,9 +540,16 @@ local function handle_summary(all_mode)
     else
         io.stdout:write("  • Показать только пользовательские пакеты : \27[36mgrime pkg\27[0m\n")
     end
+    if not show_all_managers then
+        io.stdout:write("  • Показать все поддерживаемые менеджеры  : \27[36mgrime pkg -v\27[0m (или \27[36mgrime pkg --all-managers\27[0m)\n")
+    else
+        io.stdout:write("  • Скрыть не установленные менеджеры      : \27[36mgrime pkg\27[0m\n")
+    end
     io.stdout:write("  • Список пакетов менеджера               : \27[36mgrime pkg <менеджер> [-a]\27[0m (например: \27[36mgrime pkg pacman\27[0m, \27[36mgrime pkg box -a\27[0m)\n")
     io.stdout:write("  • Сквозной поиск пакета                  : \27[36mgrime pkg <имя_пакета> [-a]\27[0m (например: \27[36mgrime pkg git\27[0m, \27[36mgrime pkg nvim -a\27[0m)\n")
     io.stdout:write("  • Подробная справка                      : \27[36mgrime pkg --help\27[0m\n\n")
+
+    return shown_managers
 end
 
 -- 2. Детальный список установленных пакетов для указанного менеджера
@@ -826,7 +853,7 @@ local function print_help()
 %s%sGrime Pkg%s — Унифицированное управление пакетами хоста, контейнеров и окружений
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime pkg [-a, --all]                   # Сводная таблица (по умолчанию: пользовательские пакеты; -a: все пакеты)
+    grime pkg [-a, --all] [-v, --all-managers] # Сводная таблица (по умолчанию: пользовательские пакеты; -a: все пакеты)
     grime pkg <менеджер> [-a] [фильтр]      # Список пакетов менеджера (по умолчанию: пользовательские; -a: все)
     grime pkg <пакет> [-a]                  # Сквозной нечеткий поиск пакета (по умолчанию: пользовательские; -a: все)
     grime pkg search <запрос> [-a]          # Явный сквозной нечеткий поиск
@@ -837,6 +864,8 @@ local function print_help()
 %sФЛАГИ:%s
     -a, --all, --deps                       # Выводить или искать среди ВСЕХ пакетов и зависимостей системы
                                             # (по умолчанию отображаются только явно установленные пользователем)
+    -v, --verbose, --all-managers           # Показывать все поддерживаемые менеджеры в сводке (включая не установленные)
+                                            # (по умолчанию отображаются только установленные и активные)
 
 %sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ (и их нечеткие алиасы):%s
     • pacman    (pac, arch)                 # Pacman: pacman -Qe (по умолчанию) vs pacman -Q (-a)
@@ -848,8 +877,10 @@ local function print_help()
     • pipx      (pip, python)               # Pipx: pipx list --short
 
 %sПРИМЕРЫ:%s
-    grime pkg                               # Сводная таблица пользовательских пакетов
+    grime pkg                               # Сводная таблица активных менеджеров
+    grime pkg -v                            # Сводная таблица всех поддерживаемых менеджеров (включая не установленные)
     grime pkg -a                            # Сводная таблица ВСЕХ пакетов хоста и контейнеров
+    grime pkg -a -v                         # Все менеджеры со всеми пакетами и зависимостями
     grime pkg pacman                        # Список пакетов, явно установленных в pacman
     grime pkg pacman -a                     # Список всех пакетов pacman (включая зависимости)
     grime pkg box                           # Пользовательские пакеты в Distrobox (dnf userinstalled)
@@ -881,7 +912,10 @@ function main()
     local cls = argparse.new({
         actions = ACTIONS,
         default_action = "list",
-        flags = { all = { "-a", "--all", "--deps" } },
+        flags = {
+            all = { "-a", "--all", "--deps" },
+            all_managers = { "-v", "--verbose", "--all-managers" },
+        },
     })
 
     local parsed = cls:parse(ctx.args)
@@ -893,11 +927,14 @@ function main()
     end
 
     local all_mode = (parsed.flags and parsed.flags.all == true) or false
+    local show_all_managers = (parsed.flags and parsed.flags.all_managers == true) or false
 
     local raw_tokens = {}
     for _, tok in ipairs(parsed.args) do
         if tok == "-a" or tok == "--all" or tok == "--deps" then
             all_mode = true
+        elseif tok == "-v" or tok == "--verbose" or tok == "--all-managers" then
+            show_all_managers = true
         else
             table.insert(raw_tokens, tok)
         end
@@ -905,6 +942,8 @@ function main()
     for _, t in ipairs(parsed.command_tokens) do
         if t == "-a" or t == "--all" or t == "--deps" then
             all_mode = true
+        elseif t == "-v" or t == "--verbose" or t == "--all-managers" then
+            show_all_managers = true
         else
             table.insert(raw_tokens, t)
         end
@@ -942,10 +981,9 @@ function main()
     -- Обработка действия list / вызова без аргументов / вызова по имени менеджера или поиску пакета
     if #raw_tokens == 0 then
         -- Вызов grime pkg или grime pkg -a / grime pkg list без аргументов -> сводная таблица
-        handle_summary(all_mode)
+        local shown_mgrs = handle_summary(all_mode, show_all_managers)
         if ctx.has_next_step then
-            local active_mgrs = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
-            ctx.module_return(table.concat(active_mgrs, "\n"))
+            ctx.module_return(table.concat(shown_mgrs, "\n"))
         end
         return
     end

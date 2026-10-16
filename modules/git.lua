@@ -32,6 +32,8 @@ local function print_help()
     %sdiff [файл]%s              Просмотр незафиксированных изменений
     %sbranch [имя]%s             Список веток или создание новой ветки
     %scheckout <ветка>%s         Переключение на указанную ветку
+    %sls-files [путь]%s          Быстрый срез отслеживаемых файлов без мусора
+    %ssnapshot [сообщение]%s     Моментальная точка сохранения с временной меткой
     %sinit [путь]%s              Инициализация нового Git-репозитория
     %shelp, -h, --help%s         Показать эту справку
 
@@ -96,16 +98,15 @@ function M.status(dir)
     local untracked = {}
 
     for _, line in ipairs(lines) do
-        local l = grime.str.trim(line)
-        if #l > 0 then
-            if l:sub(1, 2) == "##" then
-                branch_header = l:sub(4)
-            elseif l:sub(1, 2) == "??" then
-                table.insert(untracked, grime.str.trim(l:sub(4)))
+        if #line >= 2 then
+            if line:sub(1, 2) == "##" then
+                branch_header = grime.str.trim(line:sub(4))
+            elseif line:sub(1, 2) == "??" then
+                table.insert(untracked, grime.str.trim(line:sub(4)))
             else
-                local x = l:sub(1, 1)
-                local y = l:sub(2, 2)
-                local file = grime.str.trim(l:sub(3))
+                local x = line:sub(1, 1)
+                local y = line:sub(2, 2)
+                local file = grime.str.trim(line:sub(3))
                 if x ~= " " and x ~= "?" then
                     table.insert(staged, { flag = x, file = file })
                 end
@@ -125,6 +126,27 @@ function M.status(dir)
         untracked = untracked,
         is_clean = is_clean,
     }
+end
+
+--- Добавление файлов в индекс (git add)
+function M.add(dir, files)
+    local target = dir or ctx.target_dir or "."
+    if not M.is_git_repo(target) then
+        return nil, "Директория '" .. target .. "' не является Git-репозиторием"
+    end
+    local cmd = { "git", "add" }
+    if not files or #files == 0 then
+        table.insert(cmd, "-A")
+    else
+        for _, f in ipairs(files) do
+            table.insert(cmd, f)
+        end
+    end
+    local res = ctx.capture(cmd, target)
+    if res.code ~= 0 then
+        return nil, "Ошибка git add: " .. grime.str.trim(res.stderr or "")
+    end
+    return { success = true, files = files }
 end
 
 --- Фиксация изменений (git add + git commit)
@@ -270,6 +292,49 @@ function M.checkout(dir, branch)
     end
 end
 
+--- Быстрый срез файлов репозитория (git ls-files)
+function M.ls_files(dir, path_or_pattern)
+    local target = dir or ctx.target_dir or "."
+    if not M.is_git_repo(target) then
+        return nil, "Директория '" .. target .. "' не является Git-репозиторием"
+    end
+
+    local cmd = { "git", "ls-files" }
+    if path_or_pattern and #path_or_pattern > 0 then
+        table.insert(cmd, path_or_pattern)
+    end
+
+    local res = ctx.capture(cmd, target)
+    if res.code ~= 0 then
+        return nil, grime.str.trim(res.stderr or "Ошибка git ls-files")
+    end
+
+    local files = {}
+    for _, l in ipairs(grime.str.split(res.stdout or "", "\n")) do
+        local line = grime.str.trim(l)
+        if #line > 0 then
+            table.insert(files, line)
+        end
+    end
+    return files
+end
+
+--- Создание моментального снимка состояния (snapshot)
+function M.snapshot(dir, msg_suffix)
+    local target = dir or ctx.target_dir or "."
+    if not M.is_git_repo(target) then
+        return nil, "Директория '" .. target .. "' не является Git-репозиторием"
+    end
+
+    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    local commit_msg = "[GRIME SNAPSHOT] " .. timestamp
+    if msg_suffix and #grime.str.trim(msg_suffix) > 0 then
+        commit_msg = commit_msg .. ": " .. grime.str.trim(msg_suffix)
+    end
+
+    return M.commit(target, commit_msg, true)
+end
+
 --- Главная точка входа CLI
 function M.main()
     local args = ctx.args or {}
@@ -346,10 +411,31 @@ function M.main()
         return
     end
 
+    if subcmd == "add" then
+        local files = {}
+        for i = 2, #args do
+            table.insert(files, args[i])
+        end
+        local res, err = M.add(target_dir, files)
+        if not res then
+            ctx.fail(err)
+            return
+        end
+        grime.ui.success(string.format("Файлы добавлены в индекс Git (%d шт.)", #files > 0 and #files or 1))
+        ctx.success(target_dir)
+        return
+    end
+
     if subcmd == "commit" then
+        local auto_add = true
         local msg_tokens = {}
         for i = 2, #args do
-            table.insert(msg_tokens, args[i])
+            local a = args[i]
+            if a == "--staged" or a == "--no-add" or a == "-s" then
+                auto_add = false
+            else
+                table.insert(msg_tokens, a)
+            end
         end
         local msg = table.concat(msg_tokens, " ")
         if #msg == 0 then
@@ -358,11 +444,11 @@ function M.main()
         msg = grime.str.trim(msg)
 
         if #msg == 0 then
-            ctx.fail("Укажите сообщение коммита: grime git commit <сообщение> или передайте через пайплайн")
+            ctx.fail("Укажите сообщение коммита: grime git commit [--staged] <сообщение> или передайте через пайплайн")
             return
         end
 
-        local res, err = M.commit(target_dir, msg, true)
+        local res, err = M.commit(target_dir, msg, auto_add)
         if not res then
             ctx.fail(err or "Не удалось закоммитить изменения")
             return
@@ -462,6 +548,59 @@ function M.main()
         end
         grime.ui.success(res.message)
         ctx.success(bname)
+        return
+    end
+
+    if subcmd == "ls-files" or subcmd == "files" or subcmd == "ls_files" then
+        local filter = args[2]
+        local files, err = M.ls_files(target_dir, filter)
+        if not files then
+            ctx.fail(err)
+            return
+        end
+
+        if #files == 0 then
+            grime.ui.log("Отслеживаемые файлы не найдены.")
+            ctx.success("")
+            return
+        end
+
+        if ctx.has_next_step then
+            ctx.success(table.concat(files, "\n"))
+        else
+            print(string.format("\n%sОтслеживаемые файлы Git (%d шт.):%s", ANSI.BOLD, #files, ANSI.RESET))
+            for _, f in ipairs(files) do
+                print(string.format("  %s%s%s", ANSI.CYAN, f, ANSI.RESET))
+            end
+            print()
+            ctx.success(tostring(#files))
+        end
+        return
+    end
+
+    if subcmd == "snapshot" or subcmd == "snap" then
+        local msg_tokens = {}
+        for i = 2, #args do
+            table.insert(msg_tokens, args[i])
+        end
+        local extra_msg = table.concat(msg_tokens, " ")
+        if #extra_msg == 0 then
+            extra_msg = ctx.input or ctx.pipeline_input or ""
+        end
+
+        local res, err = M.snapshot(target_dir, extra_msg)
+        if not res then
+            ctx.fail(err or "Не удалось создать снимок репозитория")
+            return
+        end
+
+        if res.no_changes then
+            grime.ui.warn("Рабочее дерево чисто. Снимок не требуется.")
+            ctx.success(res.message)
+        else
+            grime.ui.success(string.format("Снимок состояния успешно создан [%s]: %s", res.hash, res.message))
+            ctx.success(res.hash)
+        end
         return
     end
 

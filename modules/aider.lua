@@ -3,18 +3,25 @@ local ctx = grime.ctx
 local GRIME_CONVENTIONS = [[
 
 [GRIME AGENT CONVENTIONS]:
-1. Для сохранения структурированных данных или состояния в шину Grime используйте тег:
+1. ВЫПОЛНЕНИЕ СИСТЕМНЫХ ДЕЙСТВИЙ (ОБЯЗАТЕЛЬНО):
+При запросах на системные действия (копирование 'cp', перемещение 'mv', создание директорий 'mkdir', удаление, архивация, запуск утилит) модель ОБЯЗАНА не просто советовать команду текстом, а РЕАЛЬНО ВЫПОЛНИТЬ её в одну строку через системный тег:
+<grime_spawn module="cmd">cp -r . /home/danny/Temp</grime_spawn>
+или
+<grime_exec>cp -r . /home/danny/Temp</grime_exec>
+ВНИМАНИЕ: Команда выполняется непосредственно в текущей рабочей директории ('.'). Указывайте пути относительно текущей директории '.' или абсолютные пути внутри $HOME. Команды формируйте компактно в одну строку. Использование sudo и изменение системных файлов за пределами $HOME строго запрещены!
+
+2. Для сохранения структурированных данных или состояния в шину Grime используйте тег:
 <grime_bus key="pipeline.<key>" type="json">
 {"field": "value"}
 </grime_bus>
 (Допустимые пространства имен: 'pipeline.*', 'modules.<name>.*').
 
-2. Для порождения субагента Grime (вызова другого модуля) используйте тег:
+3. Для порождения субагента Grime (вызова другого модуля) используйте тег:
 <grime_spawn module="<module_name>" cwd="<optional_cwd>">
 инструкция или аргументы для модуля
 </grime_spawn>
 
-3. Для передачи промпта следующему шагу конвейера:
+4. Для передачи промпта следующему шагу конвейера:
 <next_agent_prompt>
 инструкция для следующего агента
 </next_agent_prompt>
@@ -42,6 +49,11 @@ local function resolve_dir_or_project(arg)
     -- 1. Проверяем, существует ли как директория на диске
     if ctx.is_dir(arg) then
         return arg
+    end
+
+    local norm_arg = ctx.normalize_path and ctx.normalize_path(arg)
+    if norm_arg and ctx.is_dir(norm_arg) then
+        return norm_arg
     end
 
     -- 2. Проверяем в projects_root
@@ -304,11 +316,203 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
     end
 end
 
---- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn> и <next_agent_prompt>
-local function parse_aider_tags(output, working_dir)
+--- Проверка безопасности команд перед исполнением
+local function validate_command_security(cmd_str, target_dir)
+    if not cmd_str or cmd_str == "" then
+        return false, "[Grime Security] Команда отклонена: пустая команда."
+    end
+
+    local lower = " " .. cmd_str:lower() .. " "
+    local normalized = lower:gsub("[|&;()<>]", " ")
+
+    -- 1. БЕЗУСЛОВНЫЙ ЗАПРЕТ SUDO / ПОВЫШЕНИЯ ПРИВИЛЕГИЙ
+    if normalized:match("%s+sudo%s+")
+        or normalized:match("%s+su%s+")
+        or normalized:match("%s+doas%s+")
+        or normalized:match("%s+pkexec%s+")
+        or normalized:match("%s+chown%s+.*root")
+        or normalized:match("%s+chmod%s+.*%s+/")
+        or normalized:match("%s+chmod%s+777") then
+        return false, "[Grime Security] Команда отклонена: вызовы с правами суперпользователя (sudo) запрещены."
+    end
+
+    -- 2. ЗАПРЕТ ОПАСНЫХ ШАБЛОНОВ
+    if normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+/%s*$")
+        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+/%*")
+        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+~")
+        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+%$home")
+        or normalized:match("%f[%a]mkfs%f[%A]")
+        or normalized:match("%f[%a]fdisk%f[%A]")
+        or normalized:match("%f[%a]parted%f[%A]")
+        or normalized:match("%f[%a]dd%s+.*of=%s*/dev/")
+        or lower:match(">+%s*/dev/[a-z0-9]") then
+        return false, "[Grime Security] Команда отклонена: обнаружен опасный деструктивный шаблон."
+    end
+
+    -- 3. БЕЗУСЛОВНЫЙ ЗАПРЕТ НА ИЗМЕНЕНИЕ СИСТЕМНЫХ ФАЙЛОВ
+    local home = os.getenv("HOME") or "/home/danny"
+    local sys_dirs = { "/etc", "/usr", "/var", "/boot", "/opt", "/root", "/nix", "/sys", "/proc", "/dev", "/bin", "/sbin", "/lib", "/lib64" }
+
+    local eff_cwd = target_dir or "."
+    for _, sdir in ipairs(sys_dirs) do
+        if eff_cwd == "/" or eff_cwd == sdir or eff_cwd:sub(1, #sdir + 1) == (sdir .. "/") then
+            return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
+        end
+    end
+
+    for token in cmd_str:gmatch("[^%s|;&()]+") do
+        local clean = token:gsub("^['\"]+", ""):gsub("['\"]+$", ""):gsub("^>+", "")
+        if clean:sub(1, 1) == "/" then
+            if not clean:find(home, 1, true) then
+                if clean == "/" then
+                    return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
+                end
+                for _, sdir in ipairs(sys_dirs) do
+                    if clean == sdir or clean:sub(1, #sdir + 1) == (sdir .. "/") then
+                        return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
+                    end
+                end
+            end
+        end
+    end
+
+    return true, nil
+end
+
+--- Выполнение системного действия с информированием и валидацией безопасности
+local function execute_ai_action(cmd_str, target_dir, source_tag)
+    cmd_str = cmd_str:match("^%s*(.-)%s*$")
+    if not cmd_str or cmd_str == "" then
+        return false
+    end
+
+    -- Нормализация soft-wrap от rich/aider консоли: склеиваем строки, разорванные форматированием
+    local clean_lines = {}
+    for line in cmd_str:gmatch("[^\r\n]+") do
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed ~= "" then
+            table.insert(clean_lines, trimmed)
+        end
+    end
+
+    local normalized_cmd = ""
+    for i, line in ipairs(clean_lines) do
+        if i == 1 then
+            normalized_cmd = line
+        else
+            local prev_ends_with_op = normalized_cmd:match("[;&|]$") or normalized_cmd:match("&&$") or normalized_cmd:match("\\$")
+            local is_continuation = line:match("^[%-~/%.]") or (not prev_ends_with_op and not line:match("^[%a_][%w_]*%s"))
+            if is_continuation and not prev_ends_with_op then
+                normalized_cmd = normalized_cmd .. " " .. line
+            else
+                normalized_cmd = normalized_cmd .. "\n" .. line
+            end
+        end
+    end
+    cmd_str = normalized_cmd
+
+    local ok, err_msg = validate_command_security(cmd_str, target_dir)
+    if not ok then
+        io.stderr:write(string.format("\27[1;31m%s\27[0m\n", err_msg))
+        ctx.warn(err_msg)
+        return false, err_msg
+    end
+
+    io.stdout:write(string.format("\27[1;32m[Grime AI Execution] Выполняю действие: %s\27[0m\n", cmd_str))
+    ctx.log(string.format("[Grime AI Execution] Выполняю действие: %s (cwd=%s)", cmd_str, target_dir or "."))
+
+    local home = os.getenv("HOME") or "/home/danny"
+    local shell_cmd = cmd_str:gsub("~/", home .. "/")
+
+    -- Если Aider вывел относительный путь от корня git-репозитория (например 'ghostty/config.ghostty'),
+    -- а рабочей директорией уже является эта самая папка 'ghostty', устраняем лишний префикс
+    if target_dir then
+        local folder_name = target_dir:match("([^/]+)$")
+        if folder_name and folder_name ~= "" then
+            local prefix_pattern = "%f[%w]" .. folder_name .. "/"
+            if shell_cmd:find(prefix_pattern) then
+                -- Проверяем, существует ли файл без префикса
+                local cand_cmd = shell_cmd:gsub(prefix_pattern, "")
+                shell_cmd = cand_cmd
+            end
+        end
+    end
+
+    local res = ctx.capture({ "sh", "-c", shell_cmd }, target_dir)
+    if res.stdout and res.stdout ~= "" then
+        io.stdout:write(res.stdout)
+        if not res.stdout:match("\n$") then
+            io.stdout:write("\n")
+        end
+    end
+    if res.stderr and res.stderr ~= "" then
+        io.stderr:write(res.stderr)
+        if not res.stderr:match("\n$") then
+            io.stderr:write("\n")
+        end
+    end
+
+    if res.code == 0 then
+        ctx.log(string.format("✓ Действие успешно выполнено: %s", cmd_str))
+        return true, nil
+    else
+        local fail_msg = string.format("Действие завершилось с кодом %d: %s", res.code, res.stderr or "")
+        ctx.warn(fail_msg)
+        return false, fail_msg
+    end
+end
+
+--- Умный фоллбэк: если пользователь просит действие, а модель вывела shell-команду в markdown без тега
+local function handle_action_fallback(user_prompt, output, working_dir, has_executed_action)
+    if has_executed_action then
+        return
+    end
+    if not user_prompt or user_prompt == "" or not output or output == "" then
+        return
+    end
+
+    local p_low = user_prompt:lower()
+    local is_action_request = false
+    local action_keywords = {
+        "скопируй", "скопировать", "копируй", "копировать",
+        "перемести", "переместить", "перенеси", "перенести",
+        "создай", "создать", "удали", "удалить",
+        "архивируй", "заархивируй", "распакуй", "распаковать",
+        "запусти", "выполни", "сделай",
+        "copy", "move", "create", "delete", "remove", "archive", "extract", "run", "execute"
+    }
+    for _, kw in ipairs(action_keywords) do
+        if p_low:find(kw, 1, true) then
+            is_action_request = true
+            break
+        end
+    end
+
+    if not is_action_request then
+        return
+    end
+
+    for block_type, code_block in output:gmatch("```([a-zA-Z0-9_-]*)\r?\n(.-)```") do
+        local b_low = block_type:lower()
+        if b_low == "sh" or b_low == "bash" or b_low == "shell" or b_low == "zsh" or b_low == "" then
+            for line in code_block:gmatch("[^\r\n]+") do
+                local trimmed = line:match("^%s*(.-)%s*$")
+                if trimmed ~= "" and not trimmed:match("^#") then
+                    trimmed = trimmed:gsub("^%$%s+", "")
+                    execute_ai_action(trimmed, working_dir, "markdown_fallback")
+                end
+            end
+        end
+    end
+end
+
+--- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn>, <grime_exec> и <next_agent_prompt>
+local function parse_aider_tags(output, working_dir, user_prompt)
     if not output or output == "" then
         return nil
     end
+
+    local has_executed_action = false
 
     -- 1. Обработка тегов <grime_bus key="..." [type="json"]>...</grime_bus>
     for open_tag, content in output:gmatch("<grime_bus(.-)>(.-)</grime_bus>") do
@@ -334,7 +538,18 @@ local function parse_aider_tags(output, working_dir)
         end
     end
 
-    -- 2. Обработка тегов <grime_spawn module="..." [cwd="..."]>...</grime_spawn>
+    -- 2. Обработка тегов <grime_exec [cwd="..."]>...</grime_exec>
+    for open_tag, exec_content in output:gmatch("<grime_exec(.-)>(.-)</grime_exec>") do
+        local target_cwd = open_tag:match('cwd%s*=%s*"([^"]+)"') or open_tag:match("cwd%s*=%s*'([^']+)'") or working_dir
+        target_cwd = ctx.normalize_path(target_cwd)
+        local cmd_str = exec_content:match("^%s*(.-)%s*$")
+        if cmd_str and cmd_str ~= "" then
+            has_executed_action = true
+            execute_ai_action(cmd_str, target_cwd, "grime_exec")
+        end
+    end
+
+    -- 3. Обработка тегов <grime_spawn module="..." [cwd="..."]>...</grime_spawn>
     local grime_bin = os.getenv("GRIME_BIN")
     if not grime_bin or grime_bin == "" then
         local home = os.getenv("HOME") or ""
@@ -354,33 +569,44 @@ local function parse_aider_tags(output, working_dir)
         local prompt = spawn_content:match("^%s*(.-)%s*$")
         if target_mod and target_mod ~= "" then
             target_cwd = ctx.normalize_path(target_cwd)
-            ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
 
-            local spawn_cmd = { grime_bin, target_mod }
-            if prompt ~= "" then
-                if target_mod == "aider" then
-                    table.insert(spawn_cmd, "-m")
-                    table.insert(spawn_cmd, prompt)
-                else
-                    for tok in prompt:gmatch("%S+") do
-                        table.insert(spawn_cmd, tok)
+            if target_mod == "cmd" then
+                has_executed_action = true
+                execute_ai_action(prompt, target_cwd, "grime_spawn")
+            else
+                ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
+
+                local spawn_cmd = { grime_bin, target_mod }
+                if prompt ~= "" then
+                    if target_mod == "aider" then
+                        table.insert(spawn_cmd, "-m")
+                        table.insert(spawn_cmd, prompt)
+                    else
+                        for tok in prompt:gmatch("%S+") do
+                            table.insert(spawn_cmd, tok)
+                        end
                     end
                 end
-            end
 
-            local sres = ctx.capture(spawn_cmd, target_cwd)
-            if sres.code == 0 then
-                ctx.log(string.format("✓ Субагент '%s' успешно завершил работу.", target_mod))
-                if sres.stdout and sres.stdout ~= "" then
-                    parse_aider_tags(sres.stdout, target_cwd)
+                local sres = ctx.capture(spawn_cmd, target_cwd)
+                if sres.code == 0 then
+                    ctx.log(string.format("✓ Субагент '%s' успешно завершил работу.", target_mod))
+                    if sres.stdout and sres.stdout ~= "" then
+                        parse_aider_tags(sres.stdout, target_cwd, prompt)
+                    end
+                else
+                    ctx.warn(string.format("Субагент '%s' завершился с кодом %d: %s", target_mod, sres.code, sres.stderr))
                 end
-            else
-                ctx.warn(string.format("Субагент '%s' завершился с кодом %d: %s", target_mod, sres.code, sres.stderr))
             end
         end
     end
 
-    -- 3. Извлечение мастер-промпта следующего шага
+    -- 4. Умный фоллбэк: если пользователь просит действие, а модель вывела shell-команду в markdown без тега
+    if not has_executed_action and user_prompt then
+        handle_action_fallback(user_prompt, output, working_dir, has_executed_action)
+    end
+
+    -- 5. Извлечение мастер-промпта следующего шага
     local next_prompt = output:match("<next_agent_prompt>(.-)</next_agent_prompt>")
     if next_prompt then
         local extracted = next_prompt:match("^%s*(.-)%s*$")
@@ -720,14 +946,17 @@ function main()
         local has_exit = false
         local has_yes = false
         local has_fancy = false
+        local has_pretty = false
         for _, a in ipairs(remaining_args) do
             if a == "--exit" then has_exit = true end
             if a == "--yes-always" or a == "--yes" then has_yes = true end
             if a == "--no-fancy-input" or a == "--fancy-input" then has_fancy = true end
+            if a == "--no-pretty" or a == "--pretty" then has_pretty = true end
         end
         if not has_exit then table.insert(aider_cmd, "--exit") end
         if not has_yes then table.insert(aider_cmd, "--yes-always") end
         if not has_fancy then table.insert(aider_cmd, "--no-fancy-input") end
+        if not has_pretty then table.insert(aider_cmd, "--no-pretty") end
     end
 
     -- Подключение файлов проекта по умолчанию (если явно не указаны)
@@ -762,8 +991,8 @@ function main()
         io.stderr:write(cleaned_stderr)
 
         if res.code == 0 then
-            -- Парсинг тегов взаимодействия Grime (<grime_bus>, <grime_spawn>, <next_agent_prompt>)
-            local extracted = parse_aider_tags(res.stdout, working_dir)
+            -- Парсинг тегов взаимодействия Grime (<grime_bus>, <grime_spawn>, <grime_exec>, <next_agent_prompt>)
+            local extracted = parse_aider_tags(res.stdout, working_dir, user_message)
             if not extracted or extracted == "" then
                 extracted = res.stdout:match("^%s*(.-)%s*$")
             end
@@ -804,6 +1033,9 @@ end
 local M = {
     classify_stack = classify_stack,
     run_dev = run_dev,
+    validate_command_security = validate_command_security,
+    execute_ai_action = execute_ai_action,
+    parse_aider_tags = parse_aider_tags,
 }
 return M
 

@@ -16,11 +16,18 @@ function JavaAdapter.new()
     return self
 end
 
+local function file_exists(p)
+    if grime and grime.fs and grime.fs.exists then return grime.fs.exists(p) end
+    local f = io.open(p, "r")
+    if f then f:close(); return true end
+    return false
+end
+
 function JavaAdapter:get_nix_packages(root)
-    if grime.fs.exists(root .. "/pom.xml") then
+    if file_exists(root .. "/pom.xml") then
         return { "jdk", "maven" }
     end
-    if grime.fs.exists(root .. "/build.gradle") then
+    if file_exists(root .. "/build.gradle") then
         return { "jdk", "gradle" }
     end
     return { "jdk" }

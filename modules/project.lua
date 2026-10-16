@@ -231,13 +231,18 @@ local function resolve_project_context(parsed)
         return action, target_lang_dir, lang, extra_args
     end
 
-    -- 5. Текущая папка вызова
+    -- 5. Запрос пути без указания проекта -> возвращаем корень проектов
+    if action == "path" then
+        return action, projects_root, "cpp", extra_args
+    end
+
+    -- 6. Текущая папка вызова
     local detected_lang = detect_language(ctx.target_dir)
     if detected_lang then
         return action, ctx.target_dir, detected_lang, extra_args
     end
 
-    -- 6. Дефолтный проект
+    -- 7. Дефолтный проект
     local default_lang = lang or "cpp"
     local default_dir = get_language_dir(projects_root, default_lang) .. "/default_project"
     return action, default_dir, default_lang, extra_args
@@ -316,6 +321,7 @@ function main()
             path_requested = { "path", "-p", "--path", "-path" },
             help = { "help", "-h", "--help" },
             force = { "-f", "--force", "-force" },
+            nix = { "--nix" },
         },
         categories = { language = LANGUAGE_ALIASES },
         detect_dir = true,
@@ -390,6 +396,37 @@ function main()
             ctx.fail("директория проекта " .. project_dir .. " не найдена!")
             return
         end
+
+        local use_nix = (parsed.flags and parsed.flags.nix) or false
+        local missing_tools = {}
+
+        if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
+            local ok, missing = adapter:check_dependencies(ctx)
+            if not ok then
+                use_nix = true
+                missing_tools = missing
+            end
+        end
+
+        if use_nix and not os.getenv("IN_NIX_SHELL") then
+            if #missing_tools > 0 then
+                ctx.log(string.format("⚡ [Grime Smart Fallback] На хосте отсутствуют утилиты: %s. Автопереключение сборки в изолированный Nix...", table.concat(missing_tools, ", ")))
+            else
+                ctx.log("⚡ [Grime Nix] Сборка перенаправлена в изолированное Nix-окружение (--nix)...")
+            end
+            local code = ctx.run_process({ "grime", "nix", "build", project_dir })
+            if code ~= 0 then
+                ctx.fail("Сборка в изолированном Nix окружении завершилась с ошибкой.")
+                return
+            end
+            ctx.log("Сборка успешно завершена через Nix!")
+            if ctx.has_next_step or return_path_requested then
+                local target = adapter:get_target(project_dir)
+                ctx.module_return(target or project_dir)
+            end
+            return
+        end
+
         local ok = adapter:build(project_dir, ctx)
         if not ok then
             ctx.fail("Сборка проекта завершилась ошибкой.")
@@ -410,9 +447,29 @@ function main()
         local src_dir = project_dir .. "/" .. adapter.src_dir
         if not target or ctx.needs_rebuild(src_dir, target) then
             ctx.log("Обнаружены изменения в исходниках. Запуск сборки...")
-            if not adapter:build(project_dir, ctx) then
-                ctx.fail("Сборка упала, запуск отменен.")
-                return
+            local use_nix = (parsed.flags and parsed.flags.nix) or false
+            local missing_tools = {}
+            if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
+                local ok, missing = adapter:check_dependencies(ctx)
+                if not ok then
+                    use_nix = true
+                    missing_tools = missing
+                end
+            end
+            if use_nix and not os.getenv("IN_NIX_SHELL") then
+                if #missing_tools > 0 then
+                    ctx.log(string.format("⚡ [Grime Smart Fallback] На хосте отсутствуют утилиты: %s. Автопереключение сборки в изолированный Nix...", table.concat(missing_tools, ", ")))
+                end
+                local code = ctx.run_process({ "grime", "nix", "build", project_dir })
+                if code ~= 0 then
+                    ctx.fail("Сборка упала в Nix, запуск отменен.")
+                    return
+                end
+            else
+                if not adapter:build(project_dir, ctx) then
+                    ctx.fail("Сборка упала, запуск отменен.")
+                    return
+                end
             end
         end
 

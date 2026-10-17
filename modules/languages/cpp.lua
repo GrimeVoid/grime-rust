@@ -1,4 +1,5 @@
 local BaseAdapter = require("languages.base")
+local utils = require("languages.utils")
 
 local CppAdapter = setmetatable({}, { __index = BaseAdapter })
 CppAdapter.__index = CppAdapter
@@ -16,18 +17,12 @@ function CppAdapter.new()
     return self
 end
 
-local function file_exists(p)
-    if grime and grime.fs and grime.fs.exists then return grime.fs.exists(p) end
-    local f = io.open(p, "r")
-    if f then f:close(); return true end
-    return false
-end
 
 function CppAdapter:get_nix_packages(root)
-    if file_exists(root .. "/CMakeLists.txt") then
+    if utils.file_exists(root .. "/CMakeLists.txt") then
         return { "cmake", "gcc", "ninja", "pkg-config" }
     end
-    if file_exists(root .. "/Makefile") then
+    if utils.file_exists(root .. "/Makefile") then
         return { "gnumake", "gcc" }
     end
     return { "gcc" }
@@ -91,9 +86,9 @@ end
 function CppAdapter:check_dependencies(ctx, root)
     root = root or ctx.target_dir
     local needed = {}
-    if root and file_exists(root .. "/CMakeLists.txt") then
+    if root and utils.file_exists(root .. "/CMakeLists.txt") then
         needed = { "cmake", "ninja" }
-    elseif root and file_exists(root .. "/Makefile") then
+    elseif root and utils.file_exists(root .. "/Makefile") then
         needed = { "make" }
     else
         needed = { "g++" }
@@ -101,18 +96,7 @@ function CppAdapter:check_dependencies(ctx, root)
 
     local missing = {}
     for _, bin in ipairs(needed) do
-        local found = false
-        if grime and grime.process and grime.process.which then
-            local p = grime.process.which(bin)
-            if p and #p > 0 then found = true end
-        end
-        if not found and ctx and ctx.capture then
-            local res = ctx.capture("which " .. bin .. " 2>/dev/null")
-            if res and res.code == 0 and res.stdout and #res.stdout > 0 then
-                found = true
-            end
-        end
-        if not found then
+        if not utils.has_binary(bin, ctx) then
             table.insert(missing, bin)
         end
     end
@@ -121,22 +105,22 @@ end
 
 function CppAdapter:get_target(root, ctx)
     local proj_name = root:match("([^/\\]+)$") or "main"
-    if file_exists(root .. "/CMakeLists.txt") then
+    if utils.file_exists(root .. "/CMakeLists.txt") then
         local build_target = root .. "/build/" .. proj_name
-        if file_exists(build_target) then
+        if utils.file_exists(build_target) then
             return build_target
         end
-        if file_exists(root .. "/build/main") then
+        if utils.file_exists(root .. "/build/main") then
             return root .. "/build/main"
         end
         return BaseAdapter.get_target(self, root) or build_target
     end
 
     -- Если CMakeLists.txt отсутствует: возвращать прямой бинарник (<root>/<target>)
-    if file_exists(root .. "/" .. proj_name) then
+    if utils.file_exists(root .. "/" .. proj_name) then
         return root .. "/" .. proj_name
     end
-    if file_exists(root .. "/main") then
+    if utils.file_exists(root .. "/main") then
         return root .. "/main"
     end
     return root .. "/" .. proj_name

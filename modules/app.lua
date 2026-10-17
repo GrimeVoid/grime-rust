@@ -1,10 +1,24 @@
-local ctx = grime.ctx
+local utils = require("languages.utils")
 local BaseAdapter = require("languages.base")
 local scanner = require("languages.scanner")
 local aider = require("aider")
 local box = require("box")
 local git = require("git")
 local log = require("log")
+
+-- Модульные переменные file-scope
+local ctx = grime.ctx
+local ui = grime.ui
+local str = grime.str
+local fs = grime.fs
+local HOME = os.getenv("HOME") or ""
+local ANSI = utils.ANSI
+local utf8_len = utils.utf8_len
+local pad_utf8 = utils.pad_utf8
+
+local function get_apps_root()
+    return utils.get_apps_root(ctx)
+end
 
 if grime and not grime.call then
     grime.call = function(...)
@@ -36,7 +50,6 @@ if grime and not grime.capture then
     end
 end
 
-
 local DEFAULT_NIX = {
     cpp = { "cmake", "ninja", "gcc" },
     rust = { "cargo", "rustc" },
@@ -44,21 +57,7 @@ local DEFAULT_NIX = {
     java = { "jdk17", "maven" },
     lua = { "lua5_4" },
     generic = { "gcc", "bashInteractive", "coreutils" },
-    polyglot = { "gcc", "python3" },
 }
-
-local ANSI = {
-    BOLD = "\27[1m", RESET = "\27[0m", GREEN = "\27[32m",
-    YELLOW = "\27[33m", RED = "\27[31m", CYAN = "\27[36m",
-    PURPLE = "\27[35m", BLUE = "\27[34m"
-}
-
-local function get_apps_root()
-    local root = (ctx.paths and ctx.paths.apps) or (ctx.get_path and ctx.get_path("apps")) or (ctx.apps_root and ctx.apps_root()) or ((os.getenv("HOME") or "") .. "/.config/grime/apps")
-    root = ctx.normalize_path(root)
-    if not ctx.exists(root) then ctx.mkdir_p(root) end
-    return root
-end
 
 local function get_state_file()
     local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
@@ -187,99 +186,9 @@ local function extract_nix_packages(app_dir, m)
         end
     end
 
-    -- Разделение на nativeBuildInputs (тулчейн) и buildInputs (библиотеки)
-    local native = {}
-    local libs = {}
-    local native_set = {}
-    local libs_set = {}
-
-    for _, p in ipairs(all_pkgs) do
-        local clean = p:gsub("^pkgs%.", "")
-        if scanner.is_toolchain_package(clean) then
-            if not native_set[clean] then
-                native_set[clean] = true
-                table.insert(native, clean)
-            end
-        else
-            if not libs_set[clean] then
-                libs_set[clean] = true
-                table.insert(libs, clean)
-            end
-        end
-    end
-
-    if #native == 0 then
-        table.insert(native, "bashInteractive")
-    end
-
-    return native, libs
+    return utils.split_packages(all_pkgs, scanner)
 end
 
-local function generate_flake_nix(app_name, native_pkgs, lib_pkgs)
-    local native_lines = {}
-    for _, p in ipairs(native_pkgs or {}) do
-        local clean_p = p:gsub("^pkgs%.", "")
-        table.insert(native_lines, "              " .. clean_p)
-    end
-    if #native_lines == 0 then
-        table.insert(native_lines, "              bashInteractive")
-    end
-
-    local lib_lines = {}
-    for _, p in ipairs(lib_pkgs or {}) do
-        local clean_p = p:gsub("^pkgs%.", "")
-        table.insert(lib_lines, "              " .. clean_p)
-    end
-
-    local hook_lines = {
-        'echo "⚡ [Grime Flake] Окружение devShell активировано"'
-    }
-    if lib_pkgs and #lib_pkgs > 0 then
-        table.insert(hook_lines, 'export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$LD_LIBRARY_PATH"')
-        table.insert(hook_lines, 'export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$PKG_CONFIG_PATH"')
-    end
-
-    local build_inputs_block = ""
-    if lib_pkgs and #lib_pkgs > 0 then
-        build_inputs_block = string.format([[
-
-            buildInputs = with pkgs; [
-%s
-            ];]], table.concat(lib_lines, "\n"))
-    end
-
-    return string.format([[{
-  description = "Dev environment for %s";
-
-  inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-  };
-
-  outputs = { self, nixpkgs }:
-    let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
-    in
-    {
-      devShells = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-%s
-            ];%s
-
-            shellHook = ''
-              %s
-            '';
-          };
-        });
-    };
-}
-]], app_name, table.concat(native_lines, "\n"), build_inputs_block, table.concat(hook_lines, "\n              "))
-end
 
 local function ensure_flake(app_dir, m, app_name)
     if not app_dir or not ctx.exists(app_dir) then return false end
@@ -290,7 +199,7 @@ local function ensure_flake(app_dir, m, app_name)
 
     local name = app_name or (m and m.name) or app_dir:match("([^/]+)$") or "app"
     local native_pkgs, lib_pkgs = extract_nix_packages(app_dir, m)
-    local content = generate_flake_nix(name, native_pkgs, lib_pkgs)
+    local content = utils.generate_flake_nix(name, native_pkgs, lib_pkgs)
 
     local f = io.open(flake_path, "w")
     if f then
@@ -492,14 +401,11 @@ local function resolve_app_name(apps_root, raw_name)
     end
 
     local installed = {}
-    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
-    if p then
-        for item in p:lines() do
-            if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
-                table.insert(installed, item)
-            end
+    local entries = (grime.fs and grime.fs.list and grime.fs.list(apps_root)) or {}
+    for _, item in ipairs(entries) do
+        if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+            table.insert(installed, item)
         end
-        p:close()
     end
 
     local best = grime.fuzzy.find_best_match(raw_name, installed, 0.75)
@@ -574,13 +480,11 @@ end
 
 local function list_apps(apps_root)
     local dirs = {}
-    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
-    if p then
-        for l in p:lines() do
-            local item = l:match("^%s*(.-)%s*$")
-            if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then table.insert(dirs, item) end
+    local entries = (grime.fs and grime.fs.list and grime.fs.list(apps_root)) or {}
+    for _, item in ipairs(entries) do
+        if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+            table.insert(dirs, item)
         end
-        p:close()
     end
     table.sort(dirs)
     if #dirs == 0 then
@@ -1234,20 +1138,6 @@ local function rollback_app(apps_root, raw_name, target_commit)
     ctx.success(log_msg)
 end
 
-local function utf8_len(s)
-    local len = 0
-    for _ in (s or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        len = len + 1
-    end
-    return len
-end
-
-local function pad_utf8(str, width)
-    local len = utf8_len(str)
-    if len >= width then return str end
-    return str .. string.rep(" ", width - len)
-end
-
 local function is_pid_alive(pid)
     if not pid or not tostring(pid):match("^%d+$") then return false end
     local res = ctx.capture(string.format("kill -0 %s 2>/dev/null && echo alive", pid))
@@ -1273,15 +1163,11 @@ end
 
 local function ps_apps(apps_root)
     local dirs = {}
-    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
-    if p then
-        for l in p:lines() do
-            local item = l:match("^%s*(.-)%s*$")
-            if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
-                table.insert(dirs, item)
-            end
+    local entries = (grime.fs and grime.fs.list and grime.fs.list(apps_root)) or {}
+    for _, item in ipairs(entries) do
+        if item ~= "" and not item:match("^%.") and ctx.is_dir(apps_root .. "/" .. item) then
+            table.insert(dirs, item)
         end
-        p:close()
     end
     table.sort(dirs)
 
@@ -1290,6 +1176,9 @@ local function ps_apps(apps_root)
     for _, name in ipairs(dirs) do
         local app_dir = apps_root .. "/" .. name
         local pid_file = app_dir .. "/app.pid"
+        if not ctx.exists(pid_file) then
+            pid_file = app_dir .. "/.app.pid"
+        end
         local pid = nil
         if ctx.exists(pid_file) then
             local f = io.open(pid_file, "r")
@@ -1306,24 +1195,6 @@ local function ps_apps(apps_root)
             if not alive then
                 ctx.delete(pid_file, true)
                 pid = nil
-            end
-        end
-
-        if not alive then
-            local m = load_manifest(app_dir, name)
-            local art = m and (m.artifact or m.run)
-            if art and type(art) == "string" and not art:find(" ") then
-                local bname = art:match("([^/]+)$")
-                if bname and bname ~= "" then
-                    local pgrep = ctx.capture(string.format("pgrep -f %q 2>/dev/null", bname))
-                    if pgrep.stdout and pgrep.stdout:match("%d+") then
-                        local found_pid = pgrep.stdout:match("(%d+)")
-                        if is_pid_alive(found_pid) then
-                            pid = found_pid
-                            alive = true
-                        end
-                    end
-                end
             end
         end
 
@@ -1405,6 +1276,9 @@ local function stop_app(apps_root, raw_name, force)
     end
 
     local pid_file = dir .. "/app.pid"
+    if not ctx.exists(pid_file) then
+        pid_file = dir .. "/.app.pid"
+    end
     local pid = nil
     if ctx.exists(pid_file) then
         local f = io.open(pid_file, "r")
@@ -1412,19 +1286,6 @@ local function stop_app(apps_root, raw_name, force)
             pid = f:read("*l")
             f:close()
             if pid then pid = pid:match("^%s*(%d+)%s*$") end
-        end
-    end
-
-    if not pid or not is_pid_alive(pid) then
-        local art = m and (m.artifact or m.run)
-        if art and type(art) == "string" and not art:find(" ") then
-            local bname = art:match("([^/]+)$")
-            if bname and bname ~= "" then
-                local pgrep = ctx.capture(string.format("pgrep -f %q 2>/dev/null", bname))
-                if pgrep.stdout then
-                    pid = pgrep.stdout:match("(%d+)")
-                end
-            end
         end
     end
 
@@ -1517,8 +1378,8 @@ local function print_help()
     %s-l, --lang%s            Язык/стек проекта при создании (cpp, rust, python, java, lua)
 
 %sЦЕПОЧКИ ПРИЛОЖЕНИЙ (App Chaining):%s
-    grime app App1 -> App2 -> App3
-    grime app run Producer -> Consumer
+    grime app App1 : App2 : App3
+    grime app run Producer : Consumer
 
 %sПРИМЕРЫ НАВИГАЦИИ В FISH:%s
     cd (grime app path)                # Переход в корневой каталог приложений

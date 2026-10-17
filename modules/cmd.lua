@@ -6,7 +6,7 @@ local function print_help()
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime cmd <команда/программа> [аргументы/файлы...]
-    grime <модуль_с_путем> -> cmd <программа> [аргументы...]
+    grime <модуль_с_путем> : cmd <программа> [аргументы...]
 
 %sОПИСАНИЕ:%s
     Выполняет указанную команду в рабочей директории (target_dir), полученной от
@@ -18,9 +18,9 @@ local function print_help()
     %shelp, -h, --help%s       Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime project MyGame path -> cmd nvim CMakeLists.txt
-    grime project MyGame path -> cmd git status
-    grime app MyTool -> cmd ls -la
+    grime project MyGame path : cmd nvim CMakeLists.txt
+    grime project MyGame path : cmd git status
+    grime app MyTool : cmd ls -la
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -81,11 +81,7 @@ function main()
 
     local check_which = ctx.capture("command -v " .. program)
     if check_which.code ~= 0 then
-        if ctx.exists(base_dir .. "/shell.nix") then
-            local flat_sub = {}
-            for _, t in ipairs(cmd) do table.insert(flat_sub, string.format("%q", t)) end
-            cmd = { "nix-shell", "--run", table.concat(flat_sub, " ") }
-        elseif ctx.exists(base_dir .. "/flake.nix") then
+        if ctx.exists(base_dir .. "/flake.nix") then
             local flat_sub = {}
             for _, t in ipairs(cmd) do table.insert(flat_sub, string.format("%q", t)) end
             cmd = { "nix", "develop", "--command", "sh", "-c", table.concat(flat_sub, " ") }

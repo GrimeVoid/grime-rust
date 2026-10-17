@@ -1,3 +1,5 @@
+local utils = require("languages.utils")
+
 local BaseAdapter = {}
 BaseAdapter.__index = BaseAdapter
 
@@ -40,18 +42,7 @@ end
 function BaseAdapter:check_dependencies(ctx)
     local missing = {}
     for _, bin in ipairs(self.required_binaries or {}) do
-        local found = false
-        if grime and grime.process and grime.process.which then
-            local p = grime.process.which(bin)
-            if p and #p > 0 then found = true end
-        end
-        if not found and ctx and ctx.capture then
-            local res = ctx.capture("which " .. bin .. " 2>/dev/null")
-            if res and res.code == 0 and res.stdout and #res.stdout > 0 then
-                found = true
-            end
-        end
-        if not found then
+        if not utils.has_binary(bin, ctx) then
             table.insert(missing, bin)
         end
     end

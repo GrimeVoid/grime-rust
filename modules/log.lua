@@ -39,7 +39,7 @@ local function print_help()
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime log [команда|сообщение] [аргументы...]
-    <данные> -> grime log [уровень]
+    <данные> : grime log [уровень]
 
 %sКОМАНДЫ:%s
     %slist [n]%s                  Показать последние N записей логов (по умолчанию 20)
@@ -50,10 +50,10 @@ local function print_help()
     %shelp, -h, --help%s          Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime log errors 5 -> aider
-    echo "Сборка завершена успешно" -> grime log INFO
+    grime log errors 5 : aider
+    echo "Сборка завершена успешно" : grime log INFO
     grime log git 5
-    grime doctor -> grime log
+    grime doctor : grime log
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
@@ -290,7 +290,7 @@ function M.main()
         return
     end
 
-    -- Обработка пайплайна: echo "msg" -> grime log [уровень]
+    -- Обработка пайплайна: echo "msg" : grime log [уровень]
     if input and #input > 0 and (not subcmd or subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR") then
         local level = subcmd or "INFO"
         local entry = M.add(level, input, "pipeline")

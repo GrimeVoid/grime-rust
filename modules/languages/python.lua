@@ -1,4 +1,5 @@
 local BaseAdapter = require("languages.base")
+local utils = require("languages.utils")
 
 local PythonAdapter = setmetatable({}, { __index = BaseAdapter })
 PythonAdapter.__index = PythonAdapter
@@ -16,18 +17,11 @@ function PythonAdapter.new()
     return self
 end
 
-local function file_exists(p)
-    if grime and grime.fs and grime.fs.exists then return grime.fs.exists(p) end
-    local f = io.open(p, "r")
-    if f then f:close(); return true end
-    return false
-end
-
 function PythonAdapter:get_nix_packages(root)
-    if file_exists(root .. "/pyproject.toml") then
+    if utils.file_exists(root .. "/pyproject.toml") then
         return { "python3", "uv" }
     end
-    if file_exists(root .. "/requirements.txt") then
+    if utils.file_exists(root .. "/requirements.txt") then
         return { "python3", "pip" }
     end
     return { "python3" }

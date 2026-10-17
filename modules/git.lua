@@ -23,7 +23,7 @@ local function print_help()
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime git <команда> [аргументы...]
-    grime <директория/модуль> -> git <команда> [аргументы...]
+    grime <директория/модуль> : git <команда> [аргументы...]
 
 %sКОМАНДЫ:%s
     %sstatus%s                   Форматированный статус рабочего дерева и ветки
@@ -39,9 +39,9 @@ local function print_help()
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime git status
-    echo "feat: добавить логирование" -> grime git commit
+    echo "feat: добавить логирование" | grime git commit
     grime git log 5
-    grime app MyTool -> git status
+    grime app MyTool : git status
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,

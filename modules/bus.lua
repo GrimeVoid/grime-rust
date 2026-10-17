@@ -15,7 +15,7 @@ local function print_help()
     состояния Grime, а также для публикации событий шины конвейера.
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime bus set pipeline.target "release" -> cmd cargo build
+    grime bus set pipeline.target "release" : cmd cargo build
     grime bus get pipeline.counter
 ]],
     "\27[1m", "\27[32m", "\27[0m",

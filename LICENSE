@@ -1,107 +1,21 @@
-GRIME DUAL LICENSE
-(PolyForm Noncommercial 1.0 + Commercial Royalty 1%)
+MIT License
 
-Copyright (c) 2026 ValetJk010. All rights reserved.
+Copyright (c) 2026 ValetJk010 / Danny
 
-===============================================================================
-[ ENGLISH VERSION ]
-===============================================================================
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This software is licensed under the GRIME Dual License:
-1. PolyForm Noncommercial License 1.0 for personal, educational, research, and non-commercial purposes.
-2. Commercial Royalty License for any commercial deployment or use exceeding the indie grace threshold.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
--------------------------------------------------------------------------------
-SECTION 1: PERSONAL, EDUCATIONAL, AND NON-COMMERCIAL USE
--------------------------------------------------------------------------------
-
-Permission is hereby granted, free of charge, to any person or organization obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, merge, publish, distribute, sublicense, and/or run the Software without restriction, subject to the following condition:
-
-- The Software is used exclusively for non-commercial purposes, including personal projects, academic research, education, non-profit open-source development, internal experimentation, and hobbyist activities.
-
-Non-commercial use is completely free, perpetual, and royalty-free.
-
--------------------------------------------------------------------------------
-SECTION 2: COMMERCIAL USE AND ROYALTY TERMS
--------------------------------------------------------------------------------
-
-Any use of the Software, in whole or in part, directly or indirectly, for commercial advantage, monetary compensation, or revenue-generating activity requires compliance with the following commercial licensing terms:
-
-1. INDIE DEVELOPER & SMALL STARTUP GRACE THRESHOLD:
-   Independent developers, individual freelancers, and early-stage small businesses or startups with annual gross revenue below $50,000 USD (or equivalent in local currency) across all products or services utilizing this Software are GRANTED FULL PERMISSION to use the Software free of royalties until their annual gross revenue exceeds this threshold.
-
-2. COMMERCIAL ROYALTY:
-   Organizations and individuals whose annual gross revenue meets or exceeds $50,000 USD, or who utilize the Software as part of commercial products, SaaS infrastructure, proprietary platforms, or enterprise toolchains, must either:
-   a) Pay an ongoing royalty of 1.0% (one percent) of gross revenues derived directly or indirectly from the products or services utilizing the Software; OR
-   b) Enter into a separate enterprise agreement / negotiated custom commercial license with the Licensor.
-
-3. REDISTRIBUTION & PROPRIETARY INTEGRATIONS:
-   Embedding the Software into closed-source or commercial proprietary distributions without obtaining prior written approval or adhering to the royalty terms is strictly prohibited.
-
--------------------------------------------------------------------------------
-SECTION 3: CONTACT & LICENSING INQUIRIES
--------------------------------------------------------------------------------
-
-For commercial licensing, enterprise agreements, custom arrangements, exemption requests, or inquiries, please contact the author and copyright holder:
-
-- Author / Licensor: ValetJk010
-- GitHub: https://github.com/ValetJk010
-- Repository: https://github.com/ValetJk010/grime_pj
-
--------------------------------------------------------------------------------
-DISCLAIMER
--------------------------------------------------------------------------------
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-===============================================================================
-[ РУССКАЯ ВЕРСИЯ (RUSSIAN VERSION) ]
-===============================================================================
-
-Настоящее программное обеспечение лицензируется по двойной лицензии GRIME Dual License:
-1. PolyForm Noncommercial License 1.0 для личного, образовательного, исследовательского и некоммерческого использования.
-2. Лицензия коммерческого роялти (Commercial Royalty 1%) для любого коммерческого внедрения или использования, превышающего льготный порог для независимых разработчиков.
-
--------------------------------------------------------------------------------
-РАЗДЕЛ 1: ЛИЧНОЕ, ОБРАЗОВАТЕЛЬНОЕ И НЕКОММЕРЧЕСКОЕ ИСПОЛЬЗОВАНИЕ
--------------------------------------------------------------------------------
-
-Настоящим любому физическому или юридическому лицу предоставляется безвозмездное право на получение копии данного программного обеспечения и сопутствующей документации («Программное обеспечение»), на использование, копирование, модификацию, объединение, публикацию, распространение, сублицензирование и/или запуск Программного обеспечения без ограничений при соблюдении следующего условия:
-
-- Программное обеспечение используется исключительно в некоммерческих целях, включая личные проекты, академические исследования, образовательную деятельность, некоммерческую разработку открытого исходного кода, внутренние эксперименты и деятельность энтузиастов (хобби).
-
-Некоммерческое использование является полностью бесплатным, бессрочным и не требует выплаты каких-либо роялти.
-
--------------------------------------------------------------------------------
-РАЗДЕЛ 2: КОММЕРЧЕСКОЕ ИСПОЛЬЗОВАНИЕ И УСЛОВИЯ РОЯЛТИ
--------------------------------------------------------------------------------
-
-Любое использование Программного обеспечения (целиком или частично, прямо или косвенно) с целью извлечения коммерческой выгоды, получения денежного вознаграждения или в деятельности, приносящей доход, требует соблюдения следующих коммерческих условий:
-
-1. ЛЬГОТНЫЙ ПОРОГ ДЛЯ ИНДИ-РАЗРАБОТЧИКОВ И МАЛЫХ СТАРТАПОВ:
-   Независимым разработчикам, индивидуальным предпринимателям/фрилансерам и начинающим малым стартапам с годовым валовым доходом менее 50 000 долларов США (или эквивалента в иной валюте) по всем продуктам или сервисам, задействующим настоящее Программное обеспечение, ПРЕДОСТАВЛЯЕТСЯ ПРАВО использовать Программное обеспечение БЕСПЛАТНО и без выплаты роялти до момента превышения указанного порога валового дохода.
-
-2. КОММЕРЧЕСКОЕ РОЯЛТИ:
-   Организации и лица, чей совокупный годовой валовой доход составляет или превышает 50 000 долларов США, либо которые внедряют Программное обеспечение в состав коммерческих продуктов, SaaS-инфраструктуры, проприетарных платформ или корпоративных инструментальных цепочек, обязаны:
-   а) Выплачивать роялти в размере 1,0% (одного процента) от валового дохода, полученного прямо или косвенно от продуктов или сервисов, использующих данное Программное обеспечение; ИЛИ
-   б) Заключить отдельное индивидуальное коммерческое / корпоративное лицензионное соглашение с Правообладателем.
-
-3. РАСПРОСТРАНЕНИЕ И ПРОПРИЕТАРНАЯ ИНТЕГРАЦИЯ:
-   Встраивание Программного обеспечения в закрытые или коммерческие проприетарные дистрибутивы без предварительного письменного согласия или соблюдения условий выплаты роялти категорически запрещено.
-
--------------------------------------------------------------------------------
-РАЗДЕЛ 3: КОНТАКТЫ АВТОРА И ВОПРОСЫ ЛИЦЕНЗИРОВАНИЯ
--------------------------------------------------------------------------------
-
-По вопросам приобретения коммерческих лицензий, корпоративных договоров, индивидуальных условий, согласования льгот или партнерства обращайтесь к автору и правообладателю:
-
-- Автор / Правообладатель: ValetJk010
-- GitHub: https://github.com/ValetJk010
-- Репозиторий: https://github.com/ValetJk010/grime_pj
-
--------------------------------------------------------------------------------
-ОТКАЗ ОТ ОТВЕТСТВЕННОСТИ
--------------------------------------------------------------------------------
-
-ПРОГРАММНОЕ ОБЕСПЕЧЕНИЕ ПРЕДОСТАВЛЯЕТСЯ «КАК ЕСТЬ» (AS IS), БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, ЯВНЫХ ИЛИ ПОДРАЗУМЕВАЕМЫХ, ВКЛЮЧАЯ, НО НЕ ОГРАНИЧИВАЯСЬ ГАРАНТИЯМИ ТОВАРНОЙ ПРИГОДНОСТИ, СООТВЕТСТВИЯ ОПРЕДЕЛЕННОЙ ЦЕЛИ И ОТСУТСТВИЯ НАРУШЕНИЙ. НИ В КОЕМ СЛУЧАЕ АВТОРЫ ИЛИ ПРАВООБЛАДАТЕЛИ НЕ НЕСУТ ОТВЕТСТВЕННОСТИ ПО КАКИМ-ЛИБО ИСКАМ, ЗА УБЫТКИ ИЛИ ИНУЮ ОТВЕТСТВЕННОСТЬ В СИЛУ ДОГОВОРА, ДЕЛИКТА ИЛИ ИНЫМ ОБРАЗОМ, ВОЗНИКШИМ В СВЯЗИ С ПРОГРАММНЫМ ОБЕСПЕЧЕНИЕМ, ЕГО ИСПОЛЬЗОВАНИЕМ ИЛИ ДРУГИМИ ОПЕРАЦИЯМИ С НИМ.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

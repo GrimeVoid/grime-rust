@@ -9,124 +9,210 @@
 [![Containers: Distrobox](https://img.shields.io/badge/Containers-Distrobox%20%2F%20Podman-purple.svg)](https://distrobox.it/)
 [![Startup: 2.8 ms](https://img.shields.io/badge/Cold%20Start-2.8%20ms-brightgreen.svg)]()
 [![Socket Latency: 1.1 ms](https://img.shields.io/badge/Latency-1.1%20ms%20(Socket)-brightgreen.svg)]()
-[![License: Dual Non-Commercial / Commercial](https://img.shields.io/badge/License-Dual%20Personal%20%2F%20Commercial-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **High-performance system orchestrator for projects, containers, and ephemeral Nix environments bridging native Rust and embedded LuaJIT.**  
-> **The Ephemeral-First Manifest: The Host OS is sacred and immaculate. Just run it.**
+> **The Ephemeral-First Manifest: The Host OS is sacred and immaculate. Just run it.**  
+> High-performance system orchestrator for projects, containers, and ephemeral Nix environments bridging native Rust and declarative LuaJIT.
 
-**GRIME** fundamentally rethinks how developers interact with their operating system, build toolchains, and package dependencies. It eliminates the "works on my machine" syndrome, compiler fragmentation, and container bloat. GRIME unifies the mathematical reproducibility of **Nix Flakes**, the flexibility of isolated **Distrobox** containers, and the raw speed of a native **Rust** core into a single declarative data pipeline with sub-millisecond response latency.
+**GRIME** liberates developers from the age-old nightmare of dependency administration ("Dependency Hell"), host system degradation, and compiler fragmentation. You no longer need to turn your workstation into a dumping ground of temporary packages, conflicting libraries, and fragmented build tools.
 
-Starting with **v1.1.0**, the GRIME core has evolved into a **Production-Grade Resilient Microkernel**. All domain business logic, language adapters, and build cascades reside purely in declarative LuaJIT dynamic modules, leaving the native Rust core focused strictly on lifecycle management, asynchronous pipelining, task supervision, IPC, and uncompromising execution safety.
-
----
-
-## 🌟 The Ephemeral-First Philosophy
-
-Traditional Linux system administration and software development practices are obsolete:
-- Constant `sudo pacman -S`, `apt install`, or global `pip install` commands inevitably turn the host operating system into a dumping ground of incompatible libraries, conflicting Python/GCC/LLVM toolchains, and orphaned packages.
-- Package removals leave leftover debris in `/usr/lib`, `/var`, and system configuration directories.
-- Host state deteriorates over time into an irreproducible snowflake.
-
-### 🛡️ The GRIME Paradigm: The Immaculate Host
-In the GRIME ecosystem, the host operating system remains **crystal-clean and minimal**:
-1. **Zero Global Compilers**: You no longer need GCC 14, Clang 19, Rust, OpenJDK 21, Python 3.12, CMake, or Ninja permanently installed on the host.
-2. **On-the-Fly Ephemeral Toolchains**: The intelligent scanner automatically determines project requirements and builds code inside an isolated Nix environment that vanishes immediately after compilation.
-3. **Hermetic Sandboxing**: Any task demanding a distinct software environment is dispatched into an ephemeral Nix sandbox or an isolated Distrobox container.
-4. **Host Sovereignty**: Microkernel protection barriers guarantee that no pipeline step can ever compromise or contaminate critical host partitions (`/`, `/usr`, `/etc`, `/nix`).
+GRIME fuses the mathematical reproducibility of **Nix Flakes**, the flexibility of **Distrobox** containers, and the raw speed of a **Rust** microkernel into a seamless developer experience: any utility, compiler, or service is accessible instantaneously in a single command — leaving zero trace on your host machine.
 
 ---
 
-## ⚡ The "Just Run" Principle (Zero-Friction Execution)
+## ⚡ Section 1. Ephemeral Magic: "Just Run" (Zero-Friction Execution)
 
-The premier practical manifestation of GRIME's Ephemeral-First philosophy is **Zero-Friction Execution**:
+Traditional Linux administration is broken: to run a quick task, a developer is forced to execute `sudo pacman -S`, `apt install`, or `pip install --user`. Over time, the operating system inevitably decays into an irreproducible snowflake of conflicting `libssl` versions, disparate Python builds, drifting dynamic libraries, and orphaned files in `/usr/lib` and `/var`.
 
-### 1. Interactive Fish Shell Hook (`command-not-found`)
-Need a utility for a one-off task (`cmatrix`, `cbonsai`, `figlet`, `cava`, `ffmpeg`, `htop`, `ripgrep`, `jq`, `graphviz`)?  
-Simply type its name directly in your terminal:
+**In the GRIME universe, the host operating system remains sacred, immutable, and crystal-clean.**
+
+```
+               [ User Enters Command in Terminal ]
+                                  │
+                                  ▼
+               ┌─────────────────────────────────────┐
+               │    Intelligent Cascade Lookup       │
+               └──────────────────┬──────────────────┘
+                                  │
+      ┌───────────────────────────┴───────────────────────────┐
+      │                                                       │
+  [ Found Locally? ]                                  [ Not Found Locally? ]
+      │                                                       │
+      ├─► Grime Apps (~/apps/*)                               │
+      ├─► Host Binaries ($PATH)                               │
+      ├─► Flatpak Applications                                ▼
+      ├─► Nix Profile ($HOME/.nix-profile)        ┌─────────────────────────┐
+      ├─► Local Toolchains (Cargo/Go)             │    Nixpkgs Catalog      │
+      └─► Distrobox Containers (fedora-box)       │  (nix shell nixpkgs#…)  │
+                                                  └───────────┬─────────────┘
+                                                              │
+                                                              ▼
+                                                ┌───────────────────────────┐
+                                                │     Ephemeral Sandbox     │
+                                                │  (0 bytes junk on host)   │
+                                                └───────────────────────────┘
+```
+
+### 1. Seamless Shell Command Interception (`command_not_found`)
+Shell integration (Fish, Bash, Zsh) makes running any tool completely transparent. Simply type the name of the command you need:
 
 ```text
-> cmatrix
-[Grime] Command 'cmatrix' not found on host.
+> cbonsai
+[Grime] Command 'cbonsai' not found on host.
 Available in Nixpkgs. Run inside isolated environment? [Y/n]: y
 ```
-- Press **Enter** (or `Y`), and the utility launches instantly inside an isolated ephemeral Nix sandbox.
-- **Zero Host Installation!** Once you exit, the host system remains spotless.
-- Want to run directly without interactive prompts? Use `grime pkg run cmatrix` or pass `--yes`.
+- Press **Enter** (or `Y`) — and the utility launches instantly in a hermetic, ephemeral Nix sandbox.
+- **Zero Host Impact:** when you exit the application, the host system remains completely untouched. No `sudo`, no leftover dependencies.
+- In the exact same natural way, you can run `cmatrix`, `ffmpeg`, `ripgrep`, `figlet`, `htop`, `graphviz`, `cava`, and **100,000+** other packages from Nixpkgs.
 
-### 2. Full Interactive TUI & Native PTY Inheritance (`Stdio::inherit`)
-Powered by the Grime-RS v1.1.0 native microkernel with canonical standard stream descriptor inheritance:
-- Interactive pseudo-terminal and TUI applications (`cava`, `btop`, `nvim`, `less`, `cmatrix`) render flawlessly with full 24-bit TrueColor, mouse event support, and zero I/O latency.
+### 2. Multi-Tier Intelligent Cascade Lookup
+Before reaching out to the network or Nixpkgs, GRIME scans local environment tiers within sub-milliseconds:
+1. **Grime Apps**: user-declared micro-applications (`~/Archive/apps/`).
+2. **Host**: standard `$PATH` directories.
+3. **Flatpak**: GUI and desktop application environments.
+4. **Nix Profile**: persistent user profile installations.
+5. **Language Toolchains**: binaries in `~/.cargo/bin`, `~/go/bin`.
+6. **Distrobox Guest Containers**: if a tool is installed inside a container (e.g. `fedora-box`), GRIME transparently forwards execution there.
 
-### 3. Intelligent Command Mappings & Fuzzy Matching
-- **Smart Package Resolution**: When a command binary name differs from its Nixpkgs package attribute (e.g., `uname` is packaged inside `coreutils`, `xargs` inside `findutils`), GRIME's built-in mapping database transparently resolves the correct package.
-- **Damerau-Levenshtein Typo Detection (`grime.fuzzy`)**: If you misspell a command (`carg` instead of `cargo`), GRIME instantly suggests the closest match among installed utilities:
+If the utility is found in any local layer, it runs immediately without network overhead. If it is not found anywhere locally, the ephemeral Nixpkgs runner engages automatically.
+
+### 3. Scripted Automation: The `--no-confirm` Flag
+For CI/CD workflows, automation scripts, and background pipelines, GRIME supports non-interactive execution:
+```bash
+# Automatic non-interactive execution via package module:
+grime pkg run --no-confirm ffmpeg -i input.mp4 output.webm
+grime pkg run -y ripgrep "TODO" .
+```
+
+### 4. Uncompromised PTY/TUI Support (`Stdio::inherit`)
+The Grime-RS v1.1.0 microkernel features direct standard stream descriptor inheritance at the system level. Complex interactive terminal tools and TUIs (`nvim`, `btop`, `cava`, `cmatrix`, `less`) run with:
+- Full **24-bit TrueColor** reproduction;
+- Complete mouse input and terminal resize (`SIGWINCH`) handling;
+- Zero I/O latency and zero buffering artifacts.
+
+### 5. Smart Resolution & Fuzzy Typo Protection
+- **Smart Package Resolution**: If a command binary name differs from its Nixpkgs package attribute (e.g., `uname` belongs to `coreutils`, `xargs` belongs to `findutils`), GRIME's built-in mapping database transparently resolves the correct attribute.
+- **Damerau-Levenshtein Typo Correction (`grime.fuzzy`)**: If you mistype a command, GRIME instantly provides intelligent suggestions:
   ```text
+  > carg build
   [Grime] Command 'carg' not found.
   💡 Did you mean: cargo?
   ```
 
 ---
 
-## 🎯 Technology Stack
+## 🛠️ Section 2. Ephemeral Auto-Toolchain: Zero Compilers on Host
 
-| Component | Technology | Rationale |
-| :--- | :--- | :--- |
-| **System Microkernel** | **Rust (Edition 2021)**, Tokio, mlua | Complete type safety, zero-cost abstractions, zero garbage collection pauses, and minimal memory footprint (~4–6 MB RAM at idle). Cold start ~2.8 ms. |
-| **Scripting Engine** | **LuaJIT FFI / mlua** | Instant module logic execution, sandbox security, and hot-reload support without restarting daemon processes. |
-| **Hermetic Environments** | **Nixpkgs / Nix Flakes** | Mathematically reproducible dependencies, hard-link level deduplication, and zero host contamination. |
-| **Containerization** | **Distrobox / Podman / Docker** | Seamless integration with any Linux distribution (Fedora, Ubuntu, Arch, Alpine) with shared X11/Wayland, PipeWire, and sockets. |
-| **Inter-Process Communication** | **Unix Domain Sockets (UDS)** + StateBus | 1.1 ms roundtrip latency between CLI client and background daemon, DoS/OOM protection (strict 32 MB message limit), and zero-copy binary buffer passing (`bytes::Bytes`). |
+Traditional development workflows require bloating workstations with gigabytes of compilers: multiple versions of GCC, Clang/LLVM, Rust toolchains, OpenJDK, Python development headers, CMake, Ninja, and Meson.
+
+With GRIME, **developers no longer need compilers installed on the host**:
+
+```
+ [ Project Source Tree ] 
+            │
+            ▼
+ ┌────────────────────────┐
+ │   Scanner (scanner.lua)│ ──► Auto-detects C++, Rust, Python, Java, Go
+ └───────────┬────────────┘
+            │
+            ▼
+ ┌────────────────────────┐
+ │  Ephemeral Nix Flake   │ ──► On-the-fly devShell synthesized in ~/.cache/grime/
+ └───────────┬────────────┘
+            │
+            ▼
+ ┌────────────────────────┐
+ │   Hermetic Build Step  │ ──► Zero Dirty Tree (Working directory stays immaculate)
+ └────────────────────────┘
+```
+
+1. **Intelligent Source Scanner (`languages/scanner.lua`)**:
+   - Inspects project trees and build manifests (`CMakeLists.txt`, `Cargo.toml`, `Makefile`, `pom.xml`, `.cpp`, `.rs`, `.py`, `.java`, `.go`).
+   - Constructs a minimal, complete build graph and populates `nativeBuildInputs`.
+2. **Zero Dirty Tree Principle**:
+   - Ephemeral Flake manifests are generated on the fly inside an isolated cache directory (`~/.cache/grime/flakes/<hash>/`).
+   - Leaves **zero stray files** (`flake.nix`, `flake.lock`, `.direnv`) in your project's working directory.
+3. **Declarative Custom Dependencies (`special_dependencies`)**:
+   - Project-specific system libraries (`openssl`, `boost`, `raylib`, `opencv`) are declared cleanly in `app.lua` and seamlessly merged into the auto-toolchain:
+   ```lua
+   special_dependencies = { "openssl", "boost", "raylib" }
+   ```
+4. **Single-Command Build & Run**:
+   ```bash
+   grime project build   # Compiles inside ephemeral toolchain
+   grime project run     # Executes with automatic mtime change detection
+   ```
 
 ---
 
-## ⚡ Key Architectural Capabilities
+## 📦 Section 3. Seamless Harmony with Distrobox & Containers
 
-### 1. Ephemeral Development Toolchains (Auto-Toolchain)
-GRIME liberates developers from configuring build environments manually. The built-in scanner [`languages/scanner.lua`](modules/languages/scanner.lua) and shared toolchain utilities [`languages/utils.lua`](modules/languages/utils.lua) analyze project source trees (C++, Rust, Python, Java, Lua, Go) and build configurations (`CMakeLists.txt`, `Cargo.toml`, `Makefile`, `pom.xml`):
-- Automatically synthesizes an exact compilation graph and populates `nativeBuildInputs`.
-- Seamlessly fuses the auto-discovered toolchain with custom system libraries declared in `app.lua` via `special_dependencies = { "openssl", "raylib", "boost" }`.
-- Projects build and run with `grime project build` and `grime project run` without needing compilers installed on the host!
+GRIME removes boundaries between Linux distributions. You never need to manage disparate virtual machines or remain trapped inside an interactive container shell.
 
-### 2. Zero Dirty Tree Guarantee
-Project builds execute in isolated Nix environments without polluting the repository root:
-- Synthesizes ephemeral Flake definitions inside user cache (`~/.cache/grime/flakes/<hash>/`).
-- Leaves zero stray `flake.nix`, `flake.lock`, or `.direnv` files in your working directory.
-- Guarantees build reproducibility on any machine equipped with Nix.
-
-### 3. Microservice & Polyglot Application Orchestration (`grime app`)
-GRIME provides complete lifecycle management for microservices and polyglot bundles:
-- Declarative definitions in compact `app.lua` manifests.
-- Daemon supervision: background execution (`--detach`), PID tracking, lifecycle monitoring, and structured log capture.
-- Polyglot workflows: e.g., high-performance C++ compute engine wrapped by Python analysis scripts communicating over streams or IPC.
-
-### 4. Self-Contained Standalone Executables (`grime app bundle`)
-The `grime app bundle <app>` command generates self-sufficient portable binaries in `dist/`:
-- Bundles all runtime dependencies (including glibc, Python runtime, dynamic libraries, and assets) into a unified portable executable.
-- The resulting binary runs on any standard Linux distribution without requiring Nix, compilers, or system libraries.
-
-### 5. Seamless Multi-Environment Pipelines (Host ↔ Distrobox ↔ Nix)
-GRIME allows constructing cross-environment pipelines executed in a single command:
+### 1. Transparent Cross-Environment Pipelines
+Pipeline steps run across environments separated by colons `:`.
 ```bash
-grime project cpp init MyGame : box fedora-box : project build : host : project run
+# Initialize C++ project -> Build in Fedora container -> Return to Host -> Run on Host
+grime project cpp init MyService : box fedora-box : project build : host : project run
 ```
-- Pipeline stages are delimited by colons `:`.
-- Seamlessly forwards execution context, environment variables, and file descriptors across environment boundaries.
-- The boundary module `host` cleanly returns execution context back to the host system.
+- The boundary module `host` cleanly and safely switches execution back to the host operating system.
+- Environment variables, binary buffers, and file descriptors pass across container boundaries effortlessly.
 
-### 6. StateBus Shared State (`grime bus`) and Dual Audit (Git + Nix)
-- **StateBus**: Thread-safe in-memory key-value bus in daemon RAM for passing metadata between pipeline stages without brittle stdout parsing. Features RAII automatic cleanup of `pipeline.*` namespaces upon completion and persistent state storage.
-- **Dual Audit**: The `grime app diff <app>` command simultaneously audits source code diffs via `git diff` and closure structural deviations via `nix store diff-closures`.
-- **Snapshots & Rollbacks**: Instant versioning with `grime app snapshot <app> "revision"` and atomic `grime app rollback <app>`.
+### 2. Direct Invocation of Guest Package Managers
+Need to use DNF or APT without leaving your host terminal?
+```bash
+# Transparent execution inside fedora-box without manual "distrobox enter":
+grime box fedora-box run dnf search ripgrep
+grime box fedora-box run dnf install -y neofetch
+```
+GRIME's cascade runner can also automatically route unrecognized commands to `fedora-box` when found inside the container.
 
-### 7. Hardened Resilient Microkernel (v1.1.0)
-The native Grime-RS core introduces critical operational-level protections:
-- **IPC DoS & OOM Guard**: Strict 32 MB payload limit on socket framing, instantly preventing corrupted or malicious stream payloads from exhausting host RAM.
-- **Intelligent Task Supervisor (`TaskSupervisor`)**:
-  - Long build protection (`is_step_active`): ensures that active compilation steps or multi-minute pipeline phases do not trigger false watchdog timeouts.
-  - Automatic task cleanup (1-hour Retention Policy) preventing memory and file descriptor exhaustion over long daemon uptimes.
-  - Mutex Poison Recovery: thread panics automatically recover shared state without bringing down the resident daemon `grimed`.
-- **Filesystem Sovereignty & Path Protection**: Strict blocking of destructive operations on critical system hierarchies (`/`, `/etc`, `/usr`, `/nix`, `/var`, `/boot`, `/root`). Enforced symlink safety on permission changes (`chmod`) prevents symlink dereference attacks and privilege escalation.
-- **Stack Overflow Guard**: Enforced traversal depth limit (`max_depth = 64`) when serializing complex Lua tables to JSON, preventing stack overflows on cyclic structures.
+### 3. Binary & Desktop Application Export
+```bash
+grime box export bin /usr/bin/some-tool   # Exports guest binary into host ~/.local/bin
+grime box export app my-gui-app          # Exports desktop .desktop launcher
+```
+
+---
+
+## 🔬 Section 4. Production-Grade Power of Grime-RS v1.1.0 Microkernel
+
+Beneath the effortless developer experience lies a rigorous engineering architecture built for maximum resilience and extreme performance.
+
+### 🦀 Native Rust Microkernel (Grime-RS)
+- **Sub-Millisecond Responsiveness**: CLI cold start of **`~2.8 ms`**, IPC socket latency of **`1.1 ms`**.
+- **Minimal Footprint**: Resident daemon `grimed` consumes only **4–6 MB RAM** at idle.
+- **Memory Safety**: Zero race conditions, zero memory leaks, and complete type safety guaranteed by Rust.
+
+### 🌙 Declarative LuaJIT FFI Modules
+- All domain logic, compilation rules, and integrations are organized as dynamic modules (`~/.config/grime/modules/`).
+- **Sandboxing & Hot-Reload**: Modules update instantly without restarting the background daemon.
+- Direct invocation of native C APIs via high-performance FFI.
+
+### 🚀 Microservice Lifecycle Orchestration (`grime app`)
+- **Declarative `app.lua` Manifest**: Compact specification of build, run, dependencies, and environment variables.
+- **Supervision & Daemonization**: Background execution (`--detach`), PID tracking, and graceful shutdown (`grime app stop`).
+- **Polyglot Workflows**: Effortlessly bridge C++ high-performance compute engines with Python analysis scripts within one application.
+
+### 📦 Self-Contained Standalone Executables (`grime app bundle`)
+The `grime app bundle <app>` command creates a self-sufficient binary in `dist/`:
+- Embeds all dynamic libraries, interpreters, and glibc directly into a portable binary.
+- The resulting artifact runs on **any standard Linux distribution** without Nix, without compilers, and without external dependencies.
+
+### 🔀 In-Memory StateBus (`grime bus`) & Task Supervision
+- **RAM StateBus**: Thread-safe structured metadata exchange between pipeline stages without brittle stdout text parsing.
+- **RAII Pipeline Cleanup**: Keys in the `pipeline.*` namespace are automatically erased upon pipeline completion.
+- **TaskSupervisor**:
+  - `is_step_active`: Prevents false watchdog timeouts during lengthy compilation stages.
+  - Retention Policy (1 Hour): Automatic pruning of completed task records and file descriptors.
+  - Mutex Poison Recovery: Resilient recovery of shared state after worker thread panics.
+- **Filesystem Sovereignty**: Strict hard blocking of destructive operations against critical host directories (`/`, `/etc`, `/usr`, `/nix`, `/var`, `/boot`, `/root`).
+
+### 🔍 Dual Audit (Git + Nix Closures) & Atomic Snapshots
+- `grime app diff <app>`: Simultaneously inspects source code differences via `git diff` and closure structure divergences via `nix store diff-closures`.
+- `grime app snapshot <app> "label"`: Creates atomic restore checkpoints.
+- `grime app rollback <app>`: Instant rollback to a stable application state.
+- `grime doctor`: Comprehensive system diagnostic suite for tools, sockets, and containers.
 
 ---
 
@@ -134,9 +220,9 @@ The native Grime-RS core introduces critical operational-level protections:
 
 ```mermaid
 flowchart TD
-    subgraph ClientLayer ["CLI & Shell Interface"]
+    subgraph ClientLayer ["Client & Shell Interface"]
         CLI["grime (CLI Client / Rust)"]
-        Fish["Fish Shell (Pipelines ':' & CNF Hook)"]
+        Fish["Shell (Pipelines ':' & CNF Interceptor)"]
     end
 
     subgraph CoreLayer ["Native Rust Microkernel (grimed / in-process)"]
@@ -144,24 +230,24 @@ flowchart TD
         IPCGuard["IPC DoS & OOM Guard (32 MB Limit)"]
         Router["Pipeline Dispatcher & Async Engine (Tokio)"]
         Supervisor["TaskSupervisor (is_step_active & Retention)"]
-        FSGuard["FS Sovereign Guard (System Path Protect)"]
-        StateBus["Shared StateBus (RAM Zero-Copy)"]
+        FSGuard["FS Sovereign Guard (System Path Protection)"]
+        StateBus["StateBus (Shared RAM, Zero-Copy)"]
     end
 
-    subgraph LuaLayer ["LuaJIT Dynamic Modules (~/.config/grime/modules/)"]
+    subgraph LuaLayer ["Declarative LuaJIT Modules (~/.config/grime/modules/)"]
+        M_Pkg["pkg.lua (Cascade Lookup, CNF & Fuzzy)"]
         M_App["app.lua (Lifecycle & Bundling)"]
-        M_Proj["project.lua (Build Cascades)"]
-        M_Nix["nix.lua (Ephemeral Flakes)"]
-        M_Box["box.lua (Distrobox Warmup)"]
-        M_Pkg["pkg.lua (Meta Pkg, Fuzzy & CNF)"]
-        M_Aider["aider.lua (AI Coding Agent)"]
+        M_Proj["project.lua (Build Cascades & mtime)"]
+        M_Nix["nix.lua (Ephemeral Flakes & DevShell)"]
+        M_Box["box.lua (Distrobox Orchestration)"]
         M_Scan["languages/scanner.lua & utils.lua"]
+        M_Bus["bus.lua (StateBus Management)"]
     end
 
     subgraph Targets ["Execution Environments"]
-        HostOS["Host OS (Arch / Linux)"]
-        NixEnv["Nix Ephemeral DevShell / Flake"]
-        DBox["Distrobox Containers (Fedora / Ubuntu)"]
+        HostOS["Immaculate Host OS (Arch / NixOS / Fedora / Ubuntu)"]
+        NixEnv["Ephemeral Nix Sandbox (nix shell / devShell)"]
+        DBox["Isolated Distrobox Containers"]
     end
 
     Fish --> CLI
@@ -177,30 +263,30 @@ flowchart TD
 
 ---
 
-## 📊 Performance & System Metrics
+## 📊 Performance Benchmarks
 
-Measured latency benchmarks and system overhead:
+Measured latency metrics and runtime overhead:
 
-| Metric | Value | Description & Benchmark Conditions |
+| Metric | Value | Test Description & Conditions |
 | :--- | :--- | :--- |
-| **CLI Cold Start (`grime`)** | **`~2.8 ms`** | From binary execution to LuaJIT VM initialization and pipeline parsing |
-| **Daemon Socket Roundtrip** | **`1.1 ms`** | Full request-response cycle over Unix Domain Socket |
-| **Idle Memory Footprint** | **`4–6 MB`** | Resident Set Size (RSS) of the background `grimed` microkernel |
-| **Ephemeral Flake Synthesis** | **`< 15 ms`** | Project hashing, toolchain synthesis, and devShell caching |
-| **IPC Message Limit** | **`32 MB`** | Hardware and memory guard against OOM and socket stream attacks |
+| **CLI Cold Start (`grime`)** | **`~2.8 ms`** | From binary launch to LuaJIT VM initialization and pipeline parsing |
+| **IPC Socket Roundtrip** | **`1.1 ms`** | Full request-response cycle over Unix Domain Socket |
+| **Idle Memory Consumption** | **`4–6 MB`** | Resident Set Size (RSS) of the background `grimed` microkernel |
+| **Ephemeral Flake Synthesis** | **`< 15 ms`** | Source hashing, toolchain synthesis, and devShell caching |
+| **IPC Payload Limit** | **`32 MB`** | Hardware and memory guard against OOM and socket attacks |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Build and Installation
+### 1. Build & Installation
 
 #### Via Nix Flake (Recommended Hermetic Method):
 ```bash
-# Build static binary with zero external runtime dependencies:
+# Build static binaries with zero external runtime dependencies:
 nix build .#static
 
-# Or enter ready-to-use development shell:
+# Or enter ready development shell:
 nix develop
 ```
 
@@ -209,85 +295,89 @@ nix develop
 cargo build --release
 ```
 Compiled binaries will be available at:
-- `target/release/grime` — Ultra-fast CLI client.
+- `target/release/grime` — Ultra-fast CLI client;
 - `target/release/grimed` — Resident background daemon.
 
-Install into user `PATH`:
+Install into your user `PATH`:
 ```bash
 cp target/release/grime target/release/grimed ~/.local/bin/
 ```
 
 ### 2. Launch Background Daemon (Optional)
 ```bash
-# Start service in the background:
+# Start background resident daemon:
 grimed --daemon
 
 # Verify core health and module availability:
 grime doctor
 ```
-*(If the daemon is not running, `grime` automatically executes pipelines locally in-process without loss of features).*
+*(If the daemon is not running, `grime` executes commands locally in-process with identical features).*
+
+### 3. Connect Command-Not-Found Interceptor in Fish Shell
+Add the hook to `~/.config/fish/functions/fish_command_not_found.fish`:
+```fish
+function fish_command_not_found
+    grime pkg not-found $argv
+end
+```
+Now any unrecognized utility entered in your terminal is caught by GRIME and executed inside an ephemeral Nix sandbox or matching local environment.
 
 ---
 
 ## 💡 Real-World Scenarios
 
-### 1. Ephemeral Utility Execution Without Installation:
+### 1. Ephemeral Tool Execution Without Host Installation
 ```bash
-# One-time execution of an interactive TUI in Nix isolation:
+# One-off run of an interactive TUI utility:
 grime pkg run cmatrix
 
-# Run with auto-confirmation flag:
-grime pkg run --yes ffmpeg -version
+# Automated execution with complex arguments and zero prompts:
+grime pkg run --no-confirm ffmpeg -version
 ```
 
-### 2. Build C++ Project via Auto-Toolchain in Ephemeral Nix Flake:
+### 2. Build C++ Project via Auto-Toolchain in Ephemeral Sandbox
 ```bash
-# Intelligent cascade: CMakeLists.txt -> Makefile -> direct g++/clang++
+# Initialize, build, and run with zero compilers installed on the host:
 grime project cpp init FastService
 grime nix build FastService
 grime project run FastService
 ```
 
-### 3. Seamless Pipeline Across Environments and Containers:
+### 3. Seamless Multi-Environment Cross-Container Pipeline
 ```bash
-# Create project -> Build in Fedora container -> Return to host -> Run
+# Init Project -> Build inside Fedora container -> Switch to Host -> Run on Host
 grime project rust MicroCli : box fedora-box : project build : host : project run
 ```
 
-### 4. Creating and Supervising a Microservice:
+### 4. Create and Supervise a Microservice
 ```bash
-# Initialize service from template
+# Create service from template
 grime app new telemetry-agent --lang rust
 
-# Launch in background with PID supervision
+# Launch in background with PID tracking and supervision
 grime app run telemetry-agent --detach
 
-# Inspect all active running services
+# List running services
 grime app list
 
 # Stop service
 grime app stop telemetry-agent
 ```
 
-### 5. Packaging Polyglot App into Standalone Portable Binary:
+### 5. Package Application into Portable Standalone Binary
 ```bash
-# Compile C++ core, bundle Python runtime and all dependencies into dist/polyapp
+# Compile and bake all dependencies into dist/polyapp:
 grime app bundle polyapp
 
-# Execute self-contained portable bundle on any Linux machine:
+# Portable binary can be deployed to any Linux machine:
 ./apps/polyapp/dist/polyapp
-```
-
-### 6. Pipeline Coordination via StateBus:
-```bash
-grime bus set build.target "release-v2" : log INFO "Flag set" : bus get build.target
 ```
 
 ---
 
 ## 📝 Application Manifest Specification (`app.lua`)
 
-Each isolated application or microservice is declared via an `app.lua` manifest:
+Each isolated microservice or application is declared via `app.lua`:
 
 ```lua
 return {
@@ -297,20 +387,20 @@ return {
     description = "High-performance analytics worker",
     type = "polyglot", -- cpp, rust, python, java, polyglot, generic
 
-    -- Build instructions and output artifact
+    -- Build instructions & artifact
     build = "g++ -O3 src/engine.cpp -o engine",
     artifact = "engine",
     run = "./engine",
     sources = { "src/engine.cpp", "scripts/analyzer.py" },
 
-    -- Auto-toolchain and specific Nixpkgs dependencies
+    -- Auto-toolchain & specific Nixpkgs dependencies
     special_dependencies = {
         "openssl",
         "boost",
         "python3"
     },
 
-    -- Background daemon settings
+    -- Daemonization settings
     detached = false,
     env = {
         LOG_LEVEL = "info",
@@ -321,57 +411,31 @@ return {
 
 ---
 
-## 🛠️ Extension Modules Overview
+## 🛠️ Extension Modules
 
-The repository contains declarative LuaJIT modules (`modules/`), each implementing a specialized domain:
+The repository includes declarative LuaJIT modules (`modules/`), each addressing a dedicated domain:
 
-- [`modules/pkg.lua`](modules/pkg.lua) — Unified multi-package manager (Pacman, Flatpak, Nix, Distrobox, Cargo), smart command mappings, fuzzy typo detection, and interactive Command-Not-Found.
-- [`modules/app.lua`](modules/app.lua) — Full application lifecycle, background supervision, Git snapshots, Nix closure auditing, and standalone bundling.
-- [`modules/project.lua`](modules/project.lua) — Developer source project orchestration, fuzzy directory lookup, and mtime-based rebuild checks.
-- [`modules/languages/`](modules/languages/) — Compiler and build adapters for C++, Rust, Python, Java with smart structural scanner [`scanner.lua`](modules/languages/scanner.lua) and shared build helpers [`utils.lua`](modules/languages/utils.lua).
+- [`modules/pkg.lua`](modules/pkg.lua) — Multi-package manager, cascade lookup, fuzzy typo detection, and interactive Command-Not-Found.
+- [`modules/app.lua`](modules/app.lua) — Full application lifecycle, daemonization, Git snapshots, Nix closure audit, and bundling.
+- [`modules/project.lua`](modules/project.lua) — Developer project orchestration, fuzzy directory lookup, and mtime validation.
+- [`modules/languages/`](modules/languages/) — Compiler and build adapters for C++, Rust, Python, Java with smart scanner [`scanner.lua`](modules/languages/scanner.lua) and shared tools [`utils.lua`](modules/languages/utils.lua).
 - [`modules/nix.lua`](modules/nix.lua) — Declarative and ephemeral Nix Flake/DevShell environments, garbage collection (`gc`), deduplication (`optimise`), generation history, and rollback.
-- [`modules/box.lua`](modules/box.lua) — Orchestration and command execution inside isolated Distrobox containers, container app/binary exports.
-- [`modules/daemon.lua`](modules/daemon.lua) — Control and inspection of the background `grimed` service: memory usage, socket health, graceful restarts, and diagnostic logging.
-- [`modules/aider.lua`](modules/aider.lua) — Direct integration of the Aider autonomous AI coding assistant into Grime pipelines.
-- [`modules/bus.lua`](modules/bus.lua) — Inter-stage StateBus shared memory.
-- [`modules/git.lua`](modules/git.lua) — High-level Git repository operations, change audits, and atomic snapshots.
-- [`modules/doctor.lua`](modules/doctor.lua) — Deep diagnostic inspection of available host and container utilities.
+- [`modules/box.lua`](modules/box.lua) — Orchestration and execution inside isolated Distrobox containers, binary and desktop application export.
+- [`modules/daemon.lua`](modules/daemon.lua) — Management of the `grimed` service: status, memory monitoring, socket verification, restart, and diagnostic logs.
+- [`modules/aider.lua`](modules/aider.lua) — Integration of the autonomous AI coding agent Aider directly into the Grime pipeline.
+- [`modules/bus.lua`](modules/bus.lua) — StateBus shared memory across pipeline steps.
+- [`modules/git.lua`](modules/git.lua) — High-level Git operations, changes audit, and snapshots.
+- [`modules/doctor.lua`](modules/doctor.lua) — Deep diagnostic suite for host tools, sockets, and containers.
 - [`modules/log.lua`](modules/log.lua) — Structured system logging.
-- [`modules/host.lua`](modules/host.lua) — Pipeline boundary module cleanly returning execution back to host OS.
-- [`modules/cmd.lua`](modules/cmd.lua) — Fallback module for executing isolated ad-hoc shell commands.
-
----
-
-## 🐚 Shell Compatibility & Fish Shell Integration
-
-### 1. Pipeline Syntax
-GRIME pipelines utilize colons `:` as the universal stage delimiter:
-```fish
-grime host : bus set system.mode production : git status : log INFO "Audit complete"
-```
-> **Fish Shell Note:** Using `:` prevents token interception by Fish Shell (as `->` is treated as a file redirection operator in Fish).
-
-### 2. Enabling Command-Not-Found in Fish Shell
-Connecting the shell hook transforms Fish into a self-resolving development environment powered by the "Just Run" philosophy:
-
-```fish
-# Create hook function in Fish Shell (~/.config/fish/functions/fish_command_not_found.fish):
-function fish_command_not_found
-    grime pkg not-found $argv
-end
-```
-Any command not found on the host will now be handled by GRIME:
-1. Instant lookup in Flatpak, Grime Apps, Cargo, and Nix profile.
-2. If indexed in Nixpkgs — prompt for isolated execution `[Y/n]` with full interactive TUI support.
-3. If misspelled — instant Did-You-Mean suggestion using Levenshtein distance.
+- [`modules/host.lua`](modules/host.lua) — Boundary module for returning pipeline execution context to the host OS.
+- [`modules/cmd.lua`](modules/cmd.lua) — Fallback module for executing one-off system commands.
 
 ---
 
 ## 📄 License
 
-Distributed under the **[GRIME Dual License](LICENSE)**:
-- **Personal, Educational, and Research Use:** 100% Free, Perpetual, and Unrestricted ([PolyForm Noncommercial 1.0](LICENSE)).
-- **Commercial Use:** 1% Royalty on gross revenue, with a generous $50,000/year exemption threshold for indie developers and early startups.
+This project is licensed under the open-source **[MIT License](LICENSE)**.
 
-Full terms and legal text are available in [LICENSE](LICENSE).  
-Author: **ValetJk010**
+You are completely free to use, modify, distribute, and integrate GRIME into personal, academic, research, and commercial projects without royalties or hidden restrictions.
+
+Copyright (c) 2026 **ValetJk010 / Danny**.

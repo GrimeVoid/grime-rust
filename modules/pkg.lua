@@ -1286,11 +1286,14 @@ local function handle_not_found(args, run_ctx)
         os.exit(127)
     end
 
-    -- 0. Извлечение флагов --no-confirm, -y, --yes
+    -- 0. Извлечение флагов --no-confirm, -y, --yes и поддержка разделителя '--'
     local no_confirm = false
     local clean_args = {}
+    local after_dash = false
     for _, a in ipairs(args) do
-        if a == "--no-confirm" or a == "-y" or a == "--yes" then
+        if not after_dash and a == "--" then
+            after_dash = true
+        elseif not after_dash and (a == "--no-confirm" or a == "-y" or a == "--yes") then
             no_confirm = true
         else
             table.insert(clean_args, a)

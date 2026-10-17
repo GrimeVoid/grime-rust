@@ -26,7 +26,7 @@ fn print_global_help(config: &crate::config::GrimeConfig) {
                 "list" => "Список всех доступных модулей (алиасы: ls, modules)",
                 "doctor" => "Диагностика окружения, путей и зависимостей Grime",
                 "bus" => "Шина разделяемого состояния (StateBus) и событий",
-                "daemon" => "Управление фоновым сервисом-демоном (grimed)",
+                "daemon" => "Управление фоновым сервисом-демоном (grime daemon)",
                 "git" => "Полноценное управление Git-репозиториями и версионированием",
                 "log" => "Централизованный сбор, хранение и фильтрация логов",
                 "benchmark" => "Стресс-тестирование, бенчмаркинг конвейеров и замеры задержек",
@@ -43,12 +43,12 @@ fn print_global_help(config: &crate::config::GrimeConfig) {
         \x1b[1mИспользование:\x1b[0m\n  \
           grime [опции] <модуль> [аргументы] [ : <модуль> [аргументы] ... ]\n\n\
         \x1b[1mРазделители конвейера:\x1b[0m\n  \
-          : , -- , -> , |\n  \
+          : , -> , |\n  \
           \x1b[33mПодсказка для Fish shell:\x1b[0m Токен '->' парсится шеллом как редирект в файл (>).\n  \
           В Fish shell рекомендуется использовать двоеточие ':' или экранировать '\"->\"'.\n\n\
         \x1b[1mГлобальные флаги:\x1b[0m\n  \
           -f, --force          Игнорировать ошибки шагов конвейера\n  \
-          -d, --detach         Запуск открепленной фоновой задачи через демон grimed\n  \
+          -d, --detach         Запуск открепленной фоновой задачи через встроенный демон\n  \
           -p, --path <путь>    Задать базовую рабочую директорию конвейера\n  \
           -h, --help           Показать эту справку\n  \
           -v, --version        Показать версию программы\n\n\
@@ -57,6 +57,56 @@ fn print_global_help(config: &crate::config::GrimeConfig) {
         \x1b[90mДля справки по конкретному модулю: grime <модуль> --help\x1b[0m",
         mod_lines.trim_end()
     );
+}
+
+/// Подключение к демону с ленивым авто-спавном:
+/// Если сокет отсутствует или подключение возвращает ошибку,
+/// автоматически запускает `grime --daemon-server` в фоне как открепленный процесс
+/// и ожидает готовности Unix-сокета.
+pub async fn connect_or_spawn_daemon() -> Result<UnixStream, std::io::Error> {
+    let sock_path = get_socket_path();
+
+    // 1. Попытка подключения к уже работающему демону
+    if sock_path.exists() {
+        if let Ok(stream) = UnixStream::connect(&sock_path).await {
+            return Ok(stream);
+        }
+        // Сокет существует, но подключение не удалось (демон упал или завершился некорректно)
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    // 2. Авто-спавн grime --daemon-server в фоне как открепленный процесс
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grime"));
+    let mut cmd = std::process::Command::new(current_exe);
+    cmd.arg("--daemon-server")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()?;
+
+    // 3. В цикле (до 15 попыток с паузой 25 мс, суммарно ~375 мс) дожидаемся появления и готовности сокета
+    for _ in 0..15 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        if sock_path.exists() {
+            if let Ok(stream) = UnixStream::connect(&sock_path).await {
+                return Ok(stream);
+            }
+        }
+    }
+
+    UnixStream::connect(&sock_path).await
 }
 
 pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, config_path: Option<&Path>) -> i32 {
@@ -82,58 +132,61 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
 
     // 1. Если указан флаг --detach / -d: передаем задачу супервизору демона через Unix-сокет
     if parsed.detach {
-        let sock_path = get_socket_path();
-        if sock_path.exists() {
-            if let Ok(mut stream) = UnixStream::connect(&sock_path).await {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .to_string_lossy()
-                    .to_string();
+        let mut stream = match connect_or_spawn_daemon().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Grime] Ошибка подключения к демону (авто-запуск не удался): {}", e);
+                return 1;
+            }
+        };
 
-                let mut env = HashMap::new();
-                for (k, v) in std::env::vars() {
-                    env.insert(k, v);
-                }
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
 
-                let msg = ClientMessage::Run {
-                    cwd,
-                    args: raw_args.to_vec(),
-                    env,
-                    detach: true,
-                };
+        let mut env = HashMap::new();
+        for (k, v) in std::env::vars() {
+            env.insert(k, v);
+        }
 
-                if let Ok(bytes) = rmp_serde::to_vec_named(&msg) {
-                    let len = (bytes.len() as u32).to_be_bytes();
-                    if stream.write_all(&len).await.is_ok() && stream.write_all(&bytes).await.is_ok() {
-                        let mut len_buf = [0u8; 4];
-                        if stream.read_exact(&mut len_buf).await.is_ok() {
-                            let resp_len = u32::from_be_bytes(len_buf) as usize;
-                            if resp_len > MAX_IPC_PAYLOAD_SIZE {
-                                eprintln!(
-                                    "[Grime Security] Ошибка: размер ответа демона превышает максимально допустимый лимит ({} > {})",
-                                    resp_len, MAX_IPC_PAYLOAD_SIZE
-                                );
-                                return 1;
+        let msg = ClientMessage::Run {
+            cwd,
+            args: raw_args.to_vec(),
+            env,
+            detach: true,
+        };
+
+        if let Ok(bytes) = rmp_serde::to_vec_named(&msg) {
+            let len = (bytes.len() as u32).to_be_bytes();
+            if stream.write_all(&len).await.is_ok() && stream.write_all(&bytes).await.is_ok() {
+                let mut len_buf = [0u8; 4];
+                if stream.read_exact(&mut len_buf).await.is_ok() {
+                    let resp_len = u32::from_be_bytes(len_buf) as usize;
+                    if resp_len > MAX_IPC_PAYLOAD_SIZE {
+                        eprintln!(
+                            "[Grime Security] Ошибка: размер ответа демона превышает максимально допустимый лимит ({} > {})",
+                            resp_len, MAX_IPC_PAYLOAD_SIZE
+                        );
+                        return 1;
+                    }
+                    let mut resp_buf = vec![0u8; resp_len];
+                    if stream.read_exact(&mut resp_buf).await.is_ok() {
+                        if let Ok(resp) = rmp_serde::from_slice::<DaemonResponse>(&resp_buf) {
+                            if let Some(ref res) = resp.result {
+                                println!("{}", res);
                             }
-                            let mut resp_buf = vec![0u8; resp_len];
-                            if stream.read_exact(&mut resp_buf).await.is_ok() {
-                                if let Ok(resp) = rmp_serde::from_slice::<DaemonResponse>(&resp_buf) {
-                                    if let Some(ref res) = resp.result {
-                                        println!("{}", res);
-                                    }
-                                    if let Some(ref err) = resp.error {
-                                        eprintln!("[Grime] {}", err);
-                                    }
-                                    return resp.exit_code;
-                                }
+                            if let Some(ref err) = resp.error {
+                                eprintln!("[Grime] {}", err);
                             }
+                            return resp.exit_code;
                         }
                     }
                 }
             }
         }
 
-        eprintln!("[Grime] Ошибка: Демон grimed не запущен. Для фоновых открепленных задач (--detach) запустите 'grimed'.");
+        eprintln!("[Grime] Ошибка: Не удалось передать задачу демону или получить ответ.");
         return 1;
     }
 

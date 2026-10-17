@@ -68,8 +68,8 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
 
     let listener = UnixListener::bind(&sock_path)?;
     println!(
-        "{} Демон grimed запущен на сокете: {} (Протокол: MessagePack)",
-        "[grimed]".green().bold(),
+        "{} Демон grime запущен на сокете: {} (Протокол: MessagePack)",
+        "[grime-daemon]".green().bold(),
         sock_path.display()
     );
 
@@ -104,7 +104,7 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
 
             println!(
                 "{} Hot-reload активен для каталога: {}",
-                "[grimed]".green().bold(),
+                "[grime-daemon]".green().bold(),
                 watch_dir.display()
             );
 
@@ -114,14 +114,14 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                     if has_lua {
                         println!(
                             "{} Обнаружено изменение Lua-модулей! Перезагрузка состояния...",
-                            "[grimed Hot-Reload]".yellow().bold()
+                            "[grime-daemon Hot-Reload]".yellow().bold()
                         );
                         if let Ok(new_orch) = Orchestrator::new(Some(watch_dir.clone()), conf_p.as_deref()) {
                             let mut lock = orch_reload.blocking_write();
                             *lock = new_orch;
                             println!(
                                 "{} Модули успешно обновлены в памяти демона.",
-                                "[grimed Hot-Reload]".green().bold()
+                                "[grime-daemon Hot-Reload]".green().bold()
                             );
                         }
                     }
@@ -150,7 +150,7 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                     if payload_len > MAX_IPC_PAYLOAD_SIZE {
                         eprintln!(
                             "{} Превышен максимальный размер IPC-сообщения: {} байт (лимит: {} байт)",
-                            "[grimed Security]".red().bold(),
+                            "[grime-daemon Security]".red().bold(),
                             payload_len,
                             MAX_IPC_PAYLOAD_SIZE
                         );
@@ -295,7 +295,7 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                 });
             }
             Err(e) => {
-                eprintln!("[grimed] Ошибка accept: {}", e);
+                eprintln!("[grime-daemon] Ошибка accept: {}", e);
             }
         }
     }

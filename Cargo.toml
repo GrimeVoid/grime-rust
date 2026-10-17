@@ -11,10 +11,6 @@ path = "src/lib.rs"
 name = "grime"
 path = "src/bin/grime.rs"
 
-[[bin]]
-name = "grimed"
-path = "src/bin/grimed.rs"
-
 [dependencies]
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 tokio = { version = "1.38", features = ["full"] }

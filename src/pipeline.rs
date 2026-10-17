@@ -17,9 +17,9 @@ pub struct ParsedPipeline {
 pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
 
 const PATH_FLAGS: &[&str] = &["-p", "-path", "--path"];
-const ARG_FLAGS: &[&str] = &["-arg", "--args", "-c", "-com", "--com"];
+const ARG_FLAGS: &[&str] = &["--args", "-arg"];
 const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
-const SEPARATORS: &[&str] = &["--", ":", "->", "|"];
+const SEPARATORS: &[&str] = &[":", "->", "|"];
 
 /// Динамическое сканирование директорий модулей Grime на диске
 pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<String> {
@@ -204,47 +204,50 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         }
     } else {
         // Режим без разделителей (одиночный модуль или legacy -a)
-        let mut arg_flag_idx: Option<usize> = None;
-        for (idx, t) in tokens.iter().enumerate() {
-            if ARG_FLAGS.contains(&t.as_str()) {
-                arg_flag_idx = Some(idx);
-                break;
-            }
-        }
+        let filtered: Vec<String> = tokens
+            .into_iter()
+            .filter(|t| !MOD_FLAGS.contains(&t.as_str()))
+            .collect();
 
-        if let Some(idx) = arg_flag_idx {
-            let modules: Vec<String> = tokens[..idx]
-                .iter()
-                .filter(|t| !MOD_FLAGS.contains(&t.as_str()))
-                .map(|t| canonical_module_name(t))
-                .collect();
-            let args_part: Vec<String> = tokens[idx + 1..].to_vec();
-
-            let target_modules = if modules.is_empty() {
-                vec!["project".to_string()]
-            } else {
-                modules
-            };
-
-            for m in target_modules {
+        if !filtered.is_empty() {
+            // Если первый токен не начинается с '-', то это однозначно целевой модуль!
+            // Все последующие токены передаются модулю КАК ЕСТЬ, без попыток дробить их флагами.
+            if !filtered[0].starts_with('-') {
+                let mod_name = canonical_module_name(&filtered[0]);
+                let mod_args = filtered[1..].to_vec();
                 steps.push(PipelineStep {
-                    module: m,
-                    args: args_part.clone(),
+                    module: mod_name,
+                    args: mod_args,
                 });
-            }
-        } else {
-            let filtered: Vec<String> = tokens
-                .into_iter()
-                .filter(|t| !MOD_FLAGS.contains(&t.as_str()))
-                .collect();
-            if !filtered.is_empty() {
-                if !filtered[0].starts_with('-') {
-                    let mod_name = canonical_module_name(&filtered[0]);
-                    let mod_args = filtered[1..].to_vec();
-                    steps.push(PipelineStep {
-                        module: mod_name,
-                        args: mod_args,
-                    });
+            } else {
+                // Если первый токен начинается с флага, проверяем legacy ARG_FLAGS (--args)
+                let mut arg_flag_idx: Option<usize> = None;
+                for (idx, t) in filtered.iter().enumerate() {
+                    if ARG_FLAGS.contains(&t.as_str()) {
+                        arg_flag_idx = Some(idx);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = arg_flag_idx {
+                    let modules: Vec<String> = filtered[..idx]
+                        .iter()
+                        .map(|t| canonical_module_name(t))
+                        .collect();
+                    let args_part: Vec<String> = filtered[idx + 1..].to_vec();
+
+                    let target_modules = if modules.is_empty() {
+                        vec!["project".to_string()]
+                    } else {
+                        modules
+                    };
+
+                    for m in target_modules {
+                        steps.push(PipelineStep {
+                            module: m,
+                            args: args_part.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -459,5 +462,46 @@ mod tests {
         assert_eq!(res.steps[2].module, "host");
         assert_eq!(res.steps[3].module, "aider");
         assert_eq!(res.steps[3].args, vec!["-m", "review"]);
+    }
+
+    #[test]
+    fn test_pkg_not_found_with_flag_c() {
+        let args = vec![
+            "pkg".to_string(),
+            "not-found".to_string(),
+            "--no-confirm".to_string(),
+            "tty-clock".to_string(),
+            "-C".to_string(),
+            "4".to_string(),
+            "-c".to_string(),
+        ];
+        let res = parse_pipeline_args(&args);
+        assert_eq!(res.steps.len(), 1);
+        assert_eq!(res.steps[0].module, "pkg");
+        assert_eq!(
+            res.steps[0].args,
+            vec!["not-found", "--no-confirm", "tty-clock", "-C", "4", "-c"]
+        );
+    }
+
+    #[test]
+    fn test_pkg_not_found_with_double_dash() {
+        let args = vec![
+            "pkg".to_string(),
+            "not-found".to_string(),
+            "--no-confirm".to_string(),
+            "--".to_string(),
+            "tty-clock".to_string(),
+            "-C".to_string(),
+            "4".to_string(),
+            "-c".to_string(),
+        ];
+        let res = parse_pipeline_args(&args);
+        assert_eq!(res.steps.len(), 1);
+        assert_eq!(res.steps[0].module, "pkg");
+        assert_eq!(
+            res.steps[0].args,
+            vec!["not-found", "--no-confirm", "--", "tty-clock", "-C", "4", "-c"]
+        );
     }
 }

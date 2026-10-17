@@ -1,5 +1,5 @@
 {
-  description = "Grime - Modular workspace and task orchestration daemon/CLI";
+  description = "Grime - Modular single-binary workspace and task orchestration system";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -32,7 +32,7 @@
           doCheck = false; # Можно включить true при необходимости
 
           meta = with pkgs.lib; {
-            description = "Grime workspace & execution daemon";
+            description = "Grime modular single-binary workspace & execution orchestrator";
             homepage = "https://github.com/ValetJk010/Grime_Project";
             license = licenses.mit;
             maintainers = [ ];

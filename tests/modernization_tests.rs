@@ -515,9 +515,9 @@ async fn test_command_list_and_aliases() {
     assert_eq!(p_modules.steps.len(), 1);
     assert_eq!(p_modules.steps[0].module, "list");
 
-    // 2. Исполнение модуля list.lua в локальной директории modules
+    // 2. Исполнение модуля list.lua в локальной директории modules (если модуль присутствует)
     let local_mods = PathBuf::from("modules");
-    if local_mods.exists() {
+    if local_mods.join("list.lua").exists() {
         let orch = Orchestrator::new(Some(local_mods), None).unwrap();
         let res = orch.run_pipeline(&p_list).await;
         assert!(res.is_ok(), "Выполнение grime list завершилось ошибкой: {:?}", res);

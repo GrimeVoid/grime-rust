@@ -11,7 +11,7 @@
 [![Socket Latency: 1.1 ms](https://img.shields.io/badge/Latency-1.1%20ms%20(Socket)-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **The Ephemeral-First Manifest: The Host OS is sacred and immaculate. Just run it.**  
+> **Manifesto of Absolute Ephemerality: Whatever can be uninstalled, must not be installed.**  
 > High-performance system orchestrator for projects, containers, and ephemeral Nix environments bridging native Rust and declarative LuaJIT.
 
 **GRIME** liberates developers from the age-old nightmare of dependency administration ("Dependency Hell"), host system degradation, and compiler fragmentation. You no longer need to turn your workstation into a dumping ground of temporary packages, conflicting libraries, and fragmented build tools.
@@ -181,7 +181,7 @@ Beneath the effortless developer experience lies a rigorous engineering architec
 
 ### 🦀 Native Rust Microkernel (Grime-RS)
 - **Sub-Millisecond Responsiveness**: CLI cold start of **`~2.8 ms`**, IPC socket latency of **`1.1 ms`**.
-- **Minimal Footprint**: Resident daemon `grimed` consumes only **4–6 MB RAM** at idle.
+- **Minimal Footprint**: Resident daemon `grime --daemon-server` consumes only **4–6 MB RAM** at idle.
 - **Memory Safety**: Zero race conditions, zero memory leaks, and complete type safety guaranteed by Rust.
 
 ### 🌙 Declarative LuaJIT FFI Modules
@@ -225,7 +225,7 @@ flowchart TD
         Fish["Shell (Pipelines ':' & CNF Interceptor)"]
     end
 
-    subgraph CoreLayer ["Native Rust Microkernel (grimed / in-process)"]
+    subgraph CoreLayer ["Native Rust Microkernel (Single-Binary grime / in-process)"]
         UDS["Unix Domain Socket (/run/user/UID/grime.sock)"]
         IPCGuard["IPC DoS & OOM Guard (32 MB Limit)"]
         Router["Pipeline Dispatcher & Async Engine (Tokio)"]
@@ -271,7 +271,7 @@ Measured latency metrics and runtime overhead:
 | :--- | :--- | :--- |
 | **CLI Cold Start (`grime`)** | **`~2.8 ms`** | From binary launch to LuaJIT VM initialization and pipeline parsing |
 | **IPC Socket Roundtrip** | **`1.1 ms`** | Full request-response cycle over Unix Domain Socket |
-| **Idle Memory Consumption** | **`4–6 MB`** | Resident Set Size (RSS) of the background `grimed` microkernel |
+| **Idle Memory Consumption** | **`4–6 MB`** | Resident Set Size (RSS) of the background service `grime --daemon-server` |
 | **Ephemeral Flake Synthesis** | **`< 15 ms`** | Source hashing, toolchain synthesis, and devShell caching |
 | **IPC Payload Limit** | **`32 MB`** | Hardware and memory guard against OOM and socket attacks |
 
@@ -283,7 +283,7 @@ Measured latency metrics and runtime overhead:
 
 #### Via Nix Flake (Recommended Hermetic Method):
 ```bash
-# Build static binaries with zero external runtime dependencies:
+# Build static binary with zero external runtime dependencies:
 nix build .#static
 
 # Or enter ready development shell:
@@ -294,24 +294,28 @@ nix develop
 ```bash
 cargo build --release
 ```
-Compiled binaries will be available at:
-- `target/release/grime` — Ultra-fast CLI client;
-- `target/release/grimed` — Resident background daemon.
+The single binary will be compiled to:
+- `target/release/grime` — Unified CLI client & embedded daemon server (`grime --daemon-server`) with lazy auto-spawn.
 
 Install into your user `PATH`:
 ```bash
-cp target/release/grime target/release/grimed ~/.local/bin/
+cp target/release/grime ~/.local/bin/
 ```
 
 ### 2. Launch Background Daemon (Optional)
+Thanks to Single-Binary Architecture and lazy auto-spawn, `grime` automatically launches the daemon in background when executing detached tasks (`--detach`).
+You can also manage the daemon manually:
 ```bash
-# Start background resident daemon:
-grimed --daemon
+# Start background daemon service:
+grime daemon start
+
+# Or run server directly in foreground:
+grime --daemon-server
 
 # Verify core health and module availability:
 grime doctor
 ```
-*(If the daemon is not running, `grime` executes commands locally in-process with identical features).*
+*(If the daemon is not running, `grime` executes commands locally in-process or automatically spawns the daemon on demand for tasks with `--detach`).*
 
 ### 3. Connect Command-Not-Found Interceptor in Fish Shell
 Add the hook to `~/.config/fish/functions/fish_command_not_found.fish`:
@@ -421,7 +425,7 @@ The repository includes declarative LuaJIT modules (`modules/`), each addressing
 - [`modules/languages/`](modules/languages/) — Compiler and build adapters for C++, Rust, Python, Java with smart scanner [`scanner.lua`](modules/languages/scanner.lua) and shared tools [`utils.lua`](modules/languages/utils.lua).
 - [`modules/nix.lua`](modules/nix.lua) — Declarative and ephemeral Nix Flake/DevShell environments, garbage collection (`gc`), deduplication (`optimise`), generation history, and rollback.
 - [`modules/box.lua`](modules/box.lua) — Orchestration and execution inside isolated Distrobox containers, binary and desktop application export.
-- [`modules/daemon.lua`](modules/daemon.lua) — Management of the `grimed` service: status, memory monitoring, socket verification, restart, and diagnostic logs.
+- [`modules/daemon.lua`](modules/daemon.lua) — Management of the background daemon service (`grime --daemon-server`): status, memory monitoring, socket verification, restart, and diagnostic logs.
 - [`modules/aider.lua`](modules/aider.lua) — Integration of the autonomous AI coding agent Aider directly into the Grime pipeline.
 - [`modules/bus.lua`](modules/bus.lua) — StateBus shared memory across pipeline steps.
 - [`modules/git.lua`](modules/git.lua) — High-level Git operations, changes audit, and snapshots.

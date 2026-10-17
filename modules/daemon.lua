@@ -2,12 +2,12 @@ local ctx = grime.ctx
 
 local function print_help()
     print(string.format([[
-%s%sGrime Daemon%s — Управление фоновым сервисом-демоном (grimed) и контекстом терминала
+%s%sGrime Daemon%s — Управление фоновым сервисом-демоном (grime --daemon-server) и контекстом терминала
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime daemon status                                 Проверить статус демона и сокета
     grime daemon ping                                   Проверить отклик демона
-    grime daemon start                                  Запустить демон grimed в фоне
+    grime daemon start                                  Запустить демон в фоне (grime --daemon-server)
     grime daemon stop                                   Остановить работающий демон
     grime daemon restart                                Перезапустить демон
     grime daemon feed <cmd> [code] [cwd] [output]       Записать событие терминала в StateBus
@@ -153,78 +153,78 @@ function main()
     local sock = get_socket_path()
 
     if action == "status" then
-        local pgrep = ctx.capture("pgrep -x grimed")
+        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
         local is_running = pgrep.code == 0
         local sock_exists = ctx.exists(sock)
 
         if is_running then
             local pid = grime.str.trim(pgrep.stdout)
-            grime.ui.success(string.format("Демон grimed активен (PID: %s, сокет: %s)", pid, sock))
+            grime.ui.success(string.format("Демон grime активен (PID: %s, сокет: %s)", pid, sock))
             ctx.success(pid)
         else
-            grime.ui.warn("Демон grimed не запущен (сокет: " .. sock .. ")")
+            grime.ui.warn("Демон grime не запущен (сокет: " .. sock .. ")")
             ctx.success("stopped")
         end
     elseif action == "ping" then
-        local pgrep = ctx.capture("pgrep -x grimed")
+        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
         if pgrep.code == 0 then
-            grime.ui.success("PONG: демон grimed активен")
+            grime.ui.success("PONG: демон grime активен")
             ctx.success("PONG")
         else
-            ctx.fail("Демон grimed недоступен")
+            ctx.fail("Демон grime недоступен")
         end
     elseif action == "start" then
-        local pgrep = ctx.capture("pgrep -x grimed")
+        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
         if pgrep.code == 0 then
             local pid = grime.str.trim(pgrep.stdout)
-            grime.ui.warn("Демон grimed уже запущен (PID: " .. pid .. ")")
+            grime.ui.warn("Демон grime уже запущен (PID: " .. pid .. ")")
             ctx.success("already_running")
             return
         end
-        ctx.log("Запуск демона grimed в фоне...")
-        local res = ctx.run_shell("nohup setsid grimed >/dev/null 2>&1 &", ".")
+        ctx.log("Запуск демона grime в фоне...")
+        local res = ctx.run_shell("nohup setsid grime --daemon-server >/dev/null 2>&1 &", ".")
         os.execute("sleep 0.1")
-        local check = ctx.capture("pgrep -x grimed")
+        local check = ctx.capture("pgrep -f 'grime --daemon-server'")
         if check.code == 0 then
             local pid = grime.str.trim(check.stdout)
-            grime.ui.success(string.format("Демон grimed успешно запущен (PID: %s)", pid))
+            grime.ui.success(string.format("Демон grime успешно запущен (PID: %s)", pid))
             ctx.success("started")
         else
-            ctx.fail("Не удалось запустить демон grimed")
+            ctx.fail("Не удалось запустить демон grime")
         end
     elseif action == "stop" or action == "kill" then
-        local pgrep = ctx.capture("pgrep -x grimed")
+        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
         if pgrep.code ~= 0 then
-            grime.ui.warn("Демон grimed не был запущен")
+            grime.ui.warn("Демон grime не был запущен")
             ctx.success("not_running")
             return
         end
-        ctx.log("Остановка демона grimed...")
-        local res = ctx.run_shell("pkill -x grimed", ".")
+        ctx.log("Остановка демона grime...")
+        local res = ctx.run_shell("pkill -f 'grime --daemon-server'", ".")
         if res == 0 then
             if ctx.exists(sock) then
                 ctx.delete(sock, true)
             end
-            grime.ui.success("Демон grimed остановлен")
+            grime.ui.success("Демон grime остановлен")
             ctx.success("stopped")
         else
-            ctx.fail("Не удалось остановить процесс grimed")
+            ctx.fail("Не удалось остановить процесс grime --daemon-server")
         end
     elseif action == "restart" then
-        ctx.run_shell("pkill -x grimed", ".")
+        ctx.run_shell("pkill -f 'grime --daemon-server'", ".")
         if ctx.exists(sock) then
             ctx.delete(sock, true)
         end
         os.execute("sleep 0.1")
-        ctx.run_shell("nohup setsid grimed >/dev/null 2>&1 &", ".")
+        ctx.run_shell("nohup setsid grime --daemon-server >/dev/null 2>&1 &", ".")
         os.execute("sleep 0.1")
-        local check = ctx.capture("pgrep -x grimed")
+        local check = ctx.capture("pgrep -f 'grime --daemon-server'")
         if check.code == 0 then
             local pid = grime.str.trim(check.stdout)
-            grime.ui.success(string.format("Демон grimed успешно перезапущен (PID: %s)", pid))
+            grime.ui.success(string.format("Демон grime успешно перезапущен (PID: %s)", pid))
             ctx.success("restarted")
         else
-            ctx.fail("Ошибка перезапуска grimed")
+            ctx.fail("Ошибка перезапуска демона grime")
         end
     elseif action == "feed" or action == "record" then
         local cmd = args[2]

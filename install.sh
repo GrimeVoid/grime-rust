@@ -140,35 +140,30 @@ echo -e "${DIM}Режим модулей:$(if $USE_SYMLINK; then echo " Симл
 echo ""
 
 # ------------------------------------------------------------------------------
-# ШАГ 1: Обнаружение и установка бинарников (grime и grimed)
+# ШАГ 1: Обнаружение и установка бинарника grime
 # ------------------------------------------------------------------------------
-log_info "[1/4] Обнаружение и подготовка бинарников ядра GRIME..."
+log_info "[1/4] Обнаружение и подготовка бинарника ядра GRIME..."
 
 SRC_GRIME=""
-SRC_GRIMED=""
 
 find_existing_binaries() {
     # 1. target/release
     if [[ -x "$SCRIPT_DIR/target/release/grime" ]]; then
         SRC_GRIME="$SCRIPT_DIR/target/release/grime"
-        [[ -x "$SCRIPT_DIR/target/release/grimed" ]] && SRC_GRIMED="$SCRIPT_DIR/target/release/grimed"
         return 0
     fi
     # 2. result/bin (Nix build)
     if [[ -x "$SCRIPT_DIR/result/bin/grime" ]]; then
         SRC_GRIME="$SCRIPT_DIR/result/bin/grime"
-        [[ -x "$SCRIPT_DIR/result/bin/grimed" ]] && SRC_GRIMED="$SCRIPT_DIR/result/bin/grimed"
         return 0
     fi
     # 3. Существующие в целевом BIN_DIR или ~/.local/bin
     if [[ -x "$BIN_DIR/grime" ]]; then
         SRC_GRIME="$BIN_DIR/grime"
-        [[ -x "$BIN_DIR/grimed" ]] && SRC_GRIMED="$BIN_DIR/grimed"
         return 0
     fi
     if [[ -x "$HOME/.local/bin/grime" ]]; then
         SRC_GRIME="$HOME/.local/bin/grime"
-        [[ -x "$HOME/.local/bin/grimed" ]] && SRC_GRIMED="$HOME/.local/bin/grimed"
         return 0
     fi
     return 1
@@ -180,12 +175,10 @@ build_binaries() {
         log_info "Используется Cargo для сборки в режиме --release..."
         (cd "$SCRIPT_DIR" && cargo build --release)
         SRC_GRIME="$SCRIPT_DIR/target/release/grime"
-        [[ -x "$SCRIPT_DIR/target/release/grimed" ]] && SRC_GRIMED="$SCRIPT_DIR/target/release/grimed"
     elif command -v nix >/dev/null 2>&1; then
         log_info "Используется Nix Flakes для сборки пакета..."
         (cd "$SCRIPT_DIR" && nix build --extra-experimental-features "nix-command flakes")
         SRC_GRIME="$SCRIPT_DIR/result/bin/grime"
-        [[ -x "$SCRIPT_DIR/result/bin/grimed" ]] && SRC_GRIMED="$SCRIPT_DIR/result/bin/grimed"
     else
         log_error "Инструменты сборки (cargo, nix) не найдены в системе. Сборка невозможна."
         exit 1
@@ -196,11 +189,10 @@ if [[ "$FORCE_BUILD" == "true" ]]; then
     build_binaries
 else
     if ! find_existing_binaries; then
-        log_info "Скомпилированные бинарники не обнаружены. Попытка автоматической сборки..."
+        log_info "Скомпилированный бинарник не обнаружен. Попытка автоматической сборки..."
         build_binaries
     else
         log_success "Найден бинарник ядра: $SRC_GRIME"
-        [[ -n "$SRC_GRIMED" ]] && log_success "Найден бинарник демона: $SRC_GRIMED"
     fi
 fi
 
@@ -218,17 +210,6 @@ if [[ "$SRC_GRIME" != "$BIN_DIR/grime" ]]; then
 else
     chmod +x "$BIN_DIR/grime" 2>/dev/null || true
     log_info "Бинарник $BIN_DIR/grime уже находится в целевом каталоге."
-fi
-
-# Установка grimed (если доступен)
-if [[ -n "$SRC_GRIMED" && -f "$SRC_GRIMED" ]]; then
-    if [[ "$SRC_GRIMED" != "$BIN_DIR/grimed" ]]; then
-        install -m 755 "$SRC_GRIMED" "$BIN_DIR/grimed"
-        log_success "Установлен бинарник демона: $BIN_DIR/grimed"
-    else
-        chmod +x "$BIN_DIR/grimed" 2>/dev/null || true
-        log_info "Бинарник $BIN_DIR/grimed уже находится в целевом каталоге."
-    fi
 fi
 
 # Проверка $PATH
@@ -306,7 +287,7 @@ if [[ "$SETUP_HOOK" == "true" ]]; then
         mkdir -p "$HOME/.config/fish/functions"
         cat << 'EOF' > "$HOME/.config/fish/functions/fish_command_not_found.fish"
 function fish_command_not_found
-    grime pkg not-found $argv
+    grime pkg not-found --no-confirm -- $argv
 end
 EOF
         log_success "Настроен хук Fish: ~/.config/fish/functions/fish_command_not_found.fish"
@@ -321,7 +302,7 @@ EOF
 
 # GRIME ephemeral command-not-found hook
 command_not_found_handle() {
-    grime pkg not-found "$@"
+    grime pkg not-found --no-confirm -- "$@"
 }
 EOF
             log_success "Добавлен хук в ~/.bashrc"
@@ -337,7 +318,7 @@ EOF
 
 # GRIME ephemeral command-not-found hook
 command_not_found_handler() {
-    grime pkg not-found "$@"
+    grime pkg not-found --no-confirm -- "$@"
 }
 EOF
             log_success "Добавлен хук в ~/.zshrc"
@@ -364,7 +345,7 @@ echo ""
 echo -e "${BOLD}${GREEN}===================================================================${NC}"
 echo -e "${BOLD}${GREEN}              🎉 УСТАНОВКА GRIME УСПЕШНО ЗАВЕРШЕНА!                ${NC}"
 echo -e "${BOLD}${GREEN}===================================================================${NC}"
-echo -e "  • ${BOLD}Бинарники:${NC}    $BIN_DIR/grime $([[ -f "$BIN_DIR/grimed" ]] && echo "и $BIN_DIR/grimed")"
+echo -e "  • ${BOLD}Исполняемый файл:${NC} $BIN_DIR/grime"
 echo -e "  • ${BOLD}Конфигурация:${NC} $CONFIG_DIR"
 echo -e "  • ${BOLD}Модули:${NC}       $CONFIG_DIR/modules ($(if $USE_SYMLINK; then echo "символические ссылки"; else echo "копии файлов"; fi))"
 echo -e "  • ${BOLD}Шаблоны:${NC}      $CONFIG_DIR/templates"

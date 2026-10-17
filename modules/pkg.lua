@@ -902,6 +902,23 @@ local function find_cargo_or_pipx_binary(bin)
     if ctx.exists(cargo_bin) then return cargo_bin, "cargo" end
     local local_bin = (os.getenv("HOME") or "") .. "/.local/bin/" .. bin
     if ctx.exists(local_bin) then return local_bin, "local" end
+    local go_bin = (os.getenv("HOME") or "") .. "/go/bin/" .. bin
+    if ctx.exists(go_bin) then return go_bin, "go" end
+    return nil, nil
+end
+
+-- Поиск утилиты в активном или указанном контейнере Distrobox
+local function find_distrobox_binary(cmd, box_name)
+    if not cmd or cmd == "" or not has_binary("distrobox") then return nil, nil end
+    local target_box = box_name or get_distrobox_target()
+    if not target_box then return nil, nil end
+    local res = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", "command -v " .. cmd })
+    if res.code == 0 and res.stdout and res.stdout:match("%S") then
+        local found = res.stdout:match("^%s*(.-)%s*$")
+        if found and #found > 0 then
+            return target_box, found
+        end
+    end
     return nil, nil
 end
 
@@ -944,6 +961,20 @@ local classify_paths = function(cmd, args) return utils.classify_paths(cmd, args
 local is_root_user = function() return utils.is_root_user(ctx) end
 local build_nix_shell_command = utils.build_nixgl_wrapper
 
+-- Честная проверка доступности пакета в Nixpkgs
+local function is_nixpkgs_package(pkg_name)
+    if not pkg_name or pkg_name == "" then return nil end
+    if NIX_PACKAGE_MAPPINGS[pkg_name] then
+        return NIX_PACKAGE_MAPPINGS[pkg_name]
+    end
+    if not has_binary("nix") then return nil end
+    local res = ctx.capture({ "nix", "eval", "--raw", "nixpkgs#" .. pkg_name .. ".name" })
+    if res.code == 0 and res.stdout and #res.stdout > 0 then
+        return pkg_name
+    end
+    return nil
+end
+
 -- Изолированный запуск через Nix Flake с умным маппингом пакетов, авто-GPU и поддержкой sudo
 local function run_nix_shell(target_name, run_args, explicit_sudo)
     local allowed, reason = classify_paths(target_name, run_args)
@@ -963,6 +994,96 @@ local function run_nix_shell(target_name, run_args, explicit_sudo)
         ctx.fail(string.format("Выполнение утилиты '%s' через nix shell завершилось ошибкой (код %d)", target_name, ret))
     end
     return ret
+end
+
+-- Сквозной опрос всех локальных окружений хоста и контейнеров
+local function find_locally_installed(cmd)
+    if not cmd or cmd == "" then return nil end
+
+    -- 1. Grime Apps (~/.config/grime/apps/<cmd>)
+    local apps_root = get_apps_root()
+    local app_dir = apps_root .. "/" .. cmd
+    if ctx.exists(app_dir) and ctx.is_dir(app_dir) then
+        return { type = "app", name = cmd, dir = app_dir }
+    end
+
+    -- 2. Хост $PATH и бинарники хоста
+    local host_bin = find_host_binary(cmd)
+    if host_bin then
+        return { type = "host", binary = host_bin }
+    end
+
+    -- 3. Flatpak (поиск по имени, app_id или последнему сегменту)
+    local flatpak_id, flatpak_name = find_flatpak_app(cmd)
+    if flatpak_id then
+        return { type = "flatpak", id = flatpak_id, name = flatpak_name }
+    end
+
+    -- 4. Nix Profile (~/.nix-profile/bin/<cmd>)
+    local nix_bin = find_nix_profile_binary(cmd)
+    if nix_bin then
+        return { type = "nix_profile", binary = nix_bin }
+    end
+
+    -- 5. Пользовательские бинарники (Cargo ~/.cargo/bin, Local ~/.local/bin, Go ~/go/bin)
+    local user_bin, bin_type = find_cargo_or_pipx_binary(cmd)
+    if user_bin then
+        return { type = bin_type, binary = user_bin }
+    end
+
+    -- 6. Контейнеры Distrobox (активный/дефолтный fedora-box)
+    local box_name, box_bin = find_distrobox_binary(cmd)
+    if box_name and box_bin then
+        return { type = "distrobox", box = box_name, binary = box_bin }
+    end
+
+    return nil
+end
+
+-- Унифицированное исполнение найденной локальной утилиты
+local function execute_local_target(target, run_args, is_sudo, run_ctx)
+    local c = run_ctx or ctx
+    local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+
+    if target.type == "app" then
+        local ok, err = run_grime_app(target.name, run_args)
+        if not ok and err then
+            c.fail(err)
+            return 1
+        end
+        return 0
+    elseif target.type == "host" then
+        c.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target.binary, args_str))
+        local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
+        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
+        return c.run_interactive(proc)
+    elseif target.type == "flatpak" then
+        c.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", target.id, target.id, args_str))
+        local proc = is_sudo and { "sudo", "-E", "flatpak", "run", target.id } or { "flatpak", "run", target.id }
+        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
+        return c.run_interactive(proc)
+    elseif target.type == "nix_profile" then
+        local allowed, reason = classify_paths(target.binary, run_args)
+        if not allowed then
+            c.fail(string.format("[Grime Pkg] Отказ: %s", reason))
+            return 1
+        end
+        local use_sudo = is_sudo or is_root_user()
+        local shell_cmd = build_nix_shell_command(target.binary, run_args, use_sudo)
+        c.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s%s]: %s...", target.binary, use_sudo and " (sudo -E)" or "", target.binary))
+        return c.run_interactive({ "sh", "-c", shell_cmd })
+    elseif target.type == "distrobox" then
+        c.log(string.format("[Grime Pkg] Запуск утилиты в Distrobox [%s]: %s%s...", target.box, target.binary, args_str))
+        local proc = { "distrobox", "enter", target.box, "--", target.binary }
+        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
+        return c.run_interactive(proc)
+    else
+        -- cargo, local, go
+        c.log(string.format("[Grime Pkg] Запуск утилиты [%s]: %s%s...", target.type, target.binary, args_str))
+        local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
+        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
+        return c.run_interactive(proc)
+    end
 end
 
 -- Справка по запуску утилит
@@ -1139,86 +1260,18 @@ local function handle_run(manager, packages, command_tokens)
         end
     end
 
-    -- Менеджер НЕ указан (сквозной мультипакетный поиск по приоритету)
-    -- 1. Локальные Grime Apps
-    local apps_root = get_apps_root()
-    local app_dir = apps_root .. "/" .. target_name
-    if ctx.exists(app_dir) and ctx.is_dir(app_dir) then
-        local ok, err = run_grime_app(target_name, run_args)
-        if not ok then
-            ctx.fail(err)
-        end
-        return
-    end
-
-    -- 2. Системный PATH / Pacman (Хост)
-    local host_bin = find_host_binary(target_name)
-    if host_bin then
-        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-        ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target_name, args_str))
-        local proc = { target_name }
-        for _, a in ipairs(run_args) do
-            table.insert(proc, a)
-        end
-        local ret = ctx.run_process(proc)
+    -- Менеджер НЕ указан: сквозной опрос ВСЕХ локальных окружений хоста и контейнеров
+    local local_target = find_locally_installed(target_name)
+    if local_target then
+        local ret = execute_local_target(local_target, run_args, is_root_user(), ctx)
         if ret ~= 0 then
-            ctx.fail(string.format("Системная утилита '%s' завершилась с кодом ошибки %d", target_name, ret))
+            ctx.fail(string.format("Выполнение '%s' завершилось с кодом ошибки %d", target_name, ret))
         end
         return
     end
 
-    -- 3. Flatpak
-    local flatpak_id, flatpak_name = find_flatpak_app(target_name)
-    if flatpak_id then
-        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-        ctx.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", flatpak_id, flatpak_id, args_str))
-        local proc = { "flatpak", "run", flatpak_id }
-        for _, a in ipairs(run_args) do
-            table.insert(proc, a)
-        end
-        local ret = ctx.run_process(proc)
-        if ret ~= 0 then
-            ctx.fail(string.format("Flatpak-приложение '%s' завершилось с кодом ошибки %d", flatpak_id, ret))
-        end
-        return
-    end
-
-    -- 4. Nix Profile
-    local nix_bin = find_nix_profile_binary(target_name)
-    if nix_bin then
-        local allowed, reason = classify_paths(target_name, run_args)
-        if not allowed then
-            ctx.fail(string.format("[Grime Pkg] Отказ: %s", reason))
-            return
-        end
-        local use_sudo = is_root_user()
-        local shell_cmd = build_nix_shell_command(target_name, run_args, use_sudo)
-        ctx.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s%s]: %s...", nix_bin, use_sudo and " (sudo -E)" or "", target_name))
-        local ret = ctx.run_process({ "sh", "-c", shell_cmd })
-        if ret ~= 0 then
-            ctx.fail(string.format("Утилита Nix '%s' завершилась с кодом ошибки %d", target_name, ret))
-        end
-        return
-    end
-
-    -- 5. Cargo / Pipx
-    local user_bin, bin_type = find_cargo_or_pipx_binary(target_name)
-    if user_bin then
-        local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-        ctx.log(string.format("[Grime Pkg] Запуск утилиты [%s]: %s%s...", bin_type, user_bin, args_str))
-        local proc = { user_bin }
-        for _, a in ipairs(run_args) do
-            table.insert(proc, a)
-        end
-        local ret = ctx.run_process(proc)
-        if ret ~= 0 then
-            ctx.fail(string.format("Утилита '%s' завершилась с кодом ошибки %d", target_name, ret))
-        end
-        return
-    end
-
-    -- 6. Fallback в изолированный Nix (только если нигде в системе не найдено)
-    ctx.log(string.format("[Grime Pkg] Утилита '%s' не найдена среди установленных пакетов. Запуск в изолированном Nix-окружении...", target_name))
+    -- Не найдено нигде локально -> Fallback в Nixpkgs
+    ctx.log(string.format("[Grime Pkg] Утилита '%s' не найдена среди установленных пакетов и контейнеров. Запуск в изолированном Nix-окружении...", target_name))
     run_nix_shell(target_name, run_args)
 end
 
@@ -1229,6 +1282,23 @@ end
 local function handle_not_found(args, run_ctx)
     local context = run_ctx or ctx
     if not args or #args == 0 then
+        io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
+        os.exit(127)
+    end
+
+    -- 0. Извлечение флагов --no-confirm, -y, --yes
+    local no_confirm = false
+    local clean_args = {}
+    for _, a in ipairs(args) do
+        if a == "--no-confirm" or a == "-y" or a == "--yes" then
+            no_confirm = true
+        else
+            table.insert(clean_args, a)
+        end
+    end
+    args = clean_args
+
+    if #args == 0 then
         io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
         os.exit(127)
     end
@@ -1248,63 +1318,17 @@ local function handle_not_found(args, run_ctx)
         is_sudo = true
     end
 
-    -- 1. Первым делом проверить локальные менеджеры: Flatpak, Grime Apps, Nix Profile, Cargo.
-    -- Если утилита уже есть на компьютере -> запустить немедленно без лишних запросов
-
-    -- 1.1 Flatpak
-    local flatpak_id, _ = find_flatpak_app(cmd)
-    if flatpak_id then
-        local proc = is_sudo and { "sudo", "-E", "flatpak", "run", flatpak_id } or { "flatpak", "run", flatpak_id }
-        for _, a in ipairs(cmd_args) do
-            table.insert(proc, a)
-        end
-        local code = context.run_interactive(proc)
-        os.exit(code)
+    -- 1. СКВОЗНОЙ ОПРОС ВСЕХ ЛОКАЛЬНЫХ СРЕД И КОНТЕЙНЕРОВ
+    -- Если утилита найдена в любом из локальных окружений — запускаем немедленно, ничего не спрашивая!
+    local local_target = find_locally_installed(cmd)
+    if local_target then
+        local code = execute_local_target(local_target, cmd_args, is_sudo, context)
+        os.exit(code or 0)
     end
 
-    -- 1.2 Grime Apps (~/.config/grime/apps/<cmd>)
-    local apps_root = get_apps_root()
-    local app_dir = apps_root .. "/" .. cmd
-    if context.exists(app_dir) and context.is_dir(app_dir) then
-        local ok, err = run_grime_app(cmd, cmd_args)
-        if not ok and err then
-            io.stderr:write(string.format("[Grime] Ошибка запуска Grime App '%s': %s\n", cmd, err))
-            os.exit(1)
-        end
-        os.exit(0)
-    end
-
-    -- 1.3 Nix Profile (~/.nix-profile/bin/<cmd>)
-    local nix_bin = find_nix_profile_binary(cmd)
-    if nix_bin then
-        local allowed, reason = classify_paths(cmd, cmd_args)
-        if not allowed then
-            io.stderr:write(string.format("[Grime] Отказ: %s\n", reason))
-            os.exit(1)
-        end
-        local use_sudo = is_sudo
-        local shell_cmd = build_nix_shell_command(cmd, cmd_args, use_sudo)
-        local code = context.run_interactive({ "sh", "-c", shell_cmd })
-        os.exit(code)
-    end
-
-    -- 1.4 Cargo (~/.cargo/bin/<cmd>)
-    local cargo_bin = HOME .. "/.cargo/bin/" .. cmd
-    if context.exists(cargo_bin) then
-        local proc = is_sudo and { "sudo", "-E", cargo_bin } or { cargo_bin }
-        for _, a in ipairs(cmd_args) do
-            table.insert(proc, a)
-        end
-        local code = context.run_interactive(proc)
-        os.exit(code)
-    end
-
-    -- 2. Если утилиты нет локально:
-    -- Проверить наличие утилиты в репозитории Nixpkgs (эфемерный запуск через Flake)
-    local nix_pkg = NIX_PACKAGE_MAPPINGS[cmd]
-    if not nix_pkg and has_binary("nix") then
-        nix_pkg = cmd
-    end
+    -- 2. ТОЛЬКО ЕСЛИ УТИЛИТА НЕ НАЙДЕНА ВО ВСЕХ ЛОКАЛЬНЫХ СРЕДАХ И КОНТЕЙНЕРАХ:
+    -- Ищем её в репозитории Nixpkgs для эфемерного запуска
+    local nix_pkg = is_nixpkgs_package(cmd)
 
     if nix_pkg then
         local allowed, reason = classify_paths(cmd, cmd_args)
@@ -1315,28 +1339,75 @@ local function handle_not_found(args, run_ctx)
 
         local use_sudo = is_sudo
         local prompt_root = use_sudo and " (с правами root через sudo -E)" or ""
-        io.stdout:write(string.format("[Grime] Команда '%s' не найдена на хосте.\nНайдена в репозитории Nixpkgs. Запустить во Flake-окружении (nixpkgs#%s)%s? [Y/n]: ", cmd, nix_pkg, prompt_root))
-        io.stdout:flush()
 
-        local ans = io.read()
-        if ans == nil then
-            io.stdout:write("\n[Grime] Запуск отменён.\n")
-            os.exit(127)
+        -- Если передан флаг --no-confirm -> запускаем без подтверждения
+        local should_run = no_confirm
+        if not should_run then
+            io.stdout:write(string.format("[Grime] Команда '%s' не найдена среди установленных утилит и контейнеров.\nНайдена в репозитории Nixpkgs. Запустить во Flake-окружении (nixpkgs#%s)%s? [Y/n]: ", cmd, nix_pkg, prompt_root))
+            io.stdout:flush()
+
+            local ans = io.read()
+            if ans == nil then
+                io.stdout:write("\n[Grime] Запуск отменён.\n")
+                os.exit(127)
+            end
+
+            local trimmed = ans:match("^%s*(.-)%s*$"):lower()
+            if trimmed == "" or trimmed == "y" or trimmed == "yes" or trimmed == "да" or trimmed == "д" then
+                should_run = true
+            else
+                io.stdout:write("[Grime] Запуск отменён.\n")
+                os.exit(127)
+            end
         end
 
-        local trimmed = ans:match("^%s*(.-)%s*$"):lower()
-        if trimmed == "" or trimmed == "y" or trimmed == "yes" or trimmed == "да" or trimmed == "д" then
+        if should_run then
             local shell_cmd = build_nix_shell_command(cmd, cmd_args, use_sudo)
             local proc = { "nix", "shell", "nixpkgs#" .. nix_pkg, "--command", "bash", "-c", shell_cmd }
             local code = context.run_interactive(proc)
-            os.exit(code)
-        else
-            io.stdout:write("[Grime] Запуск отменён.\n")
+            os.exit(code or 0)
+        end
+    end
+
+    -- 3. Если не найдена в Nixpkgs: проверим, есть ли в официальных репозиториях Arch
+    if has_binary("pacman") then
+        local pac_check = context.capture({ "pacman", "-Si", cmd })
+        if pac_check.code == 0 and pac_check.stdout and pac_check.stdout:match("%S") then
+            io.stdout:write(string.format("[Grime] Команда '%s' не установлена в системе.\n💡 Доступна в репозитории Arch: sudo pacman -S %s\n", cmd, cmd))
             os.exit(127)
         end
     end
 
-    io.stdout:write(string.format("[Grime] Команда '%s' не найдена в системе и репозитории Nixpkgs.\n", cmd))
+    -- 4. Нечеткий поиск опечаток (fuzzy did-you-mean) по установленным утилитам
+    local candidates = {}
+    local path_env = os.getenv("PATH") or ""
+    for dir in path_env:gmatch("[^:]+") do
+        local ok, files = pcall(function() return ctx.list_dir and ctx.list_dir(dir) end)
+        if ok and files then
+            for _, f in ipairs(files) do table.insert(candidates, f) end
+        end
+    end
+    local flatpaks = get_flatpak_packages(false)
+    if flatpaks then
+        for _, f in ipairs(flatpaks) do
+            table.insert(candidates, f.name)
+            local app_tail = f.details:match("%.([^%.]+)$")
+            if app_tail then table.insert(candidates, app_tail) end
+        end
+    end
+
+    local best_match = nil
+    if grime and grime.fuzzy and grime.fuzzy.find_best_match then
+        best_match = grime.fuzzy.find_best_match(cmd, candidates, 0.65)
+    end
+    if not best_match and grime and grime.fuzzy and grime.fuzzy.match_best then
+        best_match = grime.fuzzy.match_best(cmd, candidates)
+    end
+
+    io.stdout:write(string.format("[Grime] Команда '%s' не найдена в системе и контейнерах.\n", cmd))
+    if best_match and best_match ~= "" and best_match ~= cmd then
+        io.stdout:write(string.format("💡 Возможно, вы имели в виду: %s?\n", best_match))
+    end
     os.exit(127)
 end
 

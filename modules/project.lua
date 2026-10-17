@@ -167,6 +167,27 @@ local function handle_rename(projects_root, args)
     return renamed_path
 end
 
+local function resolve_abs_path(p)
+    local cur_pwd = os.getenv("PWD") or "."
+    if not p or p == "" or p == "." then
+        local t = ctx.target_dir
+        if t and #t > 0 and t ~= "." then return t end
+        return cur_pwd
+    end
+    if p:find("^~") then
+        p = (os.getenv("HOME") or "") .. p:sub(2)
+    end
+    if not p:find("^/") then
+        local base = (ctx.target_dir and #ctx.target_dir > 0 and ctx.target_dir ~= ".") and ctx.target_dir or cur_pwd
+        p = base .. "/" .. p
+    end
+    local norm = ctx.normalize_path(p)
+    if not norm or norm == "" then
+        return cur_pwd
+    end
+    return norm
+end
+
 local function resolve_project_context(parsed)
     local projects_root = get_projects_root()
     local supported_langs = get_supported_languages()
@@ -177,29 +198,37 @@ local function resolve_project_context(parsed)
 
     -- 1. Если пришли по конвейеру
     if ctx.pipeline_input then
-        local target_dir = ctx.target_dir
+        local target_dir = resolve_abs_path(ctx.target_dir)
         local detected_lang = lang or detect_language(target_dir) or "cpp"
         return action, target_dir, detected_lang, extra_args
     end
 
     -- 2. Если классификатор определил существующую директорию
     if parsed.target_dir and ctx.exists(parsed.target_dir) then
-        local detected_lang = lang or detect_language(parsed.target_dir) or "cpp"
-        return action, parsed.target_dir, detected_lang, extra_args
+        local abs_dir = resolve_abs_path(parsed.target_dir)
+        local detected_lang = lang or detect_language(abs_dir) or "cpp"
+        return action, abs_dir, detected_lang, extra_args
     end
 
     -- 3. Если передано позиционное имя проекта
     if #parsed.args > 0 then
         local project_name = parsed.args[1]
-        if ctx.exists(project_name) then
-            local detected_lang = lang or detect_language(project_name) or "cpp"
-            return action, project_name, detected_lang, extra_args
-        end
 
         if action == "init" then
+            -- Если передана точка или относительный/абсолютный путь -> инициализировать прямо в указанной директории
+            if project_name == "." or project_name:find("^%./") or project_name:find("^/") or project_name:find("^~") then
+                return action, resolve_abs_path(project_name), lang or "cpp", extra_args
+            end
+
             local target_lang_dir = get_language_dir(projects_root, lang or "cpp")
             local target_dir = target_lang_dir .. "/" .. project_name
             return action, target_dir, lang or "cpp", extra_args
+        end
+
+        if ctx.exists(project_name) then
+            local abs_dir = resolve_abs_path(project_name)
+            local detected_lang = lang or detect_language(abs_dir) or "cpp"
+            return action, abs_dir, detected_lang, extra_args
         end
 
         if lang then
@@ -227,6 +256,9 @@ local function resolve_project_context(parsed)
 
     -- 4. Язык без имени проекта
     if lang then
+        if action == "init" then
+            return action, resolve_abs_path("."), lang, extra_args
+        end
         local target_lang_dir = get_language_dir(projects_root, lang)
         return action, target_lang_dir, lang, extra_args
     end
@@ -237,9 +269,10 @@ local function resolve_project_context(parsed)
     end
 
     -- 6. Текущая папка вызова
-    local detected_lang = detect_language(ctx.target_dir)
+    local cur_abs = resolve_abs_path(".")
+    local detected_lang = detect_language(cur_abs)
     if detected_lang then
-        return action, ctx.target_dir, detected_lang, extra_args
+        return action, cur_abs, detected_lang, extra_args
     end
 
     -- 7. Дефолтный проект

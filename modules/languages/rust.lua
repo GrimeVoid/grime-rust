@@ -74,7 +74,18 @@ function RustAdapter:build(root, ctx)
 end
 
 function RustAdapter:get_run_command(root, extra_args)
-    if grime.fs.exists(root .. "/Cargo.toml") then
+    local target = self:get_target(root)
+    if target and grime.fs.exists(target) and grime.fs.is_file(target) then
+        local cmd = { target }
+        if extra_args then
+            for _, a in ipairs(extra_args) do
+                table.insert(cmd, a)
+            end
+        end
+        return cmd
+    end
+
+    if utils.has_binary("cargo") and grime.fs.exists(root .. "/Cargo.toml") then
         local cmd = { "cargo", "run" }
         if extra_args and #extra_args > 0 then
             table.insert(cmd, "--")

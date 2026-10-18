@@ -680,6 +680,57 @@ local function parse_aider_tags(output, working_dir, user_prompt)
     return nil
 end
 
+--- Компактный микро-рендерер Markdown для стилизации вывода Aider в терминале
+local function render_terminal_markdown(text)
+    if not text or text == "" then return text end
+    local lines, in_code = {}, false
+
+    local function inline_fmt(s)
+        s = s:gsub("`([^`]+)`", "\27[38;5;222m%1\27[0m")
+        s = s:gsub("%*%*([^*]+)%*%*", "\27[1m%1\27[22m")
+        s = s:gsub("%*([^*]+)%*", "\27[3m%1\27[23m")
+        s = s:gsub("(%s)_([^_]+)_(%p?)", "%1\27[3m%2\27[23m%3")
+        return s
+    end
+
+    for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        if in_code then
+            if line:match("^%s*```") then
+                in_code = false
+                table.insert(lines, "\27[90m└────────────────────────────────────────\27[0m")
+            else
+                table.insert(lines, line == "" and "\27[90m│\27[0m" or ("\27[90m│\27[0m \27[38;5;223m" .. line .. "\27[0m"))
+            end
+        else
+            local lang = line:match("^%s*```([%w_%-+#]*)")
+            if lang ~= nil then
+                in_code = true
+                table.insert(lines, string.format("\27[90m┌── [ \27[1;36m%s\27[0;90m ] ──────────────────────\27[0m", lang ~= "" and lang or "code"))
+            elseif line:match("^%s*%-%-%-%s*$") then
+                table.insert(lines, "\27[90m────────────────────────────────────────\27[0m")
+            elseif line:match("^%s*###%s+") then
+                table.insert(lines, "\27[1;32m### " .. inline_fmt(line:gsub("^%s*###%s+", "")) .. "\27[0m")
+            elseif line:match("^%s*##%s+") then
+                table.insert(lines, "\27[1;34m## " .. inline_fmt(line:gsub("^%s*##%s+", "")) .. "\27[0m")
+            elseif line:match("^%s*#%s+") then
+                table.insert(lines, "\27[1;36m# " .. inline_fmt(line:gsub("^%s*#%s+", "")) .. "\27[0m")
+            elseif line:match("^%s*>%s?") then
+                table.insert(lines, "  \27[90m│\27[0m \27[3m" .. inline_fmt(line:gsub("^%s*>%s?", "")) .. "\27[0m")
+            elseif line:match("^%s*[%-%*]%s+") then
+                local indent, content = line:match("^(%s*)[%-%*]%s+(.*)")
+                table.insert(lines, string.format("%s  \27[36m•\27[0m %s", indent or "", inline_fmt(content or "")))
+            elseif line:match("^%s*%d+%.%s+") then
+                local indent, num, content = line:match("^(%s*)(%d+)%.%s+(.*)")
+                table.insert(lines, string.format("%s  \27[33m%s.\27[0m %s", indent or "", num or "1", inline_fmt(content or "")))
+            else
+                table.insert(lines, inline_fmt(line))
+            end
+        end
+    end
+    if in_code then table.insert(lines, "\27[90m└────────────────────────────────────────\27[0m") end
+    return table.concat(lines, "\n")
+end
+
 local function print_help()
     print(string.format([[
 %s%sGrime Aider%s — AI-ассистент парного программирования и генерации кода
@@ -1064,7 +1115,9 @@ function main()
     if is_headless then
         ctx.log("Вызов Aider...")
         local res = ctx.capture(aider_cmd, working_dir)
-        io.stdout:write(res.stdout)
+        if res.stdout and res.stdout ~= "" then
+            io.stdout:write(render_terminal_markdown(res.stdout))
+        end
         local cleaned_stderr = res.stderr:gsub("Warning: Input is not a terminal %(fd=0%)%.\r?\n?", "")
         io.stderr:write(cleaned_stderr)
 
@@ -1132,6 +1185,7 @@ local M = {
     validate_command_security = validate_command_security,
     execute_ai_action = execute_ai_action,
     parse_aider_tags = parse_aider_tags,
+    render_terminal_markdown = render_terminal_markdown,
 }
 return M
 

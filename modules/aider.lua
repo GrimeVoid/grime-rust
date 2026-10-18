@@ -2,16 +2,29 @@ local ctx = grime.ctx
 
 local GRIME_CONVENTIONS = [[
 
-[GRIME CONVENTIONS]:
-1. ДЕЙСТВИЯ: Не предлагай команды текстом — выполняй их через:
-   <grime_exec>команда</grime_exec> или <grime_spawn module="cmd">команда</grime_spawn>
-   Запрещены sudo и выход за пределы $HOME.
-2. ШИНА: Сохранение данных в StateBus:
-   <grime_bus key="pipeline.<key>" type="json">{"k":"v"}</grime_bus>
-3. МОДУЛИ: Вызов субагента Grime:
-   <grime_spawn module="<mod>" cwd="<dir>">аргументы</grime_spawn>
-4. КОНВЕЙЕР: Передача промпта следующему шагу:
-   <next_agent_prompt>инструкция</next_agent_prompt>
+[GRIME CONVENTIONS & EXECUTION PROTOCOL]:
+1. СТРОГИЙ КОНТРОЛЬ ЗАПУСКА (ЗАПРЕТ САМОВОЛЬНОГО ИСПОЛНЕНИЯ):
+   - Если пользователь задал теоретический вопрос, запросил справку, консультацию, анализ кода или архитектурный совет:
+     ОТВЕЧАЙ ТОЛЬКО ТЕКСТОМ В MARKDOWN! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО генерировать исполняемые теги <grime_exec> или <grime_spawn>!
+   - Использование <grime_exec> и <grime_spawn> разрешено ИСКЛЮЧИТЕЛЬНО в двух случаях:
+     1) Создание или делегирование задачи специализированному субагенту Grime:
+        <grime_spawn module="..." cwd="...">промпт</grime_spawn>
+     2) Прямая, явная просьба пользователя выполнить команду/действие (например: "собери проект", "создай файл", "выполни X", "запусти тесты").
+2. БЕЗОПАСНОСТЬ:
+   - При явной просьбе пользователя команды выполняются через:
+     <grime_exec [cwd="..."]>команда</grime_exec>
+   - СТРОЖАЙШЕ ЗАПРЕЩЕНЫ sudo, su, doas, pkexec и любые операции за пределами $HOME.
+3. АКТУАЛЬНЫЙ СТЕК GRIME (Single-Binary Rust v1.1.0, манифест "Всё, что может быть не установлено, не должно быть установлено"):
+   - Модуль пакетов: `grime pkg search <запрос>`, `grime pkg run <утилита> [args]` (вместо устаревшего gpsearch).
+   - Модуль проектов: `grime project init <lang> [name|.]`, `grime project build [name|.]`, `grime project run [name|.]` (Auto-Toolchain / Nix Zero-Dirty-Tree). Поддерживаются C++, Rust, Python, Java.
+   - Модуль приложений: `grime app new`, `grime app run [--detach]`, `grime app bundle`, `grime app snapshot`, `grime app rollback`.
+   - Модуль контейнеров: `grime box [name] run <cmd>` (вместо устаревшего dbox-run).
+   - Синтаксис конвейеров: модули разделяются двоеточием `:`, приложения разделяются "->", флаги утилит после `--`.
+4. ШИНА И КОНВЕЙЕР:
+   - Сохранение данных в StateBus (RAM демона):
+     <grime_bus key="pipeline.<key>" type="json">{"k":"v"}</grime_bus>
+   - Передача промпта следующему шагу конвейера:
+     <next_agent_prompt>инструкция</next_agent_prompt>
 ]]
 
 local TERMINAL_DIAGNOSTIC_RULES = [[
@@ -756,6 +769,7 @@ local function print_help()
 
 %sИНТЕГРАЦИЯ С ШИНОЙ GRIME:%s
     Aider автоматически поддерживает теги в выводе:
+    • <grime_exec [cwd="..."]>...</grime_exec>         — выполнение команд хоста (по явной просьбе)
     • <grime_bus key="..." type="json">...</grime_bus> — запись в шину состояния
     • <grime_spawn module="...">...</grime_spawn>       — вызов других модулей
     • <next_agent_prompt>...</next_agent_prompt>       — передача следующему шагу

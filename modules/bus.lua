@@ -1,3 +1,7 @@
+-- Summary: Управление шиной состояния (StateBus) и событиями (EventBus)
+-- Description: Управление шиной состояния (StateBus) и событиями (EventBus)
+description = "Управление шиной состояния (StateBus) и событиями (EventBus)"
+
 local ctx = grime.ctx
 
 local function print_help()
@@ -250,3 +254,8 @@ function main()
         ctx.fail("Неизвестная команда bus: " .. action)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

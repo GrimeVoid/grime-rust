@@ -165,11 +165,22 @@ function BaseAdapter:apply_template(root, ctx, extra)
     return true
 end
 
-function BaseAdapter:init_project(root, ctx)
+function BaseAdapter:init_project(root, ctx, description)
     ctx.mkdir_p(root .. "/" .. self.src_dir)
-    local template_applied = self:apply_template(root, ctx)
+    local proj_name = root:match("([^/\\]+)$") or "project"
+    local desc = description or string.format("Проект %s на %s", proj_name, self.name)
+    local template_applied = self:apply_template(root, ctx, desc)
     if not template_applied then
-        self:create_default_files(root, ctx)
+        self:create_default_files(root, ctx, desc)
+    end
+    local gjson = root .. "/grime.json"
+    if not ctx.exists(gjson) then
+        local f = io.open(gjson, "w")
+        if f then
+            local data = string.format('{\n  "name": %q,\n  "language": %q,\n  "description": %q\n}\n', proj_name, self.name, desc)
+            f:write(data)
+            f:close()
+        end
     end
 end
 

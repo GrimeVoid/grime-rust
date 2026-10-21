@@ -1,3 +1,7 @@
+-- Summary: Информация о хост-системе и переключение в домашнюю директорию
+-- Description: Информация о хост-системе и переключение в домашнюю директорию
+description = "Информация о хост-системе и переключение в домашнюю директорию"
+
 local ctx = grime.ctx
 
 local function print_help()
@@ -69,3 +73,8 @@ function main()
         ctx.module_return(target_dir)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

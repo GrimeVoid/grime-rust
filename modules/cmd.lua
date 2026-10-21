@@ -1,3 +1,7 @@
+-- Summary: Выполнение внешних команд в контексте целевой директории конвейера
+-- Description: Выполнение внешних команд в контексте целевой директории конвейера
+description = "Выполнение внешних команд в контексте целевой директории конвейера"
+
 local ctx = grime.ctx
 
 local function print_help()
@@ -120,3 +124,8 @@ function main()
         end
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

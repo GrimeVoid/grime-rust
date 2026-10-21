@@ -1,5 +1,7 @@
 -- Summary: Полноценное управление Git-репозиториями и версионированием
+-- Description: Декларативные операции Git (status, commit, log, diff, snapshot)
 -- Описание: Управление Git (status, commit, log, diff, branch, checkout, init) и программный API
+description = "Декларативные операции Git (status, commit, log, diff, snapshot)"
 
 local ctx = grime.ctx
 
@@ -16,6 +18,7 @@ local ANSI = {
 }
 
 local M = {}
+M.description = description
 
 local function print_help()
     print(string.format([[

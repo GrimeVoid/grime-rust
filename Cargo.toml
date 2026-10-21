@@ -2,6 +2,7 @@
 name = "grime_pj"
 version = "1.1.0"
 edition = "2021"
+description = "Высокопроизводительный системный оркестратор проектов, контейнеров и эфемерных Nix-окружений на стыке Rust и LuaJIT"
 
 [lib]
 name = "grime"

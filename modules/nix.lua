@@ -4,6 +4,10 @@
     управления профилем пользователя Nix и переносимых бандлов.
 ]]
 
+-- Summary: Оркестратор изолированных сред Nix Flakes, сборок и профилей
+-- Description: Оркестратор изолированных сред Nix Flakes, сборок и профилей
+description = "Оркестратор изолированных сред Nix Flakes, сборок и профилей"
+
 local argparse = require("languages.argparse")
 local scanner = require("languages.scanner")
 local utils = require("languages.utils")
@@ -870,3 +874,8 @@ function main()
         ctx.fail("Неизвестное действие: " .. action)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

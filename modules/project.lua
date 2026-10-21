@@ -1,3 +1,7 @@
+-- Summary: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)
+-- Description: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)
+description = "Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)"
+
 local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
@@ -504,7 +508,8 @@ function main()
         end
 
         ctx.mkdir_p(project_dir)
-        adapter:init_project(project_dir, ctx)
+        local init_desc = (#extra_args > 0) and table.concat(extra_args, " ") or nil
+        adapter:init_project(project_dir, ctx, init_desc)
         ctx.log(string.format("Проект под %s инициализирован: %s", lang, project_dir))
         if ctx.has_next_step or return_path_requested then
             if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
@@ -628,3 +633,8 @@ function main()
         ctx.fail("Неизвестное действие: " .. action)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

@@ -1,3 +1,7 @@
+-- Summary: Управление фоновым сервисом-демоном GRIME и терминальным контекстом
+-- Description: Управление фоновым сервисом-демоном GRIME и терминальным контекстом
+description = "Управление фоновым сервисом-демоном GRIME и терминальным контекстом"
+
 local ctx = grime.ctx
 
 local function print_help()
@@ -349,3 +353,8 @@ function main()
         ctx.fail("Неизвестная команда daemon: " .. action)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

@@ -55,9 +55,10 @@ function RustAdapter:get_target(root)
     return BaseAdapter.get_target(self, root)
 end
 
-function RustAdapter:create_default_files(root, ctx)
+function RustAdapter:create_default_files(root, ctx, description)
     local proj_name = root:match("([^/\\]+)$") or "rust_app"
     local clean_name = proj_name:lower():gsub("[%s%-]", "_")
+    local desc = description or ("Проект " .. proj_name .. " на Rust")
 
     local cargo_file = root .. "/Cargo.toml"
     if not ctx.exists(cargo_file) then
@@ -66,9 +67,10 @@ function RustAdapter:create_default_files(root, ctx)
 name = "%s"
 version = "0.1.0"
 edition = "2021"
+description = %q
 
 [dependencies]
-]], clean_name)
+]], clean_name, desc)
         local f = io.open(cargo_file, "w")
         if f then
             f:write(content)

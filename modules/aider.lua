@@ -1,3 +1,7 @@
+-- Summary: AI-ассистент парного программирования, генерации кода и скаффолдинга
+-- Description: AI-ассистент парного программирования, генерации кода и скаффолдинга
+description = "AI-ассистент парного программирования, генерации кода и скаффолдинга"
+
 local ctx = grime.ctx
 local utils = require("languages.utils")
 
@@ -1091,6 +1095,7 @@ function main()
 end
 
 local M = {
+    description = description,
     classify_stack = classify_stack,
     run_dev = run_dev,
     validate_command_security = validate_command_security,

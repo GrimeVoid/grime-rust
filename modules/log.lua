@@ -1,5 +1,7 @@
--- Summary: Централизованный сбор, хранение и управление логами Grime
+-- Summary: Централизованный сбор, хранение и фильтрация логов системы
+-- Description: Централизованный сбор, хранение и фильтрация логов системы
 -- Описание: Управление логами (кольцевой буфер StateBus, grime.jsonl, фильтрация ошибок, интеграция с Git)
+description = "Централизованный сбор, хранение и фильтрация логов системы"
 
 local ctx = grime.ctx
 local git = require("git")
@@ -17,6 +19,7 @@ local ANSI = {
 }
 
 local M = {}
+M.description = description
 
 local MAX_RING_BUFFER = 100
 

@@ -1,3 +1,7 @@
+-- Summary: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
+-- Description: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
+description = "Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox"
+
 local argparse = require("languages.argparse")
 local utils = require("languages.utils")
 
@@ -1831,3 +1835,8 @@ function main()
         handle_search(raw_tokens, all_mode)
     end
 end
+
+return {
+    main = main,
+    description = description,
+}

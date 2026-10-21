@@ -1,3 +1,7 @@
+-- Summary: Управление жизненным циклом локальных микроприложений (Grime Apps)
+-- Description: Управление жизненным циклом локальных микроприложений (Grime Apps)
+description = "Управление жизненным циклом локальных микроприложений (Grime Apps)"
+
 local utils = require("languages.utils")
 local BaseAdapter = require("languages.base")
 local scanner = require("languages.scanner")
@@ -1636,6 +1640,7 @@ function main()
 end
 
 return {
+    description = description,
     main = main,
     get_apps_root = get_apps_root,
     load_manifest = load_manifest,

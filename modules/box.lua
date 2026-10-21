@@ -1,3 +1,7 @@
+-- Summary: Оркестрация контейнеров Distrobox / Podman и экспорт бинарников
+-- Description: Оркестрация контейнеров Distrobox / Podman и экспорт бинарников
+description = "Оркестрация контейнеров Distrobox / Podman и экспорт бинарников"
+
 local argparse = require("languages.argparse")
 local utils = require("languages.utils")
 local ctx = grime.ctx
@@ -464,6 +468,8 @@ function cleanup()
 end
 
 local M = {
+    description = description,
+    main = main,
     ensure_running = ensure_box_running,
     exec = function(box_name, cmd, cwd, env)
         ensure_box_running(box_name)

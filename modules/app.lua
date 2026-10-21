@@ -104,7 +104,7 @@ end
 local function load_manifest(app_dir, app_name)
     local mpath = app_dir .. "/app.lua"
     if not ctx.is_file(mpath) then return nil, "Манифест app.lua не найден: " .. mpath end
-    local chunk, err = loadfile(mpath)
+    local chunk, err = loadfile(mpath, "t")
     if not chunk then return nil, "Ошибка синтаксиса манифеста: " .. tostring(err) end
     local ok, res = pcall(chunk)
     if not ok then return nil, "Ошибка выполнения манифеста: " .. tostring(res) end
@@ -141,7 +141,7 @@ end
 local function to_cmd_str(cmd)
     if type(cmd) ~= "table" then return cmd end
     local q = {}
-    for _, t in ipairs(cmd) do table.insert(q, string.format("%q", t)) end
+    for _, t in ipairs(cmd) do table.insert(q, utils.shell_escape(t)) end
     return table.concat(q, " ")
 end
 
@@ -345,13 +345,13 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
     local env = get_nix_env(app_name, app_dir)
     local cmd_tokens = resolve_cmd_tokens(m, run_args)
     local raw_cmd_str = to_cmd_str(cmd_tokens)
-    local nix_cmd_str = string.format("nix develop --command sh -c %q", raw_cmd_str)
+    local nix_cmd_str = string.format("nix develop --command sh -c %s", utils.shell_escape(raw_cmd_str))
 
     if is_detach or m.detached then
-        local log = app_dir .. "/app.log"
+        local log_file = app_dir .. "/app.log"
         ctx.log(string.format("Запуск '%s' в изолированном Nix Flake (фоновый режим)...", app_name))
-        local res = ctx.capture(string.format("nohup %s > %q 2>&1 & echo $!", nix_cmd_str, log), app_dir, env)
-        local pid = res.stdout:match("%d+")
+        local res = ctx.capture(string.format("nohup setsid %s > %s 2>&1 < /dev/null & echo $!", nix_cmd_str, utils.shell_escape(log_file)), app_dir, env)
+        local pid = res.stdout and res.stdout:match("%d+") or nil
         if pid then
             local pf = io.open(app_dir .. "/app.pid", "w")
             if pf then
@@ -363,7 +363,7 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
             pcall(grime.bus.set, "app." .. app_name .. ".status", "running")
             pcall(grime.bus.set, "app." .. app_name .. ".pid", pid or "?")
         end
-        ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log))
+        ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log_file))
         return 0
     end
 
@@ -375,7 +375,7 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
             tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
             local f = io.open(tmp_file, "w")
             if f then f:write(cur_payload); f:close() end
-            run_cmd = string.format("%s < %q", nix_cmd_str, tmp_file)
+            run_cmd = string.format("%s < %s", nix_cmd_str, utils.shell_escape(tmp_file))
         end
 
         local res = ctx.capture(run_cmd, app_dir, env)
@@ -445,7 +445,7 @@ local function run_chain(apps_root, segments)
         for i = 2, #seg do table.insert(rargs, seg[i]) end
         local cmd_tokens = resolve_cmd_tokens(m, rargs)
         local raw_cmd_str = to_cmd_str(cmd_tokens)
-        local nix_cmd_str = string.format("nix develop --command sh -c %q", raw_cmd_str)
+        local nix_cmd_str = string.format("nix develop --command sh -c %s", utils.shell_escape(raw_cmd_str))
 
         local env = get_nix_env(name, dir)
         local run_cmd = nix_cmd_str
@@ -454,7 +454,7 @@ local function run_chain(apps_root, segments)
             tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
             local f = io.open(tmp_file, "w")
             if f then f:write(cur_payload); f:close() end
-            run_cmd = string.format("%s < %q", nix_cmd_str, tmp_file)
+            run_cmd = string.format("%s < %s", nix_cmd_str, utils.shell_escape(tmp_file))
         end
 
         local res = ctx.capture(run_cmd, dir, env)
@@ -561,20 +561,7 @@ local function new_app(apps_root, args)
     if not ctx.is_file(mpath) then
         local f = io.open(mpath, "w")
         if f then
-            f:write(string.format([[return {
-    name = %q,
-    description = %q,
-    type = %q,
-    artifact = "build/%s",
-    build = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
-    run = "build/%s",
-    -- Базовый тулчейн определяется автоматически через Auto-Toolchain.
-    -- Дополнительные библиотеки при необходимости указываются в special_dependencies:
-    special_dependencies = {},
-    detached = false,
-}
-]],
-                app_name, user_prompt ~= "" and user_prompt or ("Приложение " .. app_name), lang, app_name, app_name))
+            f:write(utils.generate_app_manifest(app_name, lang, user_prompt))
             f:close()
         end
     end
@@ -953,22 +940,30 @@ local function bundle_app(apps_root, raw_name)
 
     ctx.log(string.format("⚡ [Grime App Bundle] Упаковка приложения '%s' через Nix Bundle в %s...", app_name, dist_dir))
 
+    ensure_flake(app_dir, m, app_name)
+    local app_dir_abs = ctx.normalize_path(app_dir)
+
     local is_polyglot = (m.type == "polyglot")
     if not is_polyglot and type(m.languages) == "table" and #m.languages > 1 then
         is_polyglot = true
     end
 
+    local pkgs_prelude = string.format(
+        'let flake = builtins.getFlake ("path:" + %q); nixpkgs = flake.inputs.nixpkgs or (builtins.getFlake "nixpkgs"); pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};',
+        app_dir_abs
+    )
+
     local bundle_cmd = nil
     if is_polyglot and art_file and ctx.is_file(art_file) then
         local art_abs = ctx.normalize_path(art_file)
-        local art_name = art_file:match("([^/]+)$") or "compute_engine"
+        local art_name = art_file:match("([^/]+)$") or "engine"
 
         local let_bindings = {
-            "let pkgs = import <nixpkgs> {};",
+            pkgs_prelude,
             string.format("art = /. + %q;", art_abs),
         }
         local copy_commands = {}
-        local py_script_name = nil
+        local entry_script = nil
 
         local scripts = {}
         if type(m.sources) == "table" then
@@ -977,36 +972,42 @@ local function bundle_app(apps_root, raw_name)
                 if ctx.exists(spath) and ctx.is_file(spath) and ctx.normalize_path(spath) ~= art_abs then
                     local sname = s:match("([^/]+)$") or s
                     table.insert(scripts, { name = sname, path = ctx.normalize_path(spath) })
-                    if sname:match("%.py$") and not py_script_name then
-                        py_script_name = sname
+                    if (sname:match("%.py$") or sname:match("%.lua$") or sname:match("%.sh$")) and not entry_script then
+                        entry_script = sname
                     end
                 end
             end
         end
 
         if #scripts == 0 then
-            local p = io.popen("find \"" .. app_dir .. "\" -maxdepth 1 -type f -name \"*.py\" 2>/dev/null")
-            if p then
-                for line in p:lines() do
-                    local f = line:match("^%s*(.-)%s*$")
-                    if #f > 0 and ctx.normalize_path(f) ~= art_abs then
-                        local fname = f:match("([^/]+)$")
-                        table.insert(scripts, { name = fname, path = ctx.normalize_path(f) })
-                        if not py_script_name then
-                            py_script_name = fname
+            local entries = (grime.fs and grime.fs.list and grime.fs.list(app_dir)) or {}
+            for _, fname in ipairs(entries) do
+                if fname:match("%.py$") or fname:match("%.sh$") then
+                    local fpath = ctx.normalize_path(app_dir .. "/" .. fname)
+                    if ctx.is_file(fpath) and fpath ~= art_abs then
+                        table.insert(scripts, { name = fname, path = fpath })
+                        if not entry_script then
+                            entry_script = fname
                         end
                     end
                 end
-                p:close()
             end
         end
-
-        py_script_name = py_script_name or "analyzer.py"
 
         for idx, sc in ipairs(scripts) do
             local var_name = "src_" .. tostring(idx)
             table.insert(let_bindings, string.format("%s = /. + %q;", var_name, sc.path))
             table.insert(copy_commands, string.format("cp -p ${%s} $out/libexec/%s\n    chmod +x $out/libexec/%s", var_name, sc.name, sc.name))
+        end
+
+        local run_cmd_line
+        if type(m.run) == "string" and m.run ~= "" and m.run ~= m.artifact then
+            run_cmd_line = string.format('cd "$LIBEXEC_DIR" && %s "$@"', m.run)
+        elseif entry_script then
+            local runner = entry_script:match("%.py$") and "python3" or (entry_script:match("%.lua$") and "luajit" or "sh")
+            run_cmd_line = string.format('if [ -f "$LIBEXEC_DIR/%s" ]; then %s "$LIBEXEC_DIR/%s" "$@"; fi', entry_script, runner, entry_script)
+        else
+            run_cmd_line = string.format('"$LIBEXEC_DIR/%s" "$@"', art_name)
         end
 
         local nix_expr = string.format([[
@@ -1037,13 +1038,8 @@ if [ -x "$LIBEXEC_DIR/%s" ]; then
     sleep 0.1 2>/dev/null || true
 fi
 
-if [ -f "$LIBEXEC_DIR/%s" ]; then
-    python3 "$LIBEXEC_DIR/%s" "$@"
-    EXIT_CODE=$?
-else
-    EXIT_CODE=0
-fi
-
+%s
+EXIT_CODE=$?
 exit $EXIT_CODE
 EOF
     sed -i "s|@out@|$out|g" $out/bin/%s
@@ -1059,18 +1055,17 @@ EOF
             table.concat(copy_commands, "\n    "),
             app_name,
             art_name, art_name,
-            py_script_name, py_script_name,
+            run_cmd_line,
             app_name, app_name, app_name,
             app_name
         )
         bundle_cmd = { "nix", "bundle", "--expr", nix_expr, "-o", out_link, "--impure" }
     elseif art_file and ctx.is_file(art_file) then
         local art_abs = ctx.normalize_path(art_file)
-        local nix_expr = string.format([[let pkgs = import <nixpkgs> {}; art = /. + %q; in pkgs.stdenv.mkDerivation { pname = %q; version = "1.0.0"; dontUnpack = true; installPhase = ''mkdir -p $out/bin; cp -p ${art} $out/bin/%s; chmod +x $out/bin/%s''; meta.mainProgram = %q; }]],
-            art_abs, app_name, app_name, app_name, app_name)
+        local nix_expr = string.format([[%s art = /. + %q; in pkgs.stdenv.mkDerivation { pname = %q; version = "1.0.0"; dontUnpack = true; installPhase = ''mkdir -p $out/bin; cp -p ${art} $out/bin/%s; chmod +x $out/bin/%s''; meta.mainProgram = %q; }]],
+            pkgs_prelude, art_abs, app_name, app_name, app_name, app_name)
         bundle_cmd = { "nix", "bundle", "--expr", nix_expr, "-o", out_link, "--impure" }
     else
-        ensure_flake(app_dir, m, app_name)
         bundle_cmd = { "nix", "bundle", ".", "-o", out_link }
     end
 
@@ -1293,7 +1288,7 @@ local function stop_app(apps_root, raw_name, force)
     local stopped = false
 
     if pid and is_pid_alive(pid) then
-        ctx.capture(string.format("kill %s %s 2>/dev/null", sig, pid))
+        ctx.capture(string.format("pkill %s -P %s 2>/dev/null; kill %s -- -%s 2>/dev/null; kill %s %s 2>/dev/null", sig, pid, sig, pid, sig, pid))
         for _ = 1, 5 do
             if not is_pid_alive(pid) then
                 stopped = true
@@ -1301,8 +1296,8 @@ local function stop_app(apps_root, raw_name, force)
             end
             if ctx.sleep then ctx.sleep(50) else os.execute("sleep 0.05") end
         end
-        if not stopped and force then
-            ctx.capture(string.format("kill -9 %s 2>/dev/null", pid))
+        if not stopped then
+            ctx.capture(string.format("pkill -KILL -P %s 2>/dev/null; kill -9 -- -%s 2>/dev/null; kill -9 %s 2>/dev/null", pid, pid, pid))
             stopped = not is_pid_alive(pid)
         end
         if stopped or not is_pid_alive(pid) then
@@ -1421,20 +1416,28 @@ function main()
     local wants_help = false
     local path_requested = false
     local filtered = {}
+    local extra_args = {}
+    local after_sep = false
 
     local raw_args = ctx.args or {}
     for _, a in ipairs(raw_args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--detach", "-d", "--help", "-h", "--path", "-p", "--force", "-f", "-9" }, 0.75) or a
-        if matched == "--detach" or matched == "-d" then
-            is_detach = true
-        elseif matched == "--help" or matched == "-h" or a == "help" then
-            wants_help = true
-        elseif matched == "--path" or matched == "-p" or a == "path" then
-            path_requested = true
-        elseif matched == "--force" or matched == "-f" or a == "-9" or a == "-f" or a == "--force" then
-            force = true
+        if not after_sep and (a == "--" or a == "//") then
+            after_sep = true
+        elseif after_sep then
+            table.insert(extra_args, a)
         else
-            table.insert(filtered, a)
+            local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--detach", "-d", "--help", "-h", "--path", "-p", "--force", "-f", "-9" }, 0.75) or a
+            if matched == "--detach" or matched == "-d" then
+                is_detach = true
+            elseif matched == "--help" or matched == "-h" or a == "help" then
+                wants_help = true
+            elseif matched == "--path" or matched == "-p" or a == "path" then
+                path_requested = true
+            elseif matched == "--force" or matched == "-f" or a == "-9" then
+                force = true
+            else
+                table.insert(filtered, a)
+            end
         end
     end
 
@@ -1462,6 +1465,7 @@ function main()
         local is_subcmd_action = (#filtered > 0 and known_actions[filtered[1]])
         if not is_subcmd_action then
             if #filtered == 0 then
+                if ctx.set_target_dir then ctx.set_target_dir(apps_root) end
                 ctx.module_return(apps_root)
                 return
             else
@@ -1471,6 +1475,7 @@ function main()
                     ctx.fail(string.format("Приложение '%s' не найдено в %s", filtered[1], apps_root))
                     return
                 end
+                if ctx.set_target_dir then ctx.set_target_dir(dir) end
                 ctx.module_return(dir)
                 return
             end
@@ -1493,6 +1498,7 @@ function main()
         stop_app(apps_root, filtered[2], force)
         return
     elseif subcmd == "new" or subcmd == "create" or subcmd == "init" then
+        for _, ea in ipairs(extra_args) do table.insert(filtered, ea) end
         new_app(apps_root, filtered)
         return
     elseif subcmd == "build" then
@@ -1503,6 +1509,7 @@ function main()
         if not m then ctx.fail(err or "Манифест не найден"); return end
         local ok = build_app(app_name, m, dir)
         if ok and (ctx.has_next_step or path_requested) then
+            if ctx.set_target_dir then ctx.set_target_dir(dir) end
             ctx.module_return(dir)
         end
         return
@@ -1510,12 +1517,14 @@ function main()
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app commit <app_name> [сообщение]"); return end
         local msg_tokens = {}
         for i = 3, #filtered do table.insert(msg_tokens, filtered[i]) end
+        for _, ea in ipairs(extra_args) do table.insert(msg_tokens, ea) end
         commit_app(apps_root, filtered[2], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
         return
     elseif subcmd == "snapshot" then
         if not filtered[2] then ctx.fail("Укажите имя приложения: grime app snapshot <app_name> [сообщение]"); return end
         local msg_tokens = {}
         for i = 3, #filtered do table.insert(msg_tokens, filtered[i]) end
+        for _, ea in ipairs(extra_args) do table.insert(msg_tokens, ea) end
         snapshot_app(apps_root, filtered[2], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
         return
     elseif subcmd == "log" then
@@ -1593,6 +1602,11 @@ function main()
         end
     end
     if #cur_seg > 0 then table.insert(segments, cur_seg) end
+    if #segments > 0 and #extra_args > 0 then
+        for _, ea in ipairs(extra_args) do
+            table.insert(segments[#segments], ea)
+        end
+    end
 
     if #segments > 1 then
         local code = run_chain(apps_root, segments)
@@ -1608,11 +1622,13 @@ function main()
         if not m then ctx.fail(err); return end
         local rargs = {}
         for i = 2, #filtered do table.insert(rargs, filtered[i]) end
+        for _, ea in ipairs(extra_args) do table.insert(rargs, ea) end
         local code = run_app(name, m, dir, rargs, is_detach)
         if code ~= 0 then
             ctx.fail(string.format("Приложение '%s' завершилось с кодом %d", name, code))
         else
             if ctx.has_next_step or path_requested then
+                if ctx.set_target_dir then ctx.set_target_dir(dir) end
                 ctx.module_return(dir)
             end
         end

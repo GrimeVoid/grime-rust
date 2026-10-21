@@ -7,8 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::cancellation::PipelineCanceller;
+use crate::event_bus::EventBus;
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::ParsedPipeline;
+use crate::state_bus::StateBus;
 
 /// Статус открепленной задачи под контролем супервизора.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,6 +119,8 @@ pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, Arc<DetachedTask>>>>,
     idle_timeout_secs: u64,
     check_interval: Duration,
+    shared_state_bus: Option<Arc<StateBus>>,
+    shared_event_bus: Option<Arc<EventBus>>,
 }
 
 impl Default for TaskSupervisor {
@@ -135,6 +139,22 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             idle_timeout_secs,
             check_interval,
+            shared_state_bus: None,
+            shared_event_bus: None,
+        }
+    }
+
+    pub fn with_shared_buses(
+        idle_timeout_secs: u64,
+        state_bus: Arc<StateBus>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            idle_timeout_secs,
+            check_interval: Duration::from_millis(500),
+            shared_state_bus: Some(state_bus),
+            shared_event_bus: Some(event_bus),
         }
     }
 
@@ -221,18 +241,14 @@ impl TaskSupervisor {
         let task_for_monitor = task.clone();
 
         // 1. Монитор неактивности (Heartbeat Watchdog)
+        // Контролирует максимальное время выполнения шага без событий (idle_timeout_secs),
+        // реально отменяя зависший шаг через task_for_monitor.canceller.cancel(&reason).
         let watchdog_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(check_interval).await;
 
                 if task_for_monitor.get_status() != TaskStatus::Running {
                     break;
-                }
-
-                // Если активен шаг конвейера, задача не считается зависшей
-                if task_for_monitor.is_step_active() {
-                    task_for_monitor.touch_heartbeat();
-                    continue;
                 }
 
                 let last = task_for_monitor.last_heartbeat.load(Ordering::SeqCst);
@@ -243,7 +259,7 @@ impl TaskSupervisor {
 
                 if now.saturating_sub(last) >= idle_timeout {
                     eprintln!(
-                        "{} [Supervisor] Задача '{}' зависла (отсутствие активности > {}с). Принудительное завершение...",
+                        "{} [Supervisor] Задача '{}' зависла (отсутствие событий активности > {}с). Принудительное завершение...",
                         "[Supervisor]".red().bold(),
                         task_for_monitor.id,
                         idle_timeout
@@ -252,7 +268,7 @@ impl TaskSupervisor {
                     task_for_monitor.set_status(TaskStatus::TerminatedByTimeout);
 
                     let reason = format!(
-                        "Превышен таймаут простоя (Inactivity Timeout > {}s)",
+                        "Превышен таймаут выполнения шага без событий (Timeout > {}s)",
                         idle_timeout
                     );
                     task_for_monitor.canceller.cancel(&reason);
@@ -261,10 +277,25 @@ impl TaskSupervisor {
             }
         });
 
-        // 2. Исполнитель конвейера
+        // 2. Исполнитель конвейера (с передачей canceller задачи и разделяемых шин демона)
         let task_for_exec = task.clone();
+        let shared_state = self
+            .shared_state_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(StateBus::new()));
+        let shared_event = self
+            .shared_event_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(EventBus::default()));
+
         tokio::spawn(async move {
-            let orch_res = Orchestrator::new(modules_dir, config_path.as_deref());
+            let orch_res = Orchestrator::new_with_shared(
+                modules_dir,
+                config_path.as_deref(),
+                shared_state,
+                shared_event,
+                canceller.clone(),
+            );
             let orchestrator = match orch_res {
                 Ok(o) => o,
                 Err(e) => {
@@ -278,7 +309,7 @@ impl TaskSupervisor {
                 let _ = orchestrator.set_environment(env_map);
             }
 
-            // Подписка на шину событий: отслеживание активности шагов и сброс таймаута активности
+            // Подписка на шину событий: отслеживание переходов между шагами и пользовательских событий
             let mut event_rx = orchestrator.event_bus().subscribe();
             let task_heartbeat = task_for_exec.clone();
             let heartbeat_listener = tokio::spawn(async move {
@@ -299,7 +330,12 @@ impl TaskSupervisor {
                 }
             });
 
-            let exec_res = orchestrator.run_pipeline(&parsed).await;
+            let exec_res = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(orchestrator.run_pipeline(&parsed))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Паника в задаче оркестратора: {}", e)));
+
             heartbeat_listener.abort();
             watchdog_handle.abort();
 
@@ -408,39 +444,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supervisor_active_step_prevents_timeout() {
-        let canceller = PipelineCanceller::new();
-        let task = Arc::new(DetachedTask::new("active_step_task".to_string(), "heavy_build".to_string(), canceller.clone()));
+    async fn test_supervisor_cancels_hanging_lua_step() {
+        let tmp_dir = std::env::temp_dir().join(format!("grime_sup_hang_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("hang_mod.lua"),
+            r#"
+            function main()
+                local x = 0
+                while true do
+                    x = x + 1
+                end
+            end
+            "#,
+        )
+        .unwrap();
 
-        // Устанавливаем активность шага
-        task.set_step_active(true);
+        let supervisor = TaskSupervisor::with_check_interval(1, Duration::from_millis(100));
+        let parsed = crate::pipeline::parse_pipeline_args(&["hang_mod".to_string()]);
+        let task_id = supervisor
+            .spawn_detached_pipeline(parsed, Some(tmp_dir.clone()), None, None, None)
+            .await;
 
-        let task_clone = task.clone();
-        tokio::spawn(async move {
-            let check_interval = Duration::from_millis(100);
-            for _ in 0..15 {
-                tokio::time::sleep(check_interval).await;
-                if task_clone.is_step_active() {
-                    task_clone.touch_heartbeat();
-                    continue;
-                }
-                let last = task_clone.last_heartbeat.load(Ordering::SeqCst);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                if now.saturating_sub(last) >= 1 {
-                    task_clone.set_status(TaskStatus::TerminatedByTimeout);
-                    task_clone.canceller.cancel("Timeout");
-                    break;
-                }
-            }
-        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let status = supervisor.get_task_status(&task_id).await;
+        assert_eq!(
+            status,
+            Some(TaskStatus::TerminatedByTimeout),
+            "Зависший в бесконечном цикле Lua-шаг должен быть принудительно прерван Watchdog-ом"
+        );
 
-        // Ждем 1.2 секунды — благодаря активности шага задача должна оставаться Running
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert_eq!(task.get_status(), TaskStatus::Running);
-        assert!(!canceller.is_cancelled());
-
-        // Завершаем шаг
-        task.set_step_active(false);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[tokio::test]

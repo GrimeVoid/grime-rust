@@ -352,10 +352,9 @@ local function get_apps_packages(_all_mode)
     local apps_root = get_apps_root()
     if not ctx.exists(apps_root) then return {} end
     local list = {}
-    local p = io.popen(string.format("ls -1 %q 2>/dev/null", apps_root))
-    if p then
-        for l in p:lines() do
-            local item = l:match("^%s*(.-)%s*$")
+    local ok_ls, items = pcall(fs.list, apps_root)
+    if ok_ls and type(items) == "table" then
+        for _, item in ipairs(items) do
             local app_dir = apps_root .. "/" .. item
             if item ~= "" and not item:match("^%.") and ctx.is_dir(app_dir) then
                 local has_flake = ctx.exists(app_dir .. "/flake.nix")
@@ -380,7 +379,6 @@ local function get_apps_packages(_all_mode)
                 })
             end
         end
-        p:close()
     end
     table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
     return list
@@ -419,10 +417,50 @@ local function get_pipx_packages(_all_mode)
     return list
 end
 
+-- Сбор пакетов: dnf
+local function get_dnf_packages(all_mode)
+    if not has_binary("dnf") then return nil, "dnf не установлен" end
+    local cmd = all_mode and { "rpm", "-qa", "--qf", "%{NAME} %{VERSION}-%{RELEASE}\n" } or { "dnf", "repoquery", "--userinstalled", "--qf", "%{name} %{version}" }
+    local res = ctx.capture(cmd)
+    if res.code ~= 0 then return nil, "Ошибка выполнения dnf/rpm" end
+    local list = {}
+    for line in (res.stdout or ""):gmatch("[^\r\n]+") do
+        local name, ver = line:match("^(%S+)%s+(%S+)")
+        if name then table.insert(list, { name = name, version = ver or "", details = "" }) end
+    end
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    return list
+end
+
+-- Сбор пакетов: apt
+local function get_apt_packages(all_mode)
+    if not has_binary("apt-mark") and not has_binary("dpkg-query") then return nil, "apt не установлен" end
+    local cmd = all_mode and { "dpkg-query", "-f", "${Package} ${Version}\n", "-W" } or { "apt-mark", "showmanual" }
+    local res = ctx.capture(cmd)
+    if res.code ~= 0 then return nil, "Ошибка выполнения apt/dpkg" end
+    local list = {}
+    for line in (res.stdout or ""):gmatch("[^\r\n]+") do
+        local name, ver = line:match("^(%S+)%s*(%S*)")
+        if name and #name > 0 then table.insert(list, { name = name, version = ver or "", details = "" }) end
+    end
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    return list
+end
+
 -- Обобщенный диспетчер получения пакетов
 local function get_packages_for_manager(mgr, all_mode)
     if mgr == "pacman" then
         return get_pacman_packages(all_mode)
+    elseif mgr == "dnf" then
+        return get_dnf_packages(all_mode)
+    elseif mgr == "apt" then
+        return get_apt_packages(all_mode)
+    elseif mgr == "host" then
+        if has_binary("pacman") then return get_pacman_packages(all_mode)
+        elseif has_binary("dnf") then return get_dnf_packages(all_mode)
+        elseif has_binary("apt") then return get_apt_packages(all_mode)
+        end
+        return nil, "Системный пакетный менеджер хоста не обнаружен"
     elseif mgr == "flatpak" then
         return get_flatpak_packages(all_mode)
     elseif mgr == "nix" then
@@ -454,7 +492,7 @@ local function handle_summary(all_mode, show_all_managers)
         "ПРЕВЬЮ"))
     io.stdout:write(string.rep("─", 80) .. "\n")
 
-    local managers = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
+    local managers = { "pacman", "dnf", "apt", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local active_count = 0
     local shown_managers = {}
 
@@ -627,7 +665,7 @@ local function handle_search(query_tokens, all_mode)
     io.stdout:write(string.format("\n\27[1m🔍 Сквозной нечеткий поиск пакета '\27[33m%s\27[0m\27[1m' %s:\27[0m\n", query, mode_label))
     io.stdout:write(string.rep("─", 80) .. "\n")
 
-    local managers = { "pacman", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
+    local managers = { "pacman", "dnf", "apt", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local total_found = 0
     local managers_found = 0
     local all_matched_names = {}
@@ -805,6 +843,19 @@ local NIX_PACKAGE_MAPPINGS = {
     hyperfine = "hyperfine", cowsay = "cowsay", sl = "sl", figlet = "figlet",
     lolcat = "lolcat", fastfetch = "fastfetch", neofetch = "neofetch",
     glxinfo = "mesa-demos", glxgears = "mesa-demos",
+
+    -- Сетевой аудит и утилиты повышенных привилегий
+    nmap = "nmap", masscan = "masscan", tcpdump = "tcpdump", wireshark = "wireshark",
+    tshark = "wireshark-cli", ["aircrack-ng"] = "aircrack-ng", reaver = "reaver-wps-fork-t6x",
+    kismet = "kismet", bettercap = "bettercap", ettercap = "ettercap",
+    ["arp-scan"] = "arp-scan", fping = "fping", hping3 = "hping",
+    tcptraceroute = "tcptraceroute", wavemon = "wavemon",
+    ["wireguard-tools"] = "wireguard-tools", wg = "wireguard-tools", openvpn = "openvpn",
+    iptables = "iptables", ip6tables = "iptables", nftables = "nftables", ebtables = "ebtables",
+    parted = "parted", gparted = "gparted",
+    fdisk = "util-linux", cfdisk = "util-linux", sfdisk = "util-linux",
+    gdisk = "gptfdisk", cgdisk = "gptfdisk",
+    smartctl = "smartmontools", ethtool = "ethtool", iotop = "iotop", hdparm = "hdparm",
 }
 
 -- Поиск системного бинарника на хосте (с исключением ~/.nix-profile и ~/.cargo для чистого разделения)
@@ -912,7 +963,7 @@ local function find_distrobox_binary(cmd, box_name)
     if not cmd or cmd == "" or not has_binary("distrobox") then return nil, nil end
     local target_box = box_name or get_distrobox_target()
     if not target_box then return nil, nil end
-    local res = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", "command -v " .. cmd })
+    local res = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", "command -v " .. utils.shell_escape(cmd) })
     if res.code == 0 and res.stdout and res.stdout:match("%S") then
         local found = res.stdout:match("^%s*(.-)%s*$")
         if found and #found > 0 then
@@ -961,6 +1012,116 @@ local classify_paths = function(cmd, args) return utils.classify_paths(cmd, args
 local is_root_user = function() return utils.is_root_user(ctx) end
 local build_nix_shell_command = utils.build_nixgl_wrapper
 
+-- Утилиты, требующие повышенных привилегий (root / CAP_NET_RAW / прямой доступ к оборудованию) по умолчанию
+local ROOT_PRIVILEGE_COMMANDS = {
+    masscan = true,
+    tcpdump = true,
+    wireshark = true,
+    tshark = true,
+    ["aircrack-ng"] = true,
+    reaver = true,
+    kismet = true,
+    bettercap = true,
+    ettercap = true,
+    ["arp-scan"] = true,
+    fping = true,
+    hping3 = true,
+    traceroute = true,
+    tcptraceroute = true,
+    iptables = true,
+    ip6tables = true,
+    nftables = true,
+    ebtables = true,
+    parted = true,
+    gparted = true,
+    fdisk = true,
+    cfdisk = true,
+    sfdisk = true,
+    gdisk = true,
+    cgdisk = true,
+    smartctl = true,
+    hdparm = true,
+    nvme = true,
+    ethtool = true,
+    wavemon = true,
+    ["wireguard-tools"] = true,
+    wg = true,
+    openvpn = true,
+    iotop = true,
+}
+
+-- Специфические утилиты, требующие повышенных привилегий при наличии определенных флагов
+local SPECIFIC_ROOT_FLAGS = {
+    nmap = {
+        flags = {
+            ["-O"] = true,
+            ["-A"] = true,
+            ["-sS"] = true,
+            ["-sU"] = true,
+            ["-sA"] = true,
+            ["-sF"] = true,
+            ["-sM"] = true,
+            ["-sN"] = true,
+            ["-sX"] = true,
+            ["-sW"] = true,
+            ["-sI"] = true,
+            ["-sO"] = true,
+            ["-sY"] = true,
+            ["-sZ"] = true,
+            ["--traceroute"] = true,
+            ["--badsum"] = true,
+            ["--packet-trace"] = true,
+            ["--send-ip"] = true,
+            ["--send-eth"] = true,
+        },
+        matcher = function(arg)
+            if not arg or type(arg) ~= "string" then return false end
+            if arg:sub(1, 1) == "-" and arg:sub(2, 2) ~= "-" then
+                -- Сканирования RAW-сокетов: -sS, -sU, -sA, -sF, -sM, -sN, -sX, -sW, -sI, -sO, -sY, -sZ
+                if arg:match("^%-s[SUAFMNXWIOYZsuafmnxwioyz]") then
+                    return true
+                end
+                -- Определение ОС (-O) или агрессивный режим (-A), включая сгруппированные флаги вроде -vO, -PnA, -sVO
+                if arg:match("[OA]") then
+                    return true
+                end
+            elseif arg:sub(1, 2) == "--" then
+                if arg == "--traceroute" or arg == "--badsum" or arg == "--packet-trace"
+                   or arg == "--send-ip" or arg == "--send-eth" or arg:match("^%-%-osscan") then
+                    return true
+                end
+            end
+            return false
+        end,
+    },
+}
+
+-- Интеллектуальная проверка необходимости root-привилегий
+local function needs_root_privileges(cmd, args)
+    if not cmd or cmd == "" then return false end
+    local base_cmd = (cmd:match("([^/]+)$") or cmd):lower()
+
+    -- 1. Безусловные утилиты повышенных привилегий
+    if ROOT_PRIVILEGE_COMMANDS[base_cmd] then
+        return true
+    end
+
+    -- 2. Специфические утилиты со специфическими флагами (например, nmap)
+    local spec = SPECIFIC_ROOT_FLAGS[base_cmd]
+    if spec and args and #args > 0 then
+        for _, arg in ipairs(args) do
+            if spec.flags and spec.flags[arg] then
+                return true
+            end
+            if spec.matcher and spec.matcher(arg) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 -- Честная проверка доступности пакета в Nixpkgs
 local function is_nixpkgs_package(pkg_name)
     if not pkg_name or pkg_name == "" then return nil end
@@ -977,6 +1138,7 @@ end
 
 -- Изолированный запуск через Nix Flake с умным маппингом пакетов, авто-GPU и поддержкой sudo
 local function run_nix_shell(target_name, run_args, explicit_sudo)
+    -- 1. Аудит безопасности путей хоста: НАИВЫСШИЙ ПРИОРИТЕТ
     local allowed, reason = classify_paths(target_name, run_args)
     if not allowed then
         ctx.fail(string.format("[Grime Pkg] Отказ: %s", reason))
@@ -984,7 +1146,11 @@ local function run_nix_shell(target_name, run_args, explicit_sudo)
     end
 
     local nix_pkg = NIX_PACKAGE_MAPPINGS[target_name] or target_name
-    local use_sudo = explicit_sudo or is_root_user()
+    local auto_sudo = not explicit_sudo and not is_root_user() and needs_root_privileges(target_name, run_args)
+    if auto_sudo then
+        ctx.log(string.format("[Grime Pkg] Утилита '%s' требует повышенных привилегий (RAW-сокеты/доступ к оборудованию). Запуск через sudo -E...", target_name))
+    end
+    local use_sudo = explicit_sudo or auto_sudo or is_root_user()
     local shell_cmd = build_nix_shell_command(target_name, run_args, use_sudo)
     local cmd = { "nix", "shell", "nixpkgs#" .. nix_pkg, "--command", "bash", "-c", shell_cmd }
 
@@ -1053,7 +1219,7 @@ local function execute_local_target(target, run_args, is_sudo, run_ctx)
         end
         return 0
     elseif target.type == "host" then
-        c.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target.binary, args_str))
+        c.log(string.format("[Grime Pkg] Запуск системной утилиты [хост%s]: %s%s...", is_sudo and " (sudo -E)" or "", target.binary, args_str))
         local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
         for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
         return c.run_interactive(proc)
@@ -1079,7 +1245,7 @@ local function execute_local_target(target, run_args, is_sudo, run_ctx)
         return c.run_interactive(proc)
     else
         -- cargo, local, go
-        c.log(string.format("[Grime Pkg] Запуск утилиты [%s]: %s%s...", target.type, target.binary, args_str))
+        c.log(string.format("[Grime Pkg] Запуск утилиты [%s%s]: %s%s...", target.type, is_sudo and " (sudo -E)" or "", target.binary, args_str))
         local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
         for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
         return c.run_interactive(proc)
@@ -1164,13 +1330,35 @@ local function handle_run(manager, packages, command_tokens)
         table.insert(run_args, ct)
     end
 
+    local is_sudo = false
+    if target_name == "sudo" and #run_args > 0 then
+        is_sudo = true
+        target_name = table.remove(run_args, 1)
+    end
+    if not is_sudo and is_root_user() then
+        is_sudo = true
+    end
+
+    -- 1. Аудит безопасности путей хоста: НАИВЫСШИЙ ПРИОРИТЕТ
+    local allowed, reason = classify_paths(target_name, run_args)
+    if not allowed then
+        ctx.fail(string.format("[Grime Pkg] Отказ: %s", reason))
+        return
+    end
+
+    -- 2. Интеллектуальная авто-элевация привилегий (Auto-Elevate to Root)
+    if not is_sudo and needs_root_privileges(target_name, run_args) then
+        is_sudo = true
+        ctx.log(string.format("[Grime Pkg] Утилита '%s' требует повышенных привилегий (RAW-сокеты/доступ к оборудованию). Запуск через sudo -E...", target_name))
+    end
+
     -- Если менеджер явно указан
     if manager then
         if manager == "flatpak" then
             local flatpak_id = find_flatpak_app(target_name) or target_name
             local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
             ctx.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", flatpak_id, flatpak_id, args_str))
-            local proc = { "flatpak", "run", flatpak_id }
+            local proc = is_sudo and { "sudo", "-E", "flatpak", "run", flatpak_id } or { "flatpak", "run", flatpak_id }
             for _, a in ipairs(run_args) do
                 table.insert(proc, a)
             end
@@ -1187,8 +1375,8 @@ local function handle_run(manager, packages, command_tokens)
             return
         elseif manager == "pacman" or manager == "host" then
             local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-            ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост]: %s%s...", target_name, args_str))
-            local proc = { target_name }
+            ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост%s]: %s%s...", is_sudo and " (sudo -E)" or "", target_name, args_str))
+            local proc = is_sudo and { "sudo", "-E", target_name } or { target_name }
             for _, a in ipairs(run_args) do
                 table.insert(proc, a)
             end
@@ -1198,14 +1386,9 @@ local function handle_run(manager, packages, command_tokens)
             end
             return
         elseif manager == "nix" then
-            local allowed, reason = classify_paths(target_name, run_args)
-            if not allowed then
-                ctx.fail(string.format("[Grime Pkg] Отказ: %s", reason))
-                return
-            end
             local nix_bin = find_nix_profile_binary(target_name)
             if nix_bin then
-                local use_sudo = is_root_user()
+                local use_sudo = is_sudo or is_root_user()
                 local shell_cmd = build_nix_shell_command(target_name, run_args, use_sudo)
                 ctx.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s%s]: %s...", nix_bin, use_sudo and " (sudo -E)" or "", target_name))
                 local ret = ctx.run_process({ "sh", "-c", shell_cmd })
@@ -1214,7 +1397,7 @@ local function handle_run(manager, packages, command_tokens)
                 end
                 return
             else
-                run_nix_shell(target_name, run_args)
+                run_nix_shell(target_name, run_args, is_sudo)
                 return
             end
         elseif manager == "cargo" then
@@ -1223,8 +1406,8 @@ local function handle_run(manager, packages, command_tokens)
             local target_bin = ctx.exists(cargo_bin) and cargo_bin or (ctx.exists(local_bin) and local_bin or nil)
             if target_bin then
                 local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-                ctx.log(string.format("[Grime Pkg] Запуск утилиты Cargo [%s]: %s%s...", target_bin, target_name, args_str))
-                local proc = { target_bin }
+                ctx.log(string.format("[Grime Pkg] Запуск утилиты Cargo [%s%s]: %s%s...", target_bin, is_sudo and " (sudo -E)" or "", target_name, args_str))
+                local proc = is_sudo and { "sudo", "-E", target_bin } or { target_bin }
                 for _, a in ipairs(run_args) do
                     table.insert(proc, a)
                 end
@@ -1263,7 +1446,7 @@ local function handle_run(manager, packages, command_tokens)
     -- Менеджер НЕ указан: сквозной опрос ВСЕХ локальных окружений хоста и контейнеров
     local local_target = find_locally_installed(target_name)
     if local_target then
-        local ret = execute_local_target(local_target, run_args, is_root_user(), ctx)
+        local ret = execute_local_target(local_target, run_args, is_sudo, ctx)
         if ret ~= 0 then
             ctx.fail(string.format("Выполнение '%s' завершилось с кодом ошибки %d", target_name, ret))
         end
@@ -1272,7 +1455,7 @@ local function handle_run(manager, packages, command_tokens)
 
     -- Не найдено нигде локально -> Fallback в Nixpkgs
     ctx.log(string.format("[Grime Pkg] Утилита '%s' не найдена среди установленных пакетов и контейнеров. Запуск в изолированном Nix-окружении...", target_name))
-    run_nix_shell(target_name, run_args)
+    run_nix_shell(target_name, run_args, is_sudo)
 end
 
 -- ============================================================================
@@ -1283,15 +1466,16 @@ local function handle_not_found(args, run_ctx)
     local context = run_ctx or ctx
     if not args or #args == 0 then
         io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
-        os.exit(127)
+        context.fail("Не указана команда для поиска (код 127)")
+        return
     end
 
-    -- 0. Извлечение флагов --no-confirm, -y, --yes и поддержка разделителя '--'
+    -- 0. Извлечение флагов --no-confirm, -y, --yes и поддержка разделителей '--' и '//'
     local no_confirm = false
     local clean_args = {}
     local after_dash = false
     for _, a in ipairs(args) do
-        if not after_dash and a == "--" then
+        if not after_dash and (a == "--" or a == "//") then
             after_dash = true
         elseif not after_dash and (a == "--no-confirm" or a == "-y" or a == "--yes") then
             no_confirm = true
@@ -1303,7 +1487,8 @@ local function handle_not_found(args, run_ctx)
 
     if #args == 0 then
         io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
-        os.exit(127)
+        context.fail("Не указана команда для поиска (код 127)")
+        return
     end
 
     local cmd = args[1]
@@ -1321,29 +1506,38 @@ local function handle_not_found(args, run_ctx)
         is_sudo = true
     end
 
-    -- 1. СКВОЗНОЙ ОПРОС ВСЕХ ЛОКАЛЬНЫХ СРЕД И КОНТЕЙНЕРОВ
-    -- Если утилита найдена в любом из локальных окружений — запускаем немедленно, ничего не спрашивая!
+    -- 1. Аудит безопасности путей хоста: НАИВЫСШИЙ ПРИОРИТЕТ
+    local allowed, reason = classify_paths(cmd, cmd_args)
+    if not allowed then
+        io.stderr:write(string.format("[Grime] Отказ: %s\n", reason))
+        context.fail(string.format("[Grime] Отказ: %s", reason))
+        return
+    end
+
+    -- 2. Интеллектуальная авто-элевация привилегий (Auto-Elevate to Root)
+    if not is_sudo and needs_root_privileges(cmd, cmd_args) then
+        is_sudo = true
+        io.stdout:write(string.format("[Grime Pkg] Утилита '%s' требует повышенных привилегий (RAW-сокеты/доступ к оборудованию). Запуск через sudo -E...\n", cmd))
+        io.stdout:flush()
+    end
+
+    -- 3. СКВОЗНОЙ ОПРОС ВСЕХ ЛОКАЛЬНЫХ СРЕД И КОНТЕЙНЕРОВ
     local local_target = find_locally_installed(cmd)
     if local_target then
         local code = execute_local_target(local_target, cmd_args, is_sudo, context)
-        os.exit(code or 0)
+        if code and code ~= 0 then
+            context.fail(string.format("Команда '%s' завершилась с кодом %d", cmd, code))
+        end
+        return
     end
 
-    -- 2. ТОЛЬКО ЕСЛИ УТИЛИТА НЕ НАЙДЕНА ВО ВСЕХ ЛОКАЛЬНЫХ СРЕДАХ И КОНТЕЙНЕРАХ:
-    -- Ищем её в репозитории Nixpkgs для эфемерного запуска
+    -- 4. ТОЛЬКО ЕСЛИ УТИЛИТА НЕ НАЙДЕНА ВО ВСЕХ ЛОКАЛЬНЫХ СРЕДАХ И КОНТЕЙНЕРАХ:
     local nix_pkg = is_nixpkgs_package(cmd)
 
     if nix_pkg then
-        local allowed, reason = classify_paths(cmd, cmd_args)
-        if not allowed then
-            io.stderr:write(string.format("[Grime] Отказ: %s\n", reason))
-            os.exit(1)
-        end
-
         local use_sudo = is_sudo
         local prompt_root = use_sudo and " (с правами root через sudo -E)" or ""
 
-        -- Если передан флаг --no-confirm -> запускаем без подтверждения
         local should_run = no_confirm
         if not should_run then
             io.stdout:write(string.format("[Grime] Команда '%s' не найдена среди установленных утилит и контейнеров.\nНайдена в репозитории Nixpkgs. Запустить во Flake-окружении (nixpkgs#%s)%s? [Y/n]: ", cmd, nix_pkg, prompt_root))
@@ -1352,7 +1546,8 @@ local function handle_not_found(args, run_ctx)
             local ans = io.read()
             if ans == nil then
                 io.stdout:write("\n[Grime] Запуск отменён.\n")
-                os.exit(127)
+                context.fail("Запуск отменён (код 127)")
+                return
             end
 
             local trimmed = ans:match("^%s*(.-)%s*$"):lower()
@@ -1360,7 +1555,8 @@ local function handle_not_found(args, run_ctx)
                 should_run = true
             else
                 io.stdout:write("[Grime] Запуск отменён.\n")
-                os.exit(127)
+                context.fail("Запуск отменён (код 127)")
+                return
             end
         end
 
@@ -1368,7 +1564,10 @@ local function handle_not_found(args, run_ctx)
             local shell_cmd = build_nix_shell_command(cmd, cmd_args, use_sudo)
             local proc = { "nix", "shell", "nixpkgs#" .. nix_pkg, "--command", "bash", "-c", shell_cmd }
             local code = context.run_interactive(proc)
-            os.exit(code or 0)
+            if code and code ~= 0 then
+                context.fail(string.format("Команда '%s' завершилась с кодом %d", cmd, code))
+            end
+            return
         end
     end
 
@@ -1377,7 +1576,8 @@ local function handle_not_found(args, run_ctx)
         local pac_check = context.capture({ "pacman", "-Si", cmd })
         if pac_check.code == 0 and pac_check.stdout and pac_check.stdout:match("%S") then
             io.stdout:write(string.format("[Grime] Команда '%s' не установлена в системе.\n💡 Доступна в репозитории Arch: sudo pacman -S %s\n", cmd, cmd))
-            os.exit(127)
+            context.fail(string.format("Команда '%s' не установлена в системе (код 127)", cmd))
+            return
         end
     end
 
@@ -1385,8 +1585,8 @@ local function handle_not_found(args, run_ctx)
     local candidates = {}
     local path_env = os.getenv("PATH") or ""
     for dir in path_env:gmatch("[^:]+") do
-        local ok, files = pcall(function() return ctx.list_dir and ctx.list_dir(dir) end)
-        if ok and files then
+        local ok, files = pcall(fs.list, dir)
+        if ok and type(files) == "table" then
             for _, f in ipairs(files) do table.insert(candidates, f) end
         end
     end
@@ -1411,7 +1611,7 @@ local function handle_not_found(args, run_ctx)
     if best_match and best_match ~= "" and best_match ~= cmd then
         io.stdout:write(string.format("💡 Возможно, вы имели в виду: %s?\n", best_match))
     end
-    os.exit(127)
+    context.fail(string.format("Команда '%s' не найдена (код 127)", cmd))
 end
 
 -- 7. Справка
@@ -1506,13 +1706,13 @@ function main()
                 return
             end
 
-            -- Разделение на токены до '--' и после '--'
+            -- Разделение на токены до '--' / '//' и после '--' / '//'
             local run_tokens = {}
             local cmd_tokens = {}
             local after_dash = false
             for i = 2, #raw_args do
                 local tok = raw_args[i]
-                if not after_dash and tok == "--" then
+                if not after_dash and (tok == "--" or tok == "//") then
                     after_dash = true
                 elseif after_dash then
                     table.insert(cmd_tokens, tok)
@@ -1521,7 +1721,7 @@ function main()
                 end
             end
 
-            -- Очистка от устаревших флагов при необходимости
+            -- Очистка от устаревших флагов при необходимости (только до разделителя)
             local clean_run_tokens = {}
             for _, t in ipairs(run_tokens) do
                 if t ~= "--nv" and t ~= "--prime" and t ~= "--nvidia" and t ~= "--gl" and t ~= "--gpu" and t ~= "--no-gpu" then
@@ -1574,13 +1774,7 @@ function main()
         end
     end
     for _, t in ipairs(parsed.command_tokens) do
-        if t == "-a" or t == "--all" or t == "--deps" then
-            all_mode = true
-        elseif t == "-v" or t == "--verbose" or t == "--all-managers" then
-            show_all_managers = true
-        else
-            table.insert(raw_tokens, t)
-        end
+        table.insert(raw_tokens, t)
     end
 
     if action == "search" then
@@ -1603,12 +1797,12 @@ function main()
             mgr = resolved
             table.remove(raw_tokens, 1)
         end
-        handle_run(mgr, raw_tokens, parsed.command_tokens)
+        handle_run(mgr, raw_tokens, {})
         return
     end
 
     if action == "init" then
-        require("nix")
+        ctx.run_process({ "grime", "nix", "init" }, ctx.target_dir or ".")
         return
     end
 
@@ -1629,7 +1823,7 @@ function main()
         table.remove(raw_tokens, 1)
         if #raw_tokens > 0 and ACTIONS[raw_tokens[1]:lower()] == "run" then
             table.remove(raw_tokens, 1)
-            handle_run(resolved_mgr, raw_tokens, parsed.command_tokens)
+            handle_run(resolved_mgr, raw_tokens, {})
             return
         end
         handle_detailed_list(resolved_mgr, raw_tokens, all_mode)

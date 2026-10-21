@@ -60,9 +60,15 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
     )?;
 
     // grime.process.capture(cmd, cwd, env, stdin_input) -> { code = ..., stdout = ..., stderr = ... }
+    type CaptureArgs = (
+        Value,
+        Option<String>,
+        Option<HashMap<String, String>>,
+        Option<String>,
+    );
     proc_tbl.set(
         "capture",
-        lua.create_function(|lua, (cmd, cwd, env, stdin_input): (Value, Option<String>, Option<HashMap<String, String>>, Option<String>)| {
+        lua.create_function(|lua, (cmd, cwd, env, stdin_input): CaptureArgs| {
             let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let stdin_ref = stdin_input.as_deref();
             let res = match cmd {
@@ -94,9 +100,8 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
         "memory_rss_kb",
         lua.create_function(|_, ()| {
             if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
-                let parts: Vec<&str> = content.split_whitespace().collect();
-                if parts.len() > 1 {
-                    if let Ok(pages) = parts[1].parse::<usize>() {
+                if let Some(second) = content.split_whitespace().nth(1) {
+                    if let Ok(pages) = second.parse::<usize>() {
                         let page_size_kb = {
                             let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
                             if sz > 0 {

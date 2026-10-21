@@ -123,7 +123,7 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
             if cur_len >= len {
                 Ok(s)
             } else {
-                let pad: String = std::iter::repeat(pad_char).take(len - cur_len).collect();
+                let pad: String = std::iter::repeat_n(pad_char, len - cur_len).collect();
                 Ok(format!("{}{}", pad, s))
             }
         })?,
@@ -138,7 +138,7 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
             if cur_len >= len {
                 Ok(s)
             } else {
-                let pad: String = std::iter::repeat(pad_char).take(len - cur_len).collect();
+                let pad: String = std::iter::repeat_n(pad_char, len - cur_len).collect();
                 Ok(format!("{}{}", s, pad))
             }
         })?,
@@ -156,11 +156,9 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
         "keys",
         lua.create_function(|lua, tbl: Table| {
             let res = lua.create_table()?;
-            let mut idx = 1;
-            for pair in tbl.pairs::<Value, Value>() {
+            for (idx, pair) in tbl.pairs::<Value, Value>().enumerate() {
                 let (k, _) = pair?;
-                res.set(idx, k)?;
-                idx += 1;
+                res.set(idx + 1, k)?;
             }
             Ok(res)
         })?,
@@ -171,11 +169,9 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
         "values",
         lua.create_function(|lua, tbl: Table| {
             let res = lua.create_table()?;
-            let mut idx = 1;
-            for pair in tbl.pairs::<Value, Value>() {
+            for (idx, pair) in tbl.pairs::<Value, Value>().enumerate() {
                 let (_, v) = pair?;
-                res.set(idx, v)?;
-                idx += 1;
+                res.set(idx + 1, v)?;
             }
             Ok(res)
         })?,
@@ -269,11 +265,9 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
             let res = lua.create_table()?;
             let len = tbl.raw_len();
             let finish = end_idx.unwrap_or(len).min(len);
-            let mut out_idx = 1;
-            for i in start..=finish {
+            for (out_idx, i) in (start..=finish).enumerate() {
                 let val: Value = tbl.get(i)?;
-                res.set(out_idx, val)?;
-                out_idx += 1;
+                res.set(out_idx + 1, val)?;
             }
             Ok(res)
         })?,

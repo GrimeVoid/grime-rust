@@ -79,10 +79,8 @@ fn is_allowed_runtime_path(path: &Path) -> bool {
 
     let runtime_canon = runtime_dir.canonicalize().unwrap_or(runtime_dir);
     if let Ok(rel) = path.strip_prefix(&runtime_canon) {
-        if let Some(first) = rel.components().next() {
-            if let Component::Normal(name) = first {
-                return name.to_string_lossy().starts_with("grime");
-            }
+        if let Some(Component::Normal(name)) = rel.components().next() {
+            return name.to_string_lossy().starts_with("grime");
         }
     }
     false
@@ -192,11 +190,35 @@ pub fn delete_safe(path: &Path, missing_ok: bool) -> Result<bool, String> {
 }
 
 pub fn copy_recursive(src: &Path, dst: &Path) -> Result<PathBuf, String> {
-    if !src.exists() {
-        return Err(format!("Исходный путь не найден: {}", src.display()));
+    let src_meta = fs::symlink_metadata(src)
+        .map_err(|_| format!("Исходный путь не найден: {}", src.display()))?;
+
+    if src_meta.file_type().is_symlink() {
+        let link_target = fs::read_link(src)
+            .map_err(|e| format!("Ошибка чтения симлинка '{}': {}", src.display(), e))?;
+        let dest_link = if dst.is_dir() {
+            dst.join(src.file_name().unwrap_or_default())
+        } else {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            dst.to_path_buf()
+        };
+        if fs::symlink_metadata(&dest_link).is_ok() {
+            let _ = fs::remove_file(&dest_link);
+        }
+        std::os::unix::fs::symlink(&link_target, &dest_link).map_err(|e| {
+            format!(
+                "Ошибка создания симлинка '{}' -> '{}': {}",
+                dest_link.display(),
+                link_target.display(),
+                e
+            )
+        })?;
+        return Ok(dest_link);
     }
 
-    if src.is_file() {
+    if src_meta.is_file() {
         let dest_file = if dst.is_dir() {
             dst.join(src.file_name().unwrap_or_default())
         } else {
@@ -232,7 +254,29 @@ pub fn copy_recursive(src: &Path, dst: &Path) -> Result<PathBuf, String> {
         };
         let target_path = dst.join(rel_path);
 
-        if entry.file_type().is_dir() {
+        if entry.file_type().is_symlink() {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let link_target = fs::read_link(entry_path).map_err(|e| {
+                format!(
+                    "Ошибка чтения симлинка '{}': {}",
+                    entry_path.display(),
+                    e
+                )
+            })?;
+            if fs::symlink_metadata(&target_path).is_ok() {
+                let _ = fs::remove_file(&target_path);
+            }
+            std::os::unix::fs::symlink(&link_target, &target_path).map_err(|e| {
+                format!(
+                    "Ошибка создания симлинка '{}' -> '{}': {}",
+                    target_path.display(),
+                    link_target.display(),
+                    e
+                )
+            })?;
+        } else if entry.file_type().is_dir() {
             fs::create_dir_all(&target_path).map_err(|e| e.to_string())?;
         } else if entry.file_type().is_file() {
             if let Some(parent) = target_path.parent() {
@@ -253,8 +297,22 @@ pub fn copy_recursive(src: &Path, dst: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn move_safe(src: &Path, dst: &Path) -> Result<PathBuf, String> {
-    if !src.exists() {
+    if fs::symlink_metadata(src).is_err() {
         return Err(format!("Исходный путь не найден: {}", src.display()));
+    }
+
+    if is_system_or_root_path(src) {
+        return Err(format!(
+            "Попытка перемещения защищенного системного каталога: '{}'!",
+            src.display()
+        ));
+    }
+
+    if is_system_or_root_path(dst) {
+        return Err(format!(
+            "Попытка перезаписи защищенного системного каталога при перемещении: '{}'!",
+            dst.display()
+        ));
     }
 
     if let Some(parent) = dst.parent() {
@@ -456,6 +514,38 @@ mod tests {
         cleanup_perms.set_mode(0o644);
         let _ = fs::set_permissions(&target_file, cleanup_perms);
         let _ = fs::remove_file(&target_file);
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_move_safe_protection_and_copy_recursive_symlinks() {
+        let test_root = std::env::temp_dir().join(format!("grime_move_copy_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&test_root);
+
+        let dummy_src = test_root.join("dummy_src.txt");
+        fs::write(&dummy_src, "hello").unwrap();
+
+        // Попытка переместить /etc или перезаписать /etc должна блокироваться
+        assert!(move_safe(Path::new("/etc"), &test_root.join("etc_moved")).is_err());
+        assert!(move_safe(&dummy_src, Path::new("/etc/passwd")).is_err());
+
+        // Копирование директории с симлинком
+        let src_dir = test_root.join("src_with_link");
+        fs::create_dir_all(&src_dir).unwrap();
+        let real_file = src_dir.join("real.txt");
+        fs::write(&real_file, "symlinked content").unwrap();
+        let sym_file = src_dir.join("sym.txt");
+        std::os::unix::fs::symlink("real.txt", &sym_file).unwrap();
+
+        let dst_dir = test_root.join("dst_with_link");
+        copy_recursive(&src_dir, &dst_dir).expect("copy_recursive with symlink");
+
+        let copied_sym = dst_dir.join("sym.txt");
+        let meta = fs::symlink_metadata(&copied_sym).expect("copied symlink metadata");
+        assert!(meta.file_type().is_symlink(), "Скопированный файл должен оставаться симлинком");
+        assert_eq!(fs::read_link(&copied_sym).unwrap(), PathBuf::from("real.txt"));
+        assert_eq!(fs::read_to_string(&copied_sym).unwrap(), "symlinked content");
+
         let _ = fs::remove_dir_all(&test_root);
     }
 }

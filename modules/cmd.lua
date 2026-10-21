@@ -62,12 +62,13 @@ function main()
     end
 
     local base_dir = ctx.target_dir or "."
+    local is_editor = (program == "nvim" or program == "vim" or program == "nano" or program == "cat" or program == "bat" or program == "less")
 
     local final_args = {}
     for i = 2, #args do
         local a = args[i]
         local candidate = base_dir .. "/" .. a
-        if ctx.exists(candidate) then
+        if not a:match("^%-") and (a:find("/") or a:find("%.") or is_editor) and ctx.exists(candidate) then
             table.insert(final_args, candidate)
         else
             table.insert(final_args, a)
@@ -79,11 +80,12 @@ function main()
         table.insert(cmd, a)
     end
 
-    local check_which = ctx.capture("command -v " .. program)
+    local check_which = ctx.capture({ "sh", "-c", "command -v \"$1\"", "--", program })
     if check_which.code ~= 0 then
         if ctx.exists(base_dir .. "/flake.nix") then
+            local utils = require("languages.utils")
             local flat_sub = {}
-            for _, t in ipairs(cmd) do table.insert(flat_sub, string.format("%q", t)) end
+            for _, t in ipairs(cmd) do table.insert(flat_sub, utils.shell_escape(t)) end
             cmd = { "nix", "develop", "--command", "sh", "-c", table.concat(flat_sub, " ") }
         end
     end

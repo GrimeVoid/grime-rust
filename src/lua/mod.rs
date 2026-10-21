@@ -25,10 +25,18 @@ use crate::payload::{extract_payload, PipelinePayload};
 use crate::pipeline::PipelineStep;
 use crate::state_bus::StateBus;
 
+/// Статус завершения шага конвейера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepStatus {
+    Success,
+    Failed(i32),
+}
+
 /// Результат выполнения шага конвейера в движке Lua.
 #[derive(Debug, Clone)]
 pub struct StepExecutionResult {
     pub success: bool,
+    pub status: StepStatus,
     pub return_value: Option<String>,
     pub payload: Option<PipelinePayload>,
     pub error_message: Option<String>,
@@ -45,8 +53,24 @@ pub struct GrimeLuaEngine {
     canceller: PipelineCanceller,
 }
 
-/// Преобразует значение mlua::Value в бинарное представление rmpv::Value.
+pub const MAX_RECURSION_DEPTH: usize = 64;
+
+/// Преобразует значение mlua::Value в бинарное представление rmpv::Value с защитой от бесконечной рекурсии.
 pub fn lua_value_to_rmpv(val: &mlua::Value) -> Result<rmpv::Value, mlua::Error> {
+    lua_value_to_rmpv_depth(val, 0, MAX_RECURSION_DEPTH)
+}
+
+fn lua_value_to_rmpv_depth(
+    val: &mlua::Value,
+    depth: usize,
+    max_depth: usize,
+) -> Result<rmpv::Value, mlua::Error> {
+    if depth > max_depth {
+        return Err(mlua::Error::runtime(
+            "Превышена максимальная глубина вложенности таблицы Lua в MsgPack (возможна циклическая ссылка)",
+        ));
+    }
+
     match val {
         mlua::Value::Nil => Ok(rmpv::Value::Nil),
         mlua::Value::Boolean(b) => Ok(rmpv::Value::Boolean(*b)),
@@ -74,14 +98,17 @@ pub fn lua_value_to_rmpv(val: &mlua::Value) -> Result<rmpv::Value, mlua::Error> 
                 let mut arr = Vec::with_capacity(len);
                 for i in 1..=len {
                     let item: mlua::Value = tbl.get(i)?;
-                    arr.push(lua_value_to_rmpv(&item)?);
+                    arr.push(lua_value_to_rmpv_depth(&item, depth + 1, max_depth)?);
                 }
                 Ok(rmpv::Value::Array(arr))
             } else {
                 let mut map = Vec::new();
                 for pair in tbl.pairs::<mlua::Value, mlua::Value>() {
                     let (k, v) = pair?;
-                    map.push((lua_value_to_rmpv(&k)?, lua_value_to_rmpv(&v)?));
+                    map.push((
+                        lua_value_to_rmpv_depth(&k, depth + 1, max_depth)?,
+                        lua_value_to_rmpv_depth(&v, depth + 1, max_depth)?,
+                    ));
                 }
                 Ok(rmpv::Value::Map(map))
             }
@@ -97,8 +124,23 @@ pub fn lua_value_to_rmpv(val: &mlua::Value) -> Result<rmpv::Value, mlua::Error> 
     }
 }
 
-/// Преобразует rmpv::Value обратно в mlua::Value.
+/// Преобразует rmpv::Value обратно в mlua::Value с фильтрацией недопустимых ключей (Nil/NaN).
 pub fn rmpv_to_lua_value(lua: &mlua::Lua, val: rmpv::Value) -> Result<mlua::Value, mlua::Error> {
+    rmpv_to_lua_value_depth(lua, val, 0, MAX_RECURSION_DEPTH)
+}
+
+fn rmpv_to_lua_value_depth(
+    lua: &mlua::Lua,
+    val: rmpv::Value,
+    depth: usize,
+    max_depth: usize,
+) -> Result<mlua::Value, mlua::Error> {
+    if depth > max_depth {
+        return Err(mlua::Error::runtime(
+            "Превышена максимальная глубина вложенности структуры MsgPack",
+        ));
+    }
+
     match val {
         rmpv::Value::Nil => Ok(mlua::Value::Nil),
         rmpv::Value::Boolean(b) => Ok(mlua::Value::Boolean(b)),
@@ -124,21 +166,48 @@ pub fn rmpv_to_lua_value(lua: &mlua::Lua, val: rmpv::Value) -> Result<mlua::Valu
         rmpv::Value::Array(arr) => {
             let tbl = lua.create_table()?;
             for (idx, item) in arr.into_iter().enumerate() {
-                tbl.set(idx + 1, rmpv_to_lua_value(lua, item)?)?;
+                tbl.set(
+                    idx + 1,
+                    rmpv_to_lua_value_depth(lua, item, depth + 1, max_depth)?,
+                )?;
             }
             Ok(mlua::Value::Table(tbl))
         }
         rmpv::Value::Map(map) => {
             let tbl = lua.create_table()?;
             for (k, v) in map {
-                let l_k = rmpv_to_lua_value(lua, k)?;
-                let l_v = rmpv_to_lua_value(lua, v)?;
+                let l_k = rmpv_to_lua_value_depth(lua, k, depth + 1, max_depth)?;
+                // В Lua ключом таблицы не может быть nil или NaN
+                if matches!(l_k, mlua::Value::Nil) {
+                    continue;
+                }
+                if let mlua::Value::Number(n) = l_k {
+                    if n.is_nan() {
+                        continue;
+                    }
+                }
+                let l_v = rmpv_to_lua_value_depth(lua, v, depth + 1, max_depth)?;
                 tbl.set(l_k, l_v)?;
             }
             Ok(mlua::Value::Table(tbl))
         }
         rmpv::Value::Ext(_, bytes) => Ok(mlua::Value::String(lua.create_string(&bytes)?)),
     }
+}
+
+fn extract_os_exit_code(err: &mlua::Error) -> Option<i32> {
+    let msg = err.to_string();
+    if let Some(pos) = msg.find("__GRIME_OS_EXIT__:") {
+        let after = &msg[pos + "__GRIME_OS_EXIT__:".len()..];
+        let digits: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        if let Ok(code) = digits.parse::<i32>() {
+            return Some(code);
+        }
+    }
+    None
 }
 
 impl GrimeLuaEngine {
@@ -238,16 +307,50 @@ impl GrimeLuaEngine {
     fn init_runtime(&self) -> Result<(), mlua::Error> {
         let lua = &self.lua;
 
-        // 1. Настройка package.path
+        // 1. Безопасная настройка package.path через mlua::Table
         let modules_str = self.modules_dir.to_string_lossy();
-        let lua_setup = format!(
-            "package.path = '{0}/?.lua;{0}/?/init.lua;{0}/languages/?.lua;' .. package.path",
-            modules_str
+        let package_tbl: mlua::Table = lua.globals().get("package")?;
+        let current_pkg_path: String = package_tbl.get("path").unwrap_or_default();
+        let updated_pkg_path = format!(
+            "{0}/?.lua;{0}/?/init.lua;{0}/languages/?.lua;{1}",
+            modules_str, current_pkg_path
         );
-        lua.load(&lua_setup).exec()?;
+        package_tbl.set("path", updated_pkg_path)?;
+
+        // Инициализация изолированного реестра функций cleanup по именам модулей
+        lua.set_named_registry_value("_grime_module_cleanups", lua.create_table()?)?;
+
+        // 1.1. Безопасный перехват os.exit(code) без убийства процесса оркестратора/демона
+        if let Ok(os_tbl) = lua.globals().get::<mlua::Table>("os") {
+            os_tbl.set(
+                "exit",
+                lua.create_function(|lua_ctx, code_val: Option<Value>| -> Result<(), mlua::Error> {
+                    let code: i32 = match code_val {
+                        None | Some(Value::Nil) | Some(Value::Boolean(true)) => 0,
+                        Some(Value::Boolean(false)) => 1,
+                        Some(Value::Integer(n)) => n as i32,
+                        Some(Value::Number(n)) => n as i32,
+                        _ => 1,
+                    };
+                    if let Ok(g) = lua_ctx.globals().get::<mlua::Table>("grime") {
+                        if let Ok(c) = g.get::<mlua::Table>("ctx") {
+                            let _ = c.set("_exit_code", code);
+                            let _ = c.set("_status", code == 0);
+                        }
+                    }
+                    Err(mlua::Error::RuntimeError(format!("__GRIME_OS_EXIT__:{}", code)))
+                })?,
+            )?;
+        }
 
         // 2. Создание глобальной таблицы grime
         let grime_tbl = lua.create_table()?;
+
+        // 2.1. Пинг живого Unix-сокета демона (ClientMessage::Ping -> ServerMessage::Pong)
+        grime_tbl.set(
+            "daemon_ping",
+            lua.create_function(|_, ()| Ok(crate::daemon::ping_daemon_sync()))?,
+        )?;
 
         // 3. Регистрация API процессов (grime.process)
         api_process::register_process_api(lua, &grime_tbl)?;
@@ -428,6 +531,7 @@ impl GrimeLuaEngine {
     }
 
     /// Устанавливает контекст перед запуском шага конвейера.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_step_context(
         &self,
         step: &PipelineStep,
@@ -466,6 +570,7 @@ impl GrimeLuaEngine {
                 .unwrap_or_else(|| "Выполнение конвейера отменено".to_string());
             return Ok(StepExecutionResult {
                 success: false,
+                status: StepStatus::Failed(130),
                 return_value: None,
                 payload: None,
                 error_message: Some(format!("Конвейер отменен: {}", reason)),
@@ -474,6 +579,14 @@ impl GrimeLuaEngine {
         }
 
         let lua = &self.lua;
+        let globals = lua.globals();
+
+        // Принудительная очистка _G.main и _G.cleanup перед выполнением каждого модуля
+        let _ = globals.set("main", Value::Nil);
+        let _ = globals.set("cleanup", Value::Nil);
+        if let Ok(cleanups) = lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
+            let _ = cleanups.set(module_name, Value::Nil);
+        }
 
         let mut target_mod_name = module_name.to_string();
         let mut mod_file = self.modules_dir.join(format!("{}.lua", target_mod_name));
@@ -503,6 +616,7 @@ impl GrimeLuaEngine {
             } else {
                 return Ok(StepExecutionResult {
                     success: false,
+                    status: StepStatus::Failed(1),
                     return_value: None,
                     payload: None,
                     error_message: Some(format!(
@@ -527,6 +641,8 @@ impl GrimeLuaEngine {
         let chunk_res: Result<Value, mlua::Error> = chunk.call(MultiValue::new());
 
         let mut direct_return_value: Option<Value> = None;
+        let mut os_exit_code: Option<i32> = None;
+
         match chunk_res {
             Ok(v) => {
                 if v != Value::Nil {
@@ -534,18 +650,44 @@ impl GrimeLuaEngine {
                 }
             }
             Err(e) => {
-                return Ok(StepExecutionResult {
-                    success: false,
-                    return_value: None,
-                    payload: None,
-                    error_message: Some(format!("Ошибка исполнения модуля '{}': {}", module_name, e)),
-                    changed_target_dir: None,
-                });
+                if let Some(code) = extract_os_exit_code(&e) {
+                    os_exit_code = Some(code);
+                } else {
+                    return Ok(StepExecutionResult {
+                        success: false,
+                        status: StepStatus::Failed(1),
+                        return_value: None,
+                        payload: None,
+                        error_message: Some(format!("Ошибка исполнения модуля '{}': {}", module_name, e)),
+                        changed_target_dir: None,
+                    });
+                }
             }
         }
 
-        // Если модуль экспортирует функцию main() (в globals или в возвращенной таблице), вызываем её
-        let globals = lua.globals();
+        // Сохраняем cleanup модуля в реестр по имени модуля сразу после загрузки чанка и очищаем _G.cleanup
+        let cleanup_fn_opt = globals
+            .get::<mlua::Function>("cleanup")
+            .ok()
+            .or_else(|| {
+                if let Some(Value::Table(ref tbl)) = direct_return_value {
+                    tbl.get::<mlua::Function>("cleanup").ok()
+                } else {
+                    None
+                }
+            });
+        let _ = globals.set("cleanup", Value::Nil);
+        if let Ok(cleanups) = lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
+            if let Some(cfn) = cleanup_fn_opt {
+                let _ = cleanups.set(module_name, cfn.clone());
+                let _ = cleanups.set(target_mod_name.as_str(), cfn);
+            } else {
+                let _ = cleanups.set(module_name, Value::Nil);
+                let _ = cleanups.set(target_mod_name.as_str(), Value::Nil);
+            }
+        }
+
+        // Если модуль экспортирует функцию main() (в globals или в возвращенной таблице) и не вышел на этапе чанка, вызываем её
         let main_fn_opt = globals
             .get::<mlua::Function>("main")
             .ok()
@@ -556,23 +698,31 @@ impl GrimeLuaEngine {
                     None
                 }
             });
+        let _ = globals.set("main", Value::Nil);
 
-        if let Some(main_fn) = main_fn_opt {
-            let res: Result<Value, mlua::Error> = main_fn.call(());
-            let _ = globals.set("main", Value::Nil);
-            match res {
-                Ok(v) => {
-                    // Возвращаемое значение модуля определяется результатом выполнения main()
-                    direct_return_value = if v != Value::Nil { Some(v) } else { None };
-                }
-                Err(e) => {
-                    return Ok(StepExecutionResult {
-                        success: false,
-                        return_value: None,
-                        payload: None,
-                        error_message: Some(format!("Ошибка в main() модуля '{}': {}", module_name, e)),
-                        changed_target_dir: None,
-                    });
+        if os_exit_code.is_none() {
+            if let Some(main_fn) = main_fn_opt {
+                let res: Result<Value, mlua::Error> = main_fn.call(());
+                let _ = globals.set("main", Value::Nil);
+                let _ = globals.set("cleanup", Value::Nil);
+                match res {
+                    Ok(v) => {
+                        direct_return_value = if v != Value::Nil { Some(v) } else { None };
+                    }
+                    Err(e) => {
+                        if let Some(code) = extract_os_exit_code(&e) {
+                            os_exit_code = Some(code);
+                        } else {
+                            return Ok(StepExecutionResult {
+                                success: false,
+                                status: StepStatus::Failed(1),
+                                return_value: None,
+                                payload: None,
+                                error_message: Some(format!("Ошибка в main() модуля '{}': {}", module_name, e)),
+                                changed_target_dir: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -589,12 +739,35 @@ impl GrimeLuaEngine {
             .ok()
             .flatten();
 
+        // Обработка перехваченного os.exit(code)
+        let mut step_status = if let Some(code) = os_exit_code {
+            if code == 0 {
+                status = true;
+                StepStatus::Success
+            } else {
+                status = false;
+                if error_msg.is_none() {
+                    error_msg = Some(format!(
+                        "Модуль '{}' завершился через os.exit({})",
+                        module_name, code
+                    ));
+                }
+                StepStatus::Failed(code)
+            }
+        } else if status {
+            StepStatus::Success
+        } else {
+            let code = ctx.get::<i32>("_exit_code").unwrap_or(1);
+            StepStatus::Failed(if code == 0 { 1 } else { code })
+        };
+
         // Если модуль вернул значение напрямую (через return в скрипте/main), но не вызвал ctx.success(val):
-        if ret_val.is_none() && ret_payload.is_none() {
+        if os_exit_code.is_none() && ret_val.is_none() && ret_payload.is_none() {
             if let Some(ref val) = direct_return_value {
                 match val {
                     Value::Boolean(false) => {
                         status = false;
+                        step_status = StepStatus::Failed(1);
                         if error_msg.is_none() {
                             error_msg = Some(format!("Модуль '{}' вернул false", module_name));
                         }
@@ -609,17 +782,16 @@ impl GrimeLuaEngine {
                         };
                         if is_ok == Some(false) {
                             status = false;
+                            step_status = StepStatus::Failed(1);
                             let msg: Option<String> = tbl.get("error").ok().or_else(|| tbl.get("message").ok());
                             error_msg = msg.or_else(|| Some(format!("Модуль '{}' завершился со статусом ошибки", module_name)));
                         } else {
                             // Проверяем, не является ли таблица Lua-модулем с экспортированными функциями
                             let mut contains_function = false;
-                            for pair in tbl.pairs::<Value, Value>() {
-                                if let Ok((_, v)) = pair {
-                                    if let Value::Function(_) = v {
-                                        contains_function = true;
-                                        break;
-                                    }
+                            for (_, v) in tbl.pairs::<Value, Value>().flatten() {
+                                if matches!(v, Value::Function(_)) {
+                                    contains_function = true;
+                                    break;
                                 }
                             }
 
@@ -669,6 +841,7 @@ impl GrimeLuaEngine {
 
         Ok(StepExecutionResult {
             success: status,
+            status: step_status,
             return_value: ret_val,
             payload: ret_payload,
             error_message: error_msg,
@@ -678,8 +851,16 @@ impl GrimeLuaEngine {
 
     /// Вызов функции cleanup() для указанного модуля при прерывании или ошибке.
     pub fn call_cleanup(&self, module_name: &str) {
-        let globals = self.lua.globals();
-        if let Ok(cleanup_fn) = globals.get::<mlua::Function>("cleanup") {
+        let mut cleanup_fn_opt: Option<mlua::Function> = None;
+
+        if let Ok(cleanups) = self.lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
+            if let Ok(f) = cleanups.get::<mlua::Function>(module_name) {
+                cleanup_fn_opt = Some(f);
+                let _ = cleanups.set(module_name, Value::Nil);
+            }
+        }
+
+        if let Some(cleanup_fn) = cleanup_fn_opt {
             eprintln!(
                 "{} Вызов cleanup() для модуля '{}'...",
                 "[Grime]".cyan().bold(),
@@ -688,7 +869,6 @@ impl GrimeLuaEngine {
             self.canceller.set_cleaning_up(true);
             let _ = cleanup_fn.call::<()>(());
             self.canceller.set_cleaning_up(false);
-            let _ = globals.set("cleanup", Value::Nil);
         }
     }
 
@@ -978,6 +1158,101 @@ mod tests {
         "#;
         let res: bool = lua.load(script).eval().expect("time and memory api eval");
         assert!(res);
+    }
+
+    #[test]
+    fn test_lua_os_exit_interception_and_cleanup_isolation() {
+        let tmp_dir = std::env::temp_dir().join(format!("grime_lua_lifecycle_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+
+        fs::write(
+            tmp_dir.join("mod_exit_err.lua"),
+            r#"
+            function main()
+                os.exit(42)
+            end
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp_dir.join("mod_exit_ok.lua"),
+            r#"
+            function main()
+                grime.ctx.success("done_before_exit")
+                os.exit(0)
+            end
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp_dir.join("mod_with_cleanup.lua"),
+            r#"
+            function cleanup()
+                grime.bus.set("pipeline.cleaned_mod_a", true)
+            end
+            function main()
+                return "ok_a"
+            end
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp_dir.join("mod_no_cleanup.lua"),
+            r#"
+            function main()
+                return "ok_b"
+            end
+            "#,
+        )
+        .unwrap();
+
+        let engine = GrimeLuaEngine::new(Some(tmp_dir.clone()), None).expect("init engine");
+
+        let res_err = engine.execute_module("mod_exit_err").expect("exec mod_exit_err");
+        assert!(!res_err.success);
+        assert_eq!(res_err.status, StepStatus::Failed(42));
+
+        let res_ok = engine.execute_module("mod_exit_ok").expect("exec mod_exit_ok");
+        assert!(res_ok.success);
+        assert_eq!(res_ok.status, StepStatus::Success);
+        assert_eq!(res_ok.return_value.as_deref(), Some("done_before_exit"));
+
+        // Выполняем mod_with_cleanup, затем mod_no_cleanup
+        let _ = engine.execute_module("mod_with_cleanup").unwrap();
+        let _ = engine.execute_module("mod_no_cleanup").unwrap();
+
+        // Вызов cleanup для mod_no_cleanup не должен вызывать cleanup от mod_with_cleanup!
+        engine.call_cleanup("mod_no_cleanup");
+        assert!(!engine.state_bus().has("pipeline.cleaned_mod_a"));
+
+        // А вызов cleanup для mod_with_cleanup вызывает именно его cleanup
+        engine.call_cleanup("mod_with_cleanup");
+        assert_eq!(
+            engine.state_bus().get("pipeline.cleaned_mod_a"),
+            Some(serde_json::json!(true))
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_lua_msgpack_recursion_limit() {
+        let engine = GrimeLuaEngine::new(None, None).expect("init engine");
+        let lua = &engine.lua;
+
+        let res: Result<Value, mlua::Error> = lua
+            .load(
+                r#"
+                local t = {}
+                t.self = t
+                return grime.msgpack.encode(t)
+                "#,
+            )
+            .eval();
+        assert!(res.is_err(), "Циклическая таблица должна вызывать ошибку в msgpack.encode");
     }
 }
 

@@ -30,11 +30,10 @@ local function get_socket_path()
         return xdg .. "/grime.sock"
     end
     local uid = "default"
-    local uid_p = io.popen("id -u 2>/dev/null")
-    if uid_p then
-        local u = uid_p:read("*line")
-        uid_p:close()
-        if u and #u > 0 then uid = u:match("%d+") or uid end
+    local res = ctx.capture({ "id", "-u" })
+    if res and res.code == 0 and res.stdout then
+        local u = res.stdout:match("%d+")
+        if u and #u > 0 then uid = u end
     end
     if ctx.exists("/run/user/" .. uid) then
         return "/run/user/" .. uid .. "/grime.sock"
@@ -60,26 +59,27 @@ local function load_persisted_state()
     return {}
 end
 
-local function save_persisted_key(key, val)
-    local data = load_persisted_state()
-    data[key] = val
+local function write_state_atomic(data)
     local sfile = get_state_file()
-    local f = io.open(sfile, "w")
+    local tmp = sfile .. ".tmp." .. tostring(os.time())
+    local f = io.open(tmp, "w")
     if f then
         f:write(grime.json.encode(data))
         f:close()
+        os.rename(tmp, sfile)
     end
+end
+
+local function save_persisted_key(key, val)
+    local data = load_persisted_state()
+    data[key] = val
+    write_state_atomic(data)
 end
 
 local function remove_persisted_key(key)
     local data = load_persisted_state()
     data[key] = nil
-    local sfile = get_state_file()
-    local f = io.open(sfile, "w")
-    if f then
-        f:write(grime.json.encode(data))
-        f:close()
-    end
+    write_state_atomic(data)
 end
 
 local function save_bus_key(key, val)
@@ -153,9 +153,8 @@ function main()
     local sock = get_socket_path()
 
     if action == "status" then
-        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
+        local pgrep = ctx.capture({ "pgrep", "-f", "grime --daemon-server" })
         local is_running = pgrep.code == 0
-        local sock_exists = ctx.exists(sock)
 
         if is_running then
             local pid = grime.str.trim(pgrep.stdout)
@@ -166,8 +165,16 @@ function main()
             ctx.success("stopped")
         end
     elseif action == "ping" then
-        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
-        if pgrep.code == 0 then
+        local alive = false
+        if grime and type(grime.daemon_ping) == "function" then
+            local ok, res = pcall(grime.daemon_ping)
+            if ok and res then alive = true end
+        end
+        if not alive then
+            local pgrep = ctx.capture({ "pgrep", "-f", "grime --daemon-server" })
+            alive = (pgrep.code == 0)
+        end
+        if alive then
             grime.ui.success("PONG: демон grime активен")
             ctx.success("PONG")
         else

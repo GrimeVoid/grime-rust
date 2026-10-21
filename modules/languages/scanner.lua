@@ -4,6 +4,8 @@
     активные языки программирования и синтезирующий точный тулчейн зависимостей.
 ]]
 
+local utils = require("languages.utils")
+
 local Scanner = {}
 
 local ADAPTERS = {
@@ -11,10 +13,21 @@ local ADAPTERS = {
     python = require("languages.python"),
     rust = require("languages.rust"),
     java = require("languages.java"),
+    lua = require("languages.lua"),
+}
+
+local LANG_PACKAGES = {
+    cpp = { "cmake", "gcc", "ninja", "pkg-config" },
+    rust = { "cargo", "rustc", "rust-analyzer" },
+    python = { "python3" },
+    java = { "jdk" },
+    lua = { "luajit" },
+    go = { "go" },
+    nodejs = { "nodejs" },
 }
 
 -- Известные утилиты сборочного тулчейна (попадают в nativeBuildInputs)
-local KNOWN_TOOLCHAIN_PACKAGES = {
+local TOOLCHAIN_SET = {
     ["gcc"] = true,
     ["clang"] = true,
     ["gnumake"] = true,
@@ -34,16 +47,33 @@ local KNOWN_TOOLCHAIN_PACKAGES = {
     ["jdk21"] = true,
     ["maven"] = true,
     ["gradle"] = true,
+    ["luajit"] = true,
+    ["lua"] = true,
+    ["lua5_4"] = true,
     ["go"] = true,
     ["nodejs"] = true,
     ["bashInteractive"] = true,
     ["coreutils"] = true,
 }
 
+Scanner.LANG_PACKAGES = LANG_PACKAGES
+Scanner.TOOLCHAIN_SET = TOOLCHAIN_SET
+
+local function run_capture(argv, c)
+    local ctx_obj = c or (grime and grime.ctx)
+    if ctx_obj and ctx_obj.capture then
+        return ctx_obj.capture(argv)
+    end
+    if grime and grime.process and grime.process.capture then
+        return grime.process.capture(argv)
+    end
+    return { code = 1, stdout = "", stderr = "" }
+end
+
 --- Проверка, относится ли пакет к сборочному тулчейну (компиляторы, сборщики, LSP)
 function Scanner.is_toolchain_package(pkg)
     local clean = pkg:gsub("^pkgs%.", "")
-    return KNOWN_TOOLCHAIN_PACKAGES[clean] == true
+    return TOOLCHAIN_SET[clean] == true
 end
 
 --- Быстрое получение списка файлов проекта с умной фильтрацией служебных каталогов
@@ -51,37 +81,36 @@ function Scanner.get_project_files(root, c)
     local files = {}
 
     -- 1. Попытка получить срез через git ls-files
-    local cmd_git = "git -C \"" .. root .. "\" ls-files 2>/dev/null"
-    local p_git = io.popen(cmd_git)
-    if p_git then
-        for line in p_git:lines() do
+    local res_git = run_capture({ "git", "-C", root, "ls-files" }, c)
+    if res_git and res_git.code == 0 and res_git.stdout and #res_git.stdout > 0 then
+        for line in res_git.stdout:gmatch("[^\r\n]+") do
             local trimmed = line:match("^%s*(.-)%s*$")
             if #trimmed > 0 then
                 table.insert(files, trimmed)
             end
         end
-        p_git:close()
         if #files > 0 then
             return files
         end
     end
 
-    -- 2. Fallback: интеллектуальный обход через find
-    local cmd_find = "find \"" .. root .. "\" -maxdepth 5 -type f " ..
-        "! -path '*/.*' " ..
-        "! -path '*/build/*' " ..
-        "! -path '*/target/*' " ..
-        "! -path '*/node_modules/*' " ..
-        "! -path '*/.venv/*' " ..
-        "! -path '*/venv/*' " ..
-        "! -path '*/bin/*' " ..
-        "! -path '*/obj/*' " ..
-        "! -path '*/dist/*' " ..
-        "! -path '*/__pycache__/*' 2>/dev/null"
-    local p_find = io.popen(cmd_find)
-    if p_find then
+    -- 2. Fallback: интеллектуальный обход через find (массив аргументов без шелл-инъекций)
+    local res_find = run_capture({
+        "find", root, "-maxdepth", "5", "-type", "f",
+        "!", "-path", "*/.*",
+        "!", "-path", "*/build/*",
+        "!", "-path", "*/target/*",
+        "!", "-path", "*/node_modules/*",
+        "!", "-path", "*/.venv/*",
+        "!", "-path", "*/venv/*",
+        "!", "-path", "*/bin/*",
+        "!", "-path", "*/obj/*",
+        "!", "-path", "*/dist/*",
+        "!", "-path", "*/__pycache__/*",
+    }, c)
+    if res_find and res_find.code == 0 and res_find.stdout and #res_find.stdout > 0 then
         local prefix = root:gsub("/+$", "") .. "/"
-        for line in p_find:lines() do
+        for line in res_find.stdout:gmatch("[^\r\n]+") do
             local rel = line
             if rel:find(prefix, 1, true) == 1 then
                 rel = rel:sub(#prefix + 1)
@@ -91,7 +120,6 @@ function Scanner.get_project_files(root, c)
                 table.insert(files, trimmed)
             end
         end
-        p_find:close()
         if #files > 0 then
             return files
         end
@@ -120,6 +148,15 @@ function Scanner.scan_project(root, c)
     local detected_langs_set = {}
     local detected_langs = {}
 
+    local function register_lang(lang)
+        if type(lang) == "string" and #lang > 0 and not detected_langs_set[lang] then
+            if ADAPTERS[lang] or LANG_PACKAGES[lang] then
+                detected_langs_set[lang] = true
+                table.insert(detected_langs, lang)
+            end
+        end
+    end
+
     -- Таблица соответствия манифестов и языков
     local manifest_map = {
         ["CMakeLists.txt"] = "cpp",
@@ -143,6 +180,7 @@ function Scanner.scan_project(root, c)
         [".rs"] = "rust",
         [".py"] = "python",
         [".java"] = "java",
+        [".lua"] = "lua",
         [".go"] = "go",
         [".js"] = "nodejs", [".ts"] = "nodejs",
     }
@@ -153,33 +191,44 @@ function Scanner.scan_project(root, c)
         if manifest_map[fname] then
             local lang = manifest_map[fname]
             table.insert(found_manifests, f)
-            if not detected_langs_set[lang] then
-                detected_langs_set[lang] = true
-                table.insert(detected_langs, lang)
-            end
+            register_lang(lang)
         end
 
         local ext = fname:match("(%.[%a%d_]+)$")
-        if ext and ext_map[ext] then
-            local lang = ext_map[ext]
-            if not detected_langs_set[lang] then
-                detected_langs_set[lang] = true
-                table.insert(detected_langs, lang)
-            end
+        if ext and ext_map[ext] and fname ~= "app.lua" then
+            register_lang(ext_map[ext])
         end
     end
 
-    -- Дополнительная проверка манифеста app.lua (если есть)
+    -- Безопасная загрузка таблицы манифеста app.lua (если есть)
     local app_lua = root .. "/app.lua"
-    local f_app = io.open(app_lua, "r")
-    if f_app then
-        local content = f_app:read("*all") or ""
-        f_app:close()
-        -- Поиск languages = { "...", "..." }
-        for lang in content:gmatch('"([%a%d_%+]+)"') do
-            if ADAPTERS[lang] and not detected_langs_set[lang] then
-                detected_langs_set[lang] = true
-                table.insert(detected_langs, lang)
+    local special_dependencies = {}
+    if utils.file_exists(app_lua) then
+        local chunk = loadfile(app_lua, "t", {})
+        if chunk then
+            local ok, m = pcall(chunk)
+            if ok and type(m) == "table" then
+                if type(m.languages) == "table" then
+                    for _, l in ipairs(m.languages) do
+                        register_lang(l)
+                    end
+                elseif type(m.languages) == "string" then
+                    register_lang(m.languages)
+                end
+                register_lang(m.lang)
+                register_lang(m.type)
+
+                if type(m.special_dependencies) == "table" then
+                    for _, dep in ipairs(m.special_dependencies) do
+                        if type(dep) == "string" and #dep > 0 then
+                            table.insert(special_dependencies, dep)
+                        end
+                    end
+                elseif type(m.special_dependencies) == "string" then
+                    for dep in m.special_dependencies:gmatch("%S+") do
+                        table.insert(special_dependencies, dep)
+                    end
+                end
             end
         end
     end
@@ -187,8 +236,7 @@ function Scanner.scan_project(root, c)
     -- Дополнительная проверка адаптеров через :detect()
     for lang, adp in pairs(ADAPTERS) do
         if not detected_langs_set[lang] and adp.detect and adp:detect(root) then
-            detected_langs_set[lang] = true
-            table.insert(detected_langs, lang)
+            register_lang(lang)
         end
     end
 
@@ -215,25 +263,30 @@ function Scanner.scan_project(root, c)
     for _, lang in ipairs(detected_langs) do
         local adp = ADAPTERS[lang]
         if adp then
-            -- Опрос адаптера на пакеты для Nix
             if adp.get_nix_packages then
                 local pkgs = adp:get_nix_packages(root) or {}
                 for _, p in ipairs(pkgs) do
                     add_toolchain_pkg(p)
                 end
+            elseif LANG_PACKAGES[lang] then
+                for _, p in ipairs(LANG_PACKAGES[lang]) do
+                    add_toolchain_pkg(p)
+                end
             end
-            -- Опрос адаптера на бинарники для хоста
             if adp.required_binaries then
                 for _, b in ipairs(adp.required_binaries) do
                     add_required_binary(b)
                 end
             end
-        elseif lang == "go" then
-            add_toolchain_pkg("go")
-            add_required_binary("go")
-        elseif lang == "nodejs" then
-            add_toolchain_pkg("nodejs")
-            add_required_binary("node")
+        elseif LANG_PACKAGES[lang] then
+            for _, p in ipairs(LANG_PACKAGES[lang]) do
+                add_toolchain_pkg(p)
+            end
+            if lang == "go" then
+                add_required_binary("go")
+            elseif lang == "nodejs" then
+                add_required_binary("node")
+            end
         end
     end
 
@@ -247,35 +300,17 @@ function Scanner.scan_project(root, c)
         languages = detected_langs,
         manifests = found_manifests,
         toolchain = toolchain_pkgs,
+        special_dependencies = special_dependencies,
         required_binaries = required_binaries,
         files = files,
-        has_language = function(self, lang)
+        has_language = function(_self, lang)
             return detected_langs_set[lang] == true
         end,
         check_host_dependencies = function(self, ctx_in)
             local check_ctx = ctx_in or c or (grime and grime.ctx)
             local missing = {}
             for _, bin in ipairs(self.required_binaries) do
-                local found = false
-                if grime and grime.process and grime.process.which then
-                    local p = grime.process.which(bin)
-                    if p and #p > 0 then found = true end
-                end
-                if not found and check_ctx and check_ctx.capture then
-                    local res = check_ctx.capture("which " .. bin .. " 2>/dev/null")
-                    if res and res.code == 0 and res.stdout and #res.stdout > 0 then
-                        found = true
-                    end
-                end
-                if not found then
-                    local p = io.popen("which " .. bin .. " 2>/dev/null")
-                    if p then
-                        local out = p:read("*all")
-                        p:close()
-                        if out and #out > 0 then found = true end
-                    end
-                end
-                if not found then
+                if not utils.has_binary(bin, check_ctx) then
                     table.insert(missing, bin)
                 end
             end

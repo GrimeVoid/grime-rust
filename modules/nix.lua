@@ -54,7 +54,7 @@ local function load_app_special_dependencies(root)
     local app_file = root .. "/app.lua"
     if not ctx.exists(app_file) then return {} end
 
-    local chunk = loadfile(app_file)
+    local chunk = loadfile(app_file, "t", {})
     if not chunk then return {} end
 
     local ok, m = pcall(chunk)
@@ -87,6 +87,24 @@ local function load_app_special_dependencies(root)
     return deps
 end
 
+--- Извлечение существующих пакетов из локального flake.nix (если есть)
+local function parse_existing_flake_packages(flake_path)
+    if not ctx.exists(flake_path) then return {} end
+    local content = fs.read(flake_path)
+    if not content then return {} end
+    local pkgs = {}
+    local seen = {}
+    for block in content:gmatch("with%s+pkgs;%s*%[([^%]]*)%]") do
+        for token in block:gmatch("[%w_%-%.]+") do
+            if not seen[token] then
+                seen[token] = true
+                table.insert(pkgs, token)
+            end
+        end
+    end
+    return pkgs
+end
+
 --- Комплексный сбор всех зависимостей проекта (Auto-Toolchain + Special Dependencies + CLI args)
 local function resolve_project_dependencies(target_dir, user_packages)
     local scan = scanner.scan_project(target_dir, ctx)
@@ -107,9 +125,12 @@ end
 
 --- Получение или синтез эфемерного Flake в каталоге кэша ~/.cache/grime/flakes/<hash>/
 local function get_ephemeral_flake_dir(target_dir, user_packages)
+    local scan = scanner.scan_project(target_dir, ctx)
+    local app_raw = ctx.exists(target_dir .. "/app.lua") and (fs.read(target_dir .. "/app.lua") or "") or ""
+    local sig = target_dir .. "|" .. table.concat(scan.toolchain or {}, ",") .. "|" .. app_raw
     local h = 5381
-    for i = 1, #target_dir do
-        h = ((h * 33) + target_dir:byte(i)) % 4294967296
+    for i = 1, #sig do
+        h = ((h * 33) + sig:byte(i)) % 4294967296
     end
     local hash = string.format("%08x", h)
     local cache_dir = HOME .. "/.cache/grime/flakes/" .. hash
@@ -155,6 +176,56 @@ local function handle_flake(target_dir, packages, force)
     end
 end
 
+local function handle_add(target_dir, packages)
+    if not packages or #packages == 0 then
+        ctx.fail("Укажите пакеты для добавления в окружение проекта: grime nix add <pkg...>")
+        return
+    end
+    local flake_path = target_dir .. "/flake.nix"
+    local existing = parse_existing_flake_packages(flake_path)
+    for _, p in ipairs(packages) do
+        table.insert(existing, p)
+    end
+    handle_flake(target_dir, existing, true)
+    ui.success("Пакеты добавлены в flake.nix: " .. table.concat(packages, ", "))
+    if ctx.has_next_step then ctx.module_return(target_dir) end
+end
+
+local function handle_rm(target_dir, packages)
+    if not packages or #packages == 0 then
+        ctx.fail("Укажите пакеты для удаления из окружения проекта: grime nix rm <pkg...>")
+        return
+    end
+    local flake_path = target_dir .. "/flake.nix"
+    if not ctx.exists(flake_path) then
+        ctx.fail("Файл flake.nix не найден в " .. target_dir)
+        return
+    end
+    local rm_set = {}
+    for _, p in ipairs(packages) do rm_set[p] = true; rm_set["pkgs." .. p] = true end
+
+    local existing = parse_existing_flake_packages(flake_path)
+    local filtered = {}
+    for _, p in ipairs(existing) do
+        if not rm_set[p] then
+            table.insert(filtered, p)
+        end
+    end
+
+    local native_pkgs, lib_pkgs = utils.split_packages(filtered, scanner)
+    local proj_name = target_dir:match("([^/]+)$") or "project"
+    local content = utils.generate_flake_nix(proj_name, native_pkgs, lib_pkgs)
+    local f = io.open(flake_path, "w")
+    if f then
+        f:write(content)
+        f:close()
+        ui.success("Пакеты удалены из flake.nix: " .. table.concat(packages, ", "))
+        if ctx.has_next_step then ctx.module_return(target_dir) end
+    else
+        ctx.fail("Не удалось обновить " .. flake_path)
+    end
+end
+
 -- В стандарте Flakes-Only init создает современный flake.nix
 local function handle_init(target_dir, packages, force)
     handle_flake(target_dir, packages, force)
@@ -185,13 +256,26 @@ local function handle_build(target_dir, extra_tokens)
                 ["g++"] = true, ["clang++"] = true, gcc = true, clang = true,
                 bash = true, sh = true, meson = true, gradle = true, mvn = true
             }
-            if known_build_cmds[first] and #extra_tokens > 1 then
+            if known_build_cmds[first] and #extra_tokens >= 1 then
                 is_command = true
             end
         end
 
         if is_command then
-            custom_build_cmd = table.concat(extra_tokens, " ")
+            if #extra_tokens == 1 then
+                custom_build_cmd = extra_tokens[1]
+            else
+                local escaped = {}
+                local shell_ops = { ["&&"] = true, ["||"] = true, [";"] = true, ["|"] = true }
+                for _, tok in ipairs(extra_tokens) do
+                    if shell_ops[tok] then
+                        table.insert(escaped, tok)
+                    else
+                        table.insert(escaped, utils.shell_escape(tok))
+                    end
+                end
+                custom_build_cmd = table.concat(escaped, " ")
+            end
         else
             user_packages = extra_tokens
         end
@@ -212,11 +296,12 @@ local function handle_build(target_dir, extra_tokens)
     local cache_dir = get_ephemeral_flake_dir(target_dir, user_packages)
     ctx.log("⚡ [Grime Ephemeral Flake] Запуск чистой сборки в " .. cache_dir .. "...")
 
-    local build_cmd = custom_build_cmd or ("grime project build \"" .. target_dir .. "\"")
+    local escaped_dir = utils.shell_escape(target_dir)
+    local build_cmd = custom_build_cmd or ("grime project build " .. escaped_dir)
     local cmd = {
         "nix", "develop", "path:" .. cache_dir,
         "--command", "bash", "-c",
-        "cd \"" .. target_dir .. "\" && " .. build_cmd
+        "cd " .. escaped_dir .. " && " .. build_cmd
     }
 
     local ret = ctx.run_process(cmd, target_dir)
@@ -229,13 +314,28 @@ local function handle_build(target_dir, extra_tokens)
 end
 
 local function handle_gc()
-    ctx.log("Запуск очистки мусора Nix (Garbage Collection)...")
+    ctx.log("Запуск комплексной очистки хранилища Nix и кэша GRIME (Garbage Collection)...")
     local ret = ctx.run_process({ "nix-collect-garbage", "-d" })
     if ret ~= 0 then
         ret = ctx.run_process({ "nix", "store", "gc" })
     end
+
+    -- Очистка эфемерного кэша Flakes GRIME
+    local flakes_cache = HOME .. "/.cache/grime/flakes"
+    if ctx.exists(flakes_cache) then
+        ctx.log("Очистка эфемерного кэша Flakes GRIME (" .. flakes_cache .. ")...")
+        ctx.capture({ "rm", "-rf", flakes_cache })
+    end
+
+    -- Очистка локального eval/tarball кэша Nix
+    local nix_eval_cache = HOME .. "/.cache/nix"
+    if ctx.exists(nix_eval_cache) then
+        ctx.log("Очистка локального кэша вычислений Nix (" .. nix_eval_cache .. ")...")
+        ctx.capture({ "rm", "-rf", nix_eval_cache })
+    end
+
     if ret == 0 then
-        ctx.log("Очистка хранилища Nix успешно завершена.")
+        ctx.log("✓ Хранилище Nix и кэш GRIME успешно очищены.")
     else
         ctx.fail("Ошибка при сборке мусора Nix (код " .. tostring(ret) .. ")")
     end
@@ -712,6 +812,10 @@ function main()
         if ctx.has_next_step then
             ctx.module_return(target_dir)
         end
+    elseif action == "add" then
+        handle_add(target_dir, command_tokens)
+    elseif action == "rm" then
+        handle_rm(target_dir, command_tokens)
     elseif action == "gc" then
         handle_gc()
     elseif action == "optimise" then

@@ -41,6 +41,7 @@ pub fn init_context_table(
     ctx_tbl.set("flags", flags_init)?;
     ctx_tbl.set("env", lua.create_table()?)?;
     ctx_tbl.set("_status", true)?;
+    ctx_tbl.set("_exit_code", 0)?;
     ctx_tbl.set("_error_message", Value::Nil)?;
     ctx_tbl.set("_return_value", Value::Nil)?;
     ctx_tbl.set("_return_payload", Value::Nil)?;
@@ -215,10 +216,8 @@ pub fn init_context_table(
         }
         let env_tbl: Table = c.get("env").ok()?;
         let mut map = HashMap::new();
-        for pair in env_tbl.pairs::<String, String>() {
-            if let Ok((k, v)) = pair {
-                map.insert(k, v);
-            }
+        for (k, v) in env_tbl.pairs::<String, String>().flatten() {
+            map.insert(k, v);
         }
         if map.is_empty() {
             None
@@ -300,10 +299,11 @@ pub fn init_context_table(
         )?,
     )?;
 
+    type CaptureArgs = (Value, Option<String>, Option<HashMap<String, String>>, Option<String>);
     ctx_tbl.set(
         "capture",
         lua.create_function(
-            |lua_ctx, (cmd, cwd, env, stdin_input): (Value, Option<String>, Option<HashMap<String, String>>, Option<String>)| {
+            |lua_ctx, (cmd, cwd, env, stdin_input): CaptureArgs| {
                 let globals = lua_ctx.globals();
                 let g: Table = globals.get("grime")?;
                 let c: Table = g.get("ctx")?;
@@ -508,11 +508,9 @@ pub fn init_context_table(
                 }
                 if let Ok(cfg) = g.get::<Table>("config") {
                     if let Ok(get_fn) = cfg.get::<mlua::Function>("get") {
-                        if let Ok(val) = get_fn.call::<Option<String>>(n.as_str()) {
-                            if let Some(v) = val {
-                                if !v.is_empty() && v != "auto" {
-                                    return Ok(Some(v));
-                                }
+                        if let Ok(Some(v)) = get_fn.call::<Option<String>>(n.as_str()) {
+                            if !v.is_empty() && v != "auto" {
+                                return Ok(Some(v));
                             }
                         }
                     }
@@ -634,6 +632,7 @@ pub fn init_context_table(
 }
 
 /// Обновляет параметры контекста перед запуском очередного шага конвейера.
+#[allow(clippy::too_many_arguments)]
 pub fn update_step_context(
     lua: &Lua,
     _config: &GrimeConfig,
@@ -668,6 +667,7 @@ pub fn update_step_context(
     flags_tbl.set("force", force)?;
     ctx.set("flags", flags_tbl)?;
     ctx.set("_status", true)?;
+    ctx.set("_exit_code", 0)?;
     ctx.set("_error_message", Value::Nil)?;
     ctx.set("_return_value", Value::Nil)?;
     ctx.set("_return_payload", Value::Nil)?;

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use mlua::{Lua, Value};
 use serde_json::{json, Value as JsonValue};
@@ -9,10 +11,11 @@ use serde_json::{json, Value as JsonValue};
 /// - `system.*` - системные данные процесса/демона (версия, pid, время запуска)
 /// - `env.*` - переменные окружения
 /// - `pipeline.*` - сессионные данные конвейера (очищаются по завершении через RAII)
-/// - `modules.<name>.*` - изолированное состояние модулей
+/// - `modules.<name>.*`, `log.*`, `daemon.*`, `git.*`, `session.*` и др. - персистентные пространства имен
 #[derive(Clone, Debug)]
 pub struct StateBus {
     data: Arc<RwLock<HashMap<String, JsonValue>>>,
+    persistence_path: Option<PathBuf>,
 }
 
 impl Default for StateBus {
@@ -23,15 +26,47 @@ impl Default for StateBus {
 
 impl StateBus {
     pub fn new() -> Self {
+        Self::with_persistence_path(Some(Self::default_persistence_path()))
+    }
+
+    pub fn with_persistence_path(persistence_path: Option<PathBuf>) -> Self {
         let bus = Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            persistence_path,
         };
         bus.init_defaults();
+        bus.load_persisted();
         bus
     }
 
-    /// Проверка соответствия ключа допустимым пространствам имен:
-    /// `system.*`, `env.*`, `pipeline.*`, `modules.<name>.*`.
+    /// Путь по умолчанию для хранения персистентного состояния: `~/.config/grime/state.json`.
+    pub fn default_persistence_path() -> PathBuf {
+        if let Ok(env_file) = std::env::var("GRIME_STATE_FILE") {
+            if !env_file.trim().is_empty() {
+                return PathBuf::from(env_file);
+            }
+        }
+        if cfg!(test)
+            || std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.contains("/deps/")))
+                .unwrap_or(false)
+        {
+            return std::env::temp_dir().join(format!("grime_test_state_{}.json", std::process::id()));
+        }
+        let home = crate::fs_ops::get_cached_home_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("grime").join("state.json")
+    }
+
+    /// Проверяет, подлежит ли ключ сохранению на диск (все ключи, кроме `pipeline.*`, `system.*`, `env.*`).
+    #[inline]
+    pub fn is_persistent_key(key: &str) -> bool {
+        !key.starts_with("pipeline.") && !key.starts_with("system.") && !key.starts_with("env.")
+    }
+
+    /// Проверка соответствия ключа допустимым пространствам имен.
     pub fn validate_namespace(key: &str) -> Result<(), String> {
         let parts: Vec<&str> = key.split('.').collect();
         if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
@@ -58,17 +93,75 @@ impl StateBus {
         }
     }
 
+    /// Загрузка сохраненного состояния с диска в память.
+    pub fn load_persisted(&self) {
+        let Some(ref path) = self.persistence_path else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(JsonValue::Object(obj)) = serde_json::from_str::<JsonValue>(&content) {
+                if let Ok(mut map) = self.data.write() {
+                    for (k, v) in obj {
+                        if Self::validate_namespace(&k).is_ok() && Self::is_persistent_key(&k) {
+                            map.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Атомарное сохранение всех персистентных ключей на диск через `.state.json.tmp` и `fs::rename`.
+    fn persist_map(&self, map: &HashMap<String, JsonValue>) {
+        let Some(ref path) = self.persistence_path else {
+            return;
+        };
+        Self::write_persisted_to_file(path, map);
+    }
+
+    fn write_persisted_to_file(path: &Path, map: &HashMap<String, JsonValue>) {
+        let mut persistent_obj = serde_json::Map::new();
+        for (k, v) in map {
+            if Self::is_persistent_key(k) {
+                persistent_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let tmp_name = format!(
+            ".{}.{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("state.json"),
+            std::process::id()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+
+        if let Ok(serialized) = serde_json::to_string_pretty(&JsonValue::Object(persistent_obj)) {
+            if fs::write(&tmp_path, serialized).is_ok() {
+                let _ = fs::rename(&tmp_path, path);
+            }
+        }
+    }
+
     /// Получить значение по ключу.
     pub fn get(&self, key: &str) -> Option<JsonValue> {
         let map = self.data.read().ok()?;
         map.get(key).cloned()
     }
 
-    /// Сохранить значение по ключу с валидацией пространства имен.
+    /// Сохранить значение по ключу с валидацией пространства имен и автосохранением на диск.
     pub fn set(&self, key: &str, value: JsonValue) -> Result<(), String> {
         Self::validate_namespace(key)?;
         let mut map = self.data.write().map_err(|e| e.to_string())?;
         map.insert(key.to_string(), value);
+        if Self::is_persistent_key(key) {
+            self.persist_map(&map);
+        }
         Ok(())
     }
 
@@ -84,9 +177,44 @@ impl StateBus {
     /// Удалить значение по ключу.
     pub fn delete(&self, key: &str) -> bool {
         if let Ok(mut map) = self.data.write() {
-            map.remove(key).is_some()
+            let existed = map.remove(key).is_some();
+            if existed && Self::is_persistent_key(key) {
+                self.persist_map(&map);
+            }
+            existed
         } else {
             false
+        }
+    }
+
+    /// Очистить все ключи указанного пространства имен (например, `"log."` или `"modules.cmd."`).
+    pub fn clear_namespace(&self, prefix: &str) -> usize {
+        let normalized_prefix = if prefix.ends_with('.') {
+            prefix.to_string()
+        } else {
+            format!("{}.", prefix)
+        };
+
+        if let Ok(mut map) = self.data.write() {
+            let before = map.len();
+            let mut removed_persistent = false;
+            map.retain(|k, _| {
+                if k.starts_with(&normalized_prefix) {
+                    if Self::is_persistent_key(k) {
+                        removed_persistent = true;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed = before.saturating_sub(map.len());
+            if removed_persistent {
+                self.persist_map(&map);
+            }
+            removed
+        } else {
+            0
         }
     }
 
@@ -101,7 +229,7 @@ impl StateBus {
     pub fn keys(&self, prefix: Option<&str>) -> Vec<String> {
         if let Ok(map) = self.data.read() {
             map.keys()
-                .filter(|k| prefix.map_or(true, |p| k.starts_with(p)))
+                .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
                 .cloned()
                 .collect()
         } else {
@@ -200,7 +328,7 @@ pub fn lua_to_json_depth(val: Value, depth: usize, max_depth: usize) -> Result<J
                     Ok(json!(bytes.as_slice()))
                 }
             } else {
-                Ok(JsonValue::String(format!("[UserData]")))
+                Ok(JsonValue::String("[UserData]".to_string()))
             }
         }
         _ => Ok(JsonValue::String(format!("{:?}", val))),
@@ -265,7 +393,7 @@ pub fn register_state_bus_api(lua: &Lua, bus: Arc<StateBus>) -> Result<(), mlua:
             let json_val = lua_to_json(val)?;
             bus_set
                 .set(&key, json_val)
-                .map_err(|e| mlua::Error::runtime(e))?;
+                .map_err(mlua::Error::runtime)?;
             Ok(true)
         })?,
     )?;
@@ -280,6 +408,12 @@ pub fn register_state_bus_api(lua: &Lua, bus: Arc<StateBus>) -> Result<(), mlua:
     bus_tbl.set(
         "delete",
         lua.create_function(move |_, key: String| Ok(bus_del.delete(&key)))?,
+    )?;
+
+    let bus_clear_ns = bus.clone();
+    bus_tbl.set(
+        "clear_namespace",
+        lua.create_function(move |_, prefix: String| Ok(bus_clear_ns.clear_namespace(&prefix)))?,
     )?;
 
     let bus_keys = bus.clone();
@@ -324,7 +458,8 @@ mod tests {
 
     #[test]
     fn test_bus_crud_and_raii() {
-        let bus = Arc::new(StateBus::new());
+        let tmp_state = std::env::temp_dir().join(format!("grime_state_test_{}.json", std::process::id()));
+        let bus = Arc::new(StateBus::with_persistence_path(Some(tmp_state.clone())));
         bus.set("pipeline.test_val", json!({"score": 42})).unwrap();
         bus.set("modules.aider.model", json!("gpt-4o")).unwrap();
 
@@ -345,6 +480,44 @@ mod tests {
         assert!(!bus.has("pipeline.test_val"));
         // modules.* должен остаться
         assert!(bus.has("modules.aider.model"));
+
+        let _ = fs::remove_file(&tmp_state);
+    }
+
+    #[test]
+    fn test_state_bus_persistence_across_instances() {
+        let tmp_state = std::env::temp_dir().join(format!("grime_persist_test_{}.json", std::process::id()));
+        let _ = fs::remove_file(&tmp_state);
+
+        {
+            let bus1 = StateBus::with_persistence_path(Some(tmp_state.clone()));
+            bus1.set("log.history", json!(["event1", "event2"])).unwrap();
+            bus1.set("daemon.terminal_dump", json!({"cmd": "cargo build", "status": 0})).unwrap();
+            bus1.set("pipeline.ephemeral", json!("do_not_save")).unwrap();
+        }
+
+        assert!(tmp_state.exists(), "Файл state.json должен быть создан на диске");
+
+        // Новый инстанс StateBus должен автоматически подгрузить сохраненные данные
+        let bus2 = StateBus::with_persistence_path(Some(tmp_state.clone()));
+        assert_eq!(bus2.get("log.history"), Some(json!(["event1", "event2"])));
+        assert_eq!(bus2.get("daemon.terminal_dump").unwrap()["cmd"], json!("cargo build"));
+        assert!(!bus2.has("pipeline.ephemeral"), "Сессионные ключи pipeline.* не должны сохраняться на диск");
+
+        // Проверяем clear_namespace и delete
+        let removed = bus2.clear_namespace("log");
+        assert_eq!(removed, 1);
+        assert!(!bus2.has("log.history"));
+
+        let bus3 = StateBus::with_persistence_path(Some(tmp_state.clone()));
+        assert!(!bus3.has("log.history"), "Удаленное пространство имен не должно восстанавливаться с диска");
+        assert!(bus3.has("daemon.terminal_dump"));
+
+        assert!(bus3.delete("daemon.terminal_dump"));
+        let bus4 = StateBus::with_persistence_path(Some(tmp_state.clone()));
+        assert!(!bus4.has("daemon.terminal_dump"));
+
+        let _ = fs::remove_file(&tmp_state);
     }
 
     #[test]

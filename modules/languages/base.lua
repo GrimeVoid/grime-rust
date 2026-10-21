@@ -140,7 +140,8 @@ function BaseAdapter:apply_template(root, ctx, extra)
 
         local new_content = content
         for k, v in pairs(replacements) do
-            new_content = new_content:gsub(k, v)
+            local safe_v = tostring(v):gsub("%%", "%%%%")
+            new_content = new_content:gsub(k, safe_v)
         end
 
         if new_content ~= content then
@@ -152,14 +153,13 @@ function BaseAdapter:apply_template(root, ctx, extra)
         end
     end
 
-    local p = io.popen("find \"" .. root .. "\" -type f 2>/dev/null")
-    if p then
-        for file in p:lines() do
+    local res = ctx.capture and ctx.capture({ "find", root, "-type", "f" })
+    if res and res.code == 0 and res.stdout then
+        for file in res.stdout:gmatch("[^\r\n]+") do
             if not file:find("/%.git/") and not file:find("/build/") and not file:find("/target/") then
                 substitute_file(file)
             end
         end
-        p:close()
     end
 
     return true

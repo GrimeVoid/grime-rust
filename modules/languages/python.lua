@@ -52,7 +52,7 @@ function PythonAdapter:build(root, ctx)
         return false
     end
 
-    local code = ctx.run_shell("python3 -m py_compile " .. target, root)
+    local code = ctx.run_process({ "python3", "-m", "py_compile", target }, root)
     return code == 0
 end
 

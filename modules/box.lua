@@ -1,4 +1,5 @@
 local argparse = require("languages.argparse")
+local utils = require("languages.utils")
 local ctx = grime.ctx
 
 local ACTIONS = {
@@ -181,18 +182,24 @@ end
 local function handle_run(box_name, target_dir, command_tokens)
     ensure_box_running(box_name)
     local cmd_str = "grime project run"
+    local inp = ctx.input or ctx.pipeline_input
+    if inp and type(inp) == "string" and #inp > 0 and grime and grime.fs and grime.fs.is_dir(inp) then
+        target_dir = ctx.normalize_path and ctx.normalize_path(inp) or inp
+    end
+
     if command_tokens and #command_tokens > 0 then
-        cmd_str = table.concat(command_tokens, " ")
-    elseif ctx.input or ctx.pipeline_input then
-        local inp = ctx.input or ctx.pipeline_input
-        if type(inp) == "string" and #inp > 0 then
-            cmd_str = inp
+        local escaped = {}
+        for _, tok in ipairs(command_tokens) do
+            table.insert(escaped, utils.shell_escape(tok))
         end
+        cmd_str = table.concat(escaped, " ")
+    elseif inp and type(inp) == "string" and #inp > 0 and not (grime and grime.fs and grime.fs.is_dir(inp)) then
+        cmd_str = inp
     end
 
     ctx.log(string.format("Запуск в [%s]: %s (директория: %s)", box_name, cmd_str, target_dir))
-    local escaped_dir = target_dir:gsub("'", "'\\''")
-    local inner = string.format("export PATH=\"$PATH:$HOME/.local/bin\"; cd '%s' && %s", escaped_dir, cmd_str)
+    local escaped_dir = utils.shell_escape(target_dir)
+    local inner = string.format("export PATH=\"$PATH:$HOME/.local/bin\"; cd %s && %s", escaped_dir, cmd_str)
     local cmd = { "distrobox", "enter", box_name, "--", "bash", "-c", inner }
 
     local ret = ctx.run_process(cmd, target_dir)
@@ -209,22 +216,53 @@ local function handle_export(box_name, target_dir, tokens)
     ensure_box_running(box_name)
     if not tokens or #tokens == 0 then
         ctx.log("Использование экспорта из контейнера:")
-        ctx.log("  grime box [box_name] export bin <binary_path>")
-        ctx.log("  grime box [box_name] export app <app_name>")
+        ctx.log("  grime box [box_name] export bin <binary_path>  (или --bin <binary_path>)")
+        ctx.log("  grime box [box_name] export app <app_name>     (или --app <app_name>)")
         ctx.fail("Не указаны параметры экспорта")
         return
     end
 
-    local exp_type = tokens[1]
-    local target_item = tokens[2]
+    local exp_type = nil
+    local target_item = nil
+    local extra_flags = {}
+
+    local i = 1
+    while i <= #tokens do
+        local t = tokens[i]
+        if (t == "app" or t == "--app" or t == "-a") and tokens[i + 1] then
+            exp_type = "app"
+            target_item = tokens[i + 1]
+            i = i + 1
+        elseif (t == "bin" or t == "--bin" or t == "-b") and tokens[i + 1] then
+            exp_type = "bin"
+            target_item = tokens[i + 1]
+            i = i + 1
+        elseif t:match("^%-%-app=(.+)$") then
+            exp_type = "app"
+            target_item = t:match("^%-%-app=(.+)$")
+        elseif t:match("^%-%-bin=(.+)$") then
+            exp_type = "bin"
+            target_item = t:match("^%-%-bin=(.+)$")
+        elseif not target_item and not t:match("^%-") then
+            target_item = t
+            exp_type = exp_type or (t:find("/") and "bin" or "app")
+        else
+            table.insert(extra_flags, t)
+        end
+        i = i + 1
+    end
+
     if not target_item then
-        ctx.fail("Укажите тип (bin/app) и имя элемента для экспорта")
+        ctx.fail("Укажите тип (bin/app или --bin/--app) и имя элемента для экспорта")
         return
     end
 
     local flag = (exp_type == "app") and "--app" or "--bin"
     local cmd = { "distrobox", "enter", box_name, "--", "distrobox-export", flag, target_item }
-    ctx.log(string.format("Экспорт %s '%s' из [%s]...", exp_type, target_item, box_name))
+    for _, ef in ipairs(extra_flags) do
+        table.insert(cmd, ef)
+    end
+    ctx.log(string.format("Экспорт %s '%s' из [%s]...", exp_type or "bin", target_item, box_name))
 
     local ret = ctx.run_process(cmd, target_dir)
     if grime and grime.bus then
@@ -238,12 +276,18 @@ end
 
 local function handle_create(box_name, target_dir, tokens)
     local cmd = { "distrobox", "create" }
+    local start_idx = 1
     if box_name then
         table.insert(cmd, "--name")
         table.insert(cmd, box_name)
+        if tokens and tokens[1] == box_name then
+            start_idx = 2
+        end
     end
-    for _, t in ipairs(tokens or {}) do
-        table.insert(cmd, t)
+    if tokens then
+        for i = start_idx, #tokens do
+            table.insert(cmd, tokens[i])
+        end
     end
 
     ctx.log("Создание контейнера Distrobox: " .. table.concat(cmd, " ") .. "...")
@@ -303,7 +347,7 @@ local function print_help()
     %srm, delete%s            Удалить контейнер Distrobox
                          grime box rm <имя>
     %sexport%s                Экспорт бинарника или desktop-файла из контейнера на хост
-                         grime box export <имя> --app <бинарник>
+                         grime box export [имя] --app <приложение> | --bin <путь>
     %shelp, -h, --help%s      Показать эту справку
 
 %sПРИМЕРЫ:%s
@@ -380,7 +424,7 @@ function main()
     -- Разрешаем имя контейнера
     local box_name = specified_box
     if not box_name then
-        if #command_tokens > 0 and not command_tokens[1]:match("^%-") then
+        if #command_tokens > 0 and not command_tokens[1]:match("^%-") and not (action == "export" and (command_tokens[1] == "app" or command_tokens[1] == "bin")) then
             box_name = table.remove(command_tokens, 1)
         else
             box_name = get_default_box(containers)

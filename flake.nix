@@ -33,7 +33,7 @@
 
           meta = with pkgs.lib; {
             description = "Grime modular single-binary workspace & execution orchestrator";
-            homepage = "https://github.com/ValetJk010/Grime_Project";
+            homepage = "https://github.com/GrimeVoid/grime-rust";
             license = licenses.mit;
             maintainers = [ ];
             mainProgram = "grime";

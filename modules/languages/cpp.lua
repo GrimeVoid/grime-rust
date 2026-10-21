@@ -144,15 +144,14 @@ function CppAdapter:build(root, ctx)
     -- 3. Иначе если в корне или в src/ найдены .cpp / .c файлы -> собирать напрямую компилятором хоста/devShell
     local source_files = {}
     local function collect_sources(dir)
-        local p = io.popen("find \"" .. dir .. "\" -maxdepth 1 -type f \\( -name \"*.cpp\" -o -name \"*.cc\" -o -name \"*.cxx\" -o -name \"*.c\" \\) 2>/dev/null")
-        if p then
-            for line in p:lines() do
-                local trimmed = line:match("^%s*(.-)%s*$")
-                if #trimmed > 0 then
-                    table.insert(source_files, string.format("%q", trimmed))
+        local entries = (grime and grime.fs and grime.fs.list and grime.fs.list(dir)) or {}
+        for _, f in ipairs(entries) do
+            if f:match("%.cpp$") or f:match("%.cc$") or f:match("%.cxx$") or f:match("%.c$") then
+                local full = dir .. "/" .. f
+                if not (grime and grime.fs and grime.fs.is_dir and grime.fs.is_dir(full)) then
+                    table.insert(source_files, utils.shell_escape(full))
                 end
             end
-            p:close()
         end
     end
 
@@ -168,14 +167,12 @@ function CppAdapter:build(root, ctx)
 
     local proj_name = root:match("([^/\\]+)$") or "main"
     local compiler = "g++"
-    if ctx.capture and ctx.capture("which g++ 2>/dev/null").code ~= 0 then
-        if ctx.capture("which clang++ 2>/dev/null").code == 0 then
-            compiler = "clang++"
-        end
+    if not utils.has_binary("g++", ctx) and utils.has_binary("clang++", ctx) then
+        compiler = "clang++"
     end
 
     ctx.log(string.format("Компиляция C++ проекта напрямую (%s) в %s...", compiler, root))
-    local cmd = string.format("%s -O2 -std=c++20 %s -o %q", compiler, table.concat(source_files, " "), proj_name)
+    local cmd = string.format("%s -O2 -std=c++20 %s -o %s", compiler, table.concat(source_files, " "), utils.shell_escape(proj_name))
     local code = ctx.run_shell(cmd, root)
     return code == 0
 end

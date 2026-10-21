@@ -8,6 +8,8 @@ local function print_help()
     grime bus get <ключ>
     grime bus set <ключ> <значение>
     grime bus has <ключ>
+    grime bus rm <ключ>
+    grime bus list [префикс]
     grime bus emit <событие> [json_данные]
 
 %sОПИСАНИЕ:%s
@@ -17,6 +19,7 @@ local function print_help()
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime bus set pipeline.target "release" : cmd cargo build
     grime bus get pipeline.counter
+    grime bus list
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -43,16 +46,41 @@ local function load_persisted_state()
     return {}
 end
 
+local function write_state_atomic(data)
+    local sfile = get_state_file()
+    local tmp = sfile .. ".tmp." .. tostring(os.time())
+    local f = io.open(tmp, "w")
+    if f then
+        f:write(grime.json.encode(data))
+        f:close()
+        os.rename(tmp, sfile)
+    end
+end
+
 local function save_persisted_key(key, val)
     if key:match("^pipeline%.") then return end
     local data = load_persisted_state()
     data[key] = val
-    local sfile = get_state_file()
-    local f = io.open(sfile, "w")
-    if f then
-        f:write(grime.json.encode(data))
-        f:close()
+    write_state_atomic(data)
+end
+
+local function remove_persisted_key(key)
+    local data = load_persisted_state()
+    if data[key] ~= nil then
+        data[key] = nil
+        write_state_atomic(data)
+        return true
     end
+    return false
+end
+
+local function normalize_bus_key(key)
+    if not key or type(key) ~= "string" then return key end
+    local trimmed = grime.str.trim(key)
+    if #trimmed > 0 and not trimmed:find("%.") then
+        return "user." .. trimmed
+    end
+    return trimmed
 end
 
 function main()
@@ -74,7 +102,8 @@ function main()
     end
 
     if action == "get" then
-        local key = args[2] or ctx.input or ctx.pipeline_input
+        local raw_key = args[2] or ctx.input or ctx.pipeline_input
+        local key = normalize_bus_key(raw_key)
         if not key or #key == 0 then
             ctx.fail("Укажите ключ для чтения: grime bus get <key>")
             return
@@ -84,6 +113,10 @@ function main()
             local persisted = load_persisted_state()
             if persisted[key] ~= nil then
                 val = persisted[key]
+                pcall(grime.bus.set, key, val)
+                ok = true
+            elseif raw_key and persisted[raw_key] ~= nil then
+                val = persisted[raw_key]
                 pcall(grime.bus.set, key, val)
                 ok = true
             end
@@ -101,7 +134,7 @@ function main()
             ctx.success(out)
         end
     elseif action == "set" then
-        local key = args[2]
+        local key = normalize_bus_key(args[2])
         local val_str = args[3] or ctx.input or ctx.pipeline_input
         if not key or not val_str then
             ctx.fail("Укажите ключ и значение: grime bus set <key> <value>")
@@ -126,7 +159,8 @@ function main()
             ctx.fail("Ошибка записи в шину: " .. tostring(err))
         end
     elseif action == "has" then
-        local key = args[2] or ctx.input or ctx.pipeline_input
+        local raw_key = args[2] or ctx.input or ctx.pipeline_input
+        local key = normalize_bus_key(raw_key)
         if not key then
             ctx.fail("Укажите ключ: grime bus has <key>")
             return
@@ -134,7 +168,7 @@ function main()
         local ok, exists = pcall(grime.bus.has, key)
         if (not ok or not exists) and not key:match("^pipeline%.") then
             local persisted = load_persisted_state()
-            if persisted[key] ~= nil then
+            if persisted[key] ~= nil or (raw_key and persisted[raw_key] ~= nil) then
                 exists = true
                 ok = true
             end
@@ -144,6 +178,47 @@ function main()
             return
         end
         ctx.success(tostring(exists))
+    elseif action == "rm" or action == "delete" or action == "del" then
+        local raw_key = args[2] or ctx.input or ctx.pipeline_input
+        local key = normalize_bus_key(raw_key)
+        if not key or #key == 0 then
+            ctx.fail("Укажите ключ для удаления: grime bus rm <key>")
+            return
+        end
+        if grime.bus.delete then
+            pcall(grime.bus.delete, key)
+        end
+        remove_persisted_key(key)
+        if raw_key and raw_key ~= key then
+            remove_persisted_key(raw_key)
+        end
+        ctx.log("Ключ '" .. key .. "' удален из шины")
+        ctx.success(key)
+    elseif action == "list" or action == "ls" or action == "keys" then
+        local prefix = args[2]
+        local keys_map = {}
+        if grime.bus.keys then
+            local ok, klist = pcall(grime.bus.keys, prefix)
+            if ok and type(klist) == "table" then
+                for _, k in ipairs(klist) do keys_map[k] = true end
+            end
+        end
+        local persisted = load_persisted_state()
+        for k, _ in pairs(persisted) do
+            if not prefix or k:sub(1, #prefix) == prefix then
+                keys_map[k] = true
+            end
+        end
+        local keys = {}
+        for k, _ in pairs(keys_map) do table.insert(keys, k) end
+        table.sort(keys)
+        if #keys == 0 then
+            ctx.log("Шина состояния пуста")
+            ctx.success("")
+        else
+            for _, k in ipairs(keys) do print(k) end
+            ctx.success(table.concat(keys, "\n"))
+        end
     elseif action == "emit" then
         if not (grime and grime.events) then
             ctx.fail("Шина событий Grime (EventBus) недоступна")

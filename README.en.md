@@ -2,12 +2,12 @@
 
 # GRIME (Next Generation / Grime-RS) 🦀🌙
 
-[![Release: v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/ValetJk010/Grime_Project/releases/tag/v1.1.0)
+[![Release: v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/GrimeVoid/grime-rust/releases/tag/v1.1.0)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust%202021-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Runtime: LuaJIT](https://img.shields.io/badge/Runtime-LuaJIT%20%2F%20mlua-blue.svg?logo=lua)](https://luajit.org/)
 [![Ecosystem: Nix Flakes](https://img.shields.io/badge/Ecosystem-Nix%20Flakes-5277C3.svg?logo=nixos)](https://nixos.org/)
 [![Containers: Distrobox](https://img.shields.io/badge/Containers-Distrobox%20%2F%20Podman-purple.svg)](https://distrobox.it/)
-[![Startup: 2.8 ms](https://img.shields.io/badge/Cold%20Start-2.8%20ms-brightgreen.svg)]()
+[![Startup: 2.06 ms](https://img.shields.io/badge/Cold%20Start-2.06%20ms-brightgreen.svg)]()
 [![Socket Latency: 1.1 ms](https://img.shields.io/badge/Latency-1.1%20ms%20(Socket)-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -180,18 +180,38 @@ grime box export app my-gui-app          # Exports desktop .desktop launcher
 Beneath the effortless developer experience lies a rigorous engineering architecture built for maximum resilience and extreme performance.
 
 ### 🦀 Native Rust Microkernel (Grime-RS)
-- **Sub-Millisecond Responsiveness**: CLI cold start of **`~2.8 ms`**, IPC socket latency of **`1.1 ms`**.
+- **Sub-Millisecond Responsiveness**: CLI cold start of **`~2.06 ms`**, IPC socket latency of **`1.1 ms`**.
 - **Minimal Footprint**: Resident daemon `grime --daemon-server` consumes only **4–6 MB RAM** at idle.
 - **Memory Safety**: Zero race conditions, zero memory leaks, and complete type safety guaranteed by Rust.
+- **Preamble Flag Isolation**: Kernel flags (`-f`, `-d`, `-p`, `-h`, `-v`) are parsed strictly before the first subcommand and no longer conflict with target command flags (`cmd`, `pkg`, `app`, `git`).
+- **Argument Delimiters `//` and `--`**: Full escaping support for arbitrary user arguments (e.g., `grime cmd // echo -f -d -p` or `grime pkg run -- curl -v https://...`).
+- **Process & Thread Resilience**:
+  - Eliminated pipe deadlock when streaming large data (> 64 KB) through `stdin` via dedicated asynchronous writer thread.
+  - Robust session management (`setsid`) and process group termination (`-pgid`), eliminating orphaned zombie processes.
+  - Strict POSIX signal exit code mapping (`128 + sig`).
 
 ### 🌙 Declarative LuaJIT FFI Modules
 - All domain logic, compilation rules, and integrations are organized as dynamic modules (`~/.config/grime/modules/`).
 - **Sandboxing & Hot-Reload**: Modules update instantly without restarting the background daemon.
+- **Lifecycle Isolation & Intercepted `os.exit`**: Direct calls to `os.exit(code)` are intercepted and transformed into safe exceptions without crashing the daemon, ensuring all `cleanup()` hooks are executed.
+- **Isolated Cleanup Registry**: Eliminated cross-contamination of `cleanup()` hooks between pipeline steps.
 - Direct invocation of native C APIs via high-performance FFI.
+
+### 🌐 Unified System Registry: `list` Module (`grime list` / `grime ls`)
+- Instant comprehensive overview of your development ecosystem in **~5 ms**:
+  - All registered GRIME modules with documentation;
+  - All local Grime Apps with stacks and source paths;
+  - All developer projects across all supported language directories.
+- Flexible filtering: `grime list projects`, `grime list apps`, `grime list modules cpp`.
+
+### 💻 Polyglot Project Orchestrator (`grime project`)
+- Native support for **C++**, **Rust**, **Python**, **Java**, and **Lua** (`grime project lua init <name>`).
+- Built-in `grime project list [lang] [filter]` command for swift repository lookup.
+- Automatic `mtime`-based source freshness verification before running (`grime project run`).
 
 ### 🚀 Microservice Lifecycle Orchestration (`grime app`)
 - **Declarative `app.lua` Manifest**: Compact specification of build, run, dependencies, and environment variables.
-- **Supervision & Daemonization**: Background execution (`--detach`), PID tracking, and graceful shutdown (`grime app stop`).
+- **Supervision & Daemonization**: Background execution (`--detach`), PID tracking, and graceful group shutdown (`grime app stop`).
 - **Polyglot Workflows**: Effortlessly bridge C++ high-performance compute engines with Python analysis scripts within one application.
 
 ### 📦 Self-Contained Standalone Executables (`grime app bundle`)
@@ -199,9 +219,11 @@ The `grime app bundle <app>` command creates a self-sufficient binary in `dist/`
 - Embeds all dynamic libraries, interpreters, and glibc directly into a portable binary.
 - The resulting artifact runs on **any standard Linux distribution** without Nix, without compilers, and without external dependencies.
 
-### 🔀 In-Memory StateBus (`grime bus`) & Task Supervision
-- **RAM StateBus**: Thread-safe structured metadata exchange between pipeline stages without brittle stdout text parsing.
+### 🔀 Persistent StateBus (`grime bus`) & Task Supervision
+- **RAM StateBus + Persistence**: Thread-safe structured metadata exchange between pipeline stages with atomic disk persistence in `~/.config/grime/state.json`.
+- **Auto-Namespace Normalization**: Unprefixed keys automatically default to `user.<key>` (e.g., `grime bus set key 123`).
 - **RAII Pipeline Cleanup**: Keys in the `pipeline.*` namespace are automatically erased upon pipeline completion.
+- **Host Boundary Module (`host`)**: The `: host :` boundary step provides transparent cross-boundary execution between Distrobox/Nix containers and the host OS (`: box <name> : ... : host : ...`).
 - **TaskSupervisor**:
   - `is_step_active`: Prevents false watchdog timeouts during lengthy compilation stages.
   - Retention Policy (1 Hour): Automatic pruning of completed task records and file descriptors.
@@ -269,7 +291,11 @@ Measured latency metrics and runtime overhead:
 
 | Metric | Value | Test Description & Conditions |
 | :--- | :--- | :--- |
-| **CLI Cold Start (`grime`)** | **`~2.8 ms`** | From binary launch to LuaJIT VM initialization and pipeline parsing |
+| **CLI Cold Start (`grime`)** | **`~2.06 ms`** | From binary launch to LuaJIT VM initialization and help/version output |
+| **Host Boundary Step (`host`)** | **`3.92 ms`** | Full pipeline parsing and context switching cycle |
+| **End-to-End 3-Step Pipeline** | **`4.53 ms`** | Pipeline `host : bus set ... : bus get ...` with state passing |
+| **Unified System Registry (`list`)** | **`5.47 ms`** | Full discovery and table formatting of modules, apps, and projects |
+| **Project Inspection (`project path`)** | **`6.05 ms`** | Fuzzy discovery and target project directory resolution |
 | **IPC Socket Roundtrip** | **`1.1 ms`** | Full request-response cycle over Unix Domain Socket |
 | **Idle Memory Consumption** | **`4–6 MB`** | Resident Set Size (RSS) of the background service `grime --daemon-server` |
 | **Ephemeral Flake Synthesis** | **`< 15 ms`** | Source hashing, toolchain synthesis, and devShell caching |
@@ -419,15 +445,16 @@ return {
 
 The repository includes declarative LuaJIT modules (`modules/`), each addressing a dedicated domain:
 
+- [`modules/list.lua`](modules/list.lua) — Unified system registry: comprehensive overview of all GRIME modules, Grime Apps, and developer projects (`grime list`, `grime ls`).
 - [`modules/pkg.lua`](modules/pkg.lua) — Multi-package manager, cascade lookup, fuzzy typo detection, and interactive Command-Not-Found.
 - [`modules/app.lua`](modules/app.lua) — Full application lifecycle, daemonization, Git snapshots, Nix closure audit, and bundling.
 - [`modules/project.lua`](modules/project.lua) — Developer project orchestration, fuzzy directory lookup, and mtime validation.
-- [`modules/languages/`](modules/languages/) — Compiler and build adapters for C++, Rust, Python, Java with smart scanner [`scanner.lua`](modules/languages/scanner.lua) and shared tools [`utils.lua`](modules/languages/utils.lua).
+- [`modules/languages/`](modules/languages/) — Compiler and build adapters for C++, Rust, Python, Java, Lua ([`lua.lua`](modules/languages/lua.lua)) with smart scanner [`scanner.lua`](modules/languages/scanner.lua) and shared tools [`utils.lua`](modules/languages/utils.lua).
 - [`modules/nix.lua`](modules/nix.lua) — Declarative and ephemeral Nix Flake/DevShell environments, garbage collection (`gc`), deduplication (`optimise`), generation history, and rollback.
 - [`modules/box.lua`](modules/box.lua) — Orchestration and execution inside isolated Distrobox containers, binary and desktop application export.
 - [`modules/daemon.lua`](modules/daemon.lua) — Management of the background daemon service (`grime --daemon-server`): status, memory monitoring, socket verification, restart, and diagnostic logs.
 - [`modules/aider.lua`](modules/aider.lua) — Integration of the autonomous AI coding agent Aider directly into the Grime pipeline.
-- [`modules/bus.lua`](modules/bus.lua) — StateBus shared memory across pipeline steps.
+- [`modules/bus.lua`](modules/bus.lua) — Persistent StateBus shared memory across pipeline steps.
 - [`modules/git.lua`](modules/git.lua) — High-level Git operations, changes audit, and snapshots.
 - [`modules/doctor.lua`](modules/doctor.lua) — Deep diagnostic suite for host tools, sockets, and containers.
 - [`modules/log.lua`](modules/log.lua) — Structured system logging.
@@ -442,4 +469,4 @@ This project is licensed under the open-source **[MIT License](LICENSE)**.
 
 You are completely free to use, modify, distribute, and integrate GRIME into personal, academic, research, and commercial projects without royalties or hidden restrictions.
 
-Copyright (c) 2026 **ValetJk010 / Danny**.
+Copyright (c) 2026 **GrimeVoid / Danny**.

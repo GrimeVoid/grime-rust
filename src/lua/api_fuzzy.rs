@@ -20,7 +20,7 @@ pub fn register_fuzzy_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Erro
 
             for c in &candidates {
                 if let Some(score) = matcher.fuzzy_match(c, &query) {
-                    if best_score.is_none() || score > best_score.unwrap() {
+                    if best_score.is_none_or(|best| score > best) {
                         best_score = Some(score);
                         best_candidate = Some(c.clone());
                     }
@@ -74,13 +74,11 @@ pub fn register_fuzzy_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Erro
                         }
                     }
                 } else {
-                    for pair in tbl.pairs::<Value, Value>() {
-                        if let Ok((k, _)) = pair {
-                            if let Value::String(s) = k {
-                                if let Ok(utf8) = s.to_str() {
-                                    if !utf8.is_empty() {
-                                        cand_list.push(utf8.to_string());
-                                    }
+                    for (k, _) in tbl.pairs::<Value, Value>().flatten() {
+                        if let Value::String(s) = k {
+                            if let Ok(utf8) = s.to_str() {
+                                if !utf8.is_empty() {
+                                    cand_list.push(utf8.to_string());
                                 }
                             }
                         }
@@ -113,8 +111,18 @@ pub fn register_fuzzy_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Erro
             let thresh = threshold.unwrap_or(0.75);
             let cand_refs: Vec<&str> = known_flags.iter().map(|s| s.as_str()).collect();
             let res_tbl = lua.create_table()?;
+            let mut passthrough = false;
             for (idx, arg) in args.iter().enumerate() {
-                let replaced = if arg.starts_with('-') && arg != "--" {
+                if passthrough {
+                    res_tbl.set(idx + 1, arg.clone())?;
+                    continue;
+                }
+                if arg == "--" || arg == "//" {
+                    passthrough = true;
+                    res_tbl.set(idx + 1, arg.clone())?;
+                    continue;
+                }
+                let replaced = if arg.starts_with('-') {
                     crate::args::fuzzy_match_flag(arg, &cand_refs, thresh)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| arg.clone())

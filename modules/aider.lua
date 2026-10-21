@@ -1,4 +1,5 @@
 local ctx = grime.ctx
+local utils = require("languages.utils")
 
 local GRIME_CONVENTIONS = [[
 
@@ -159,9 +160,9 @@ end
 
 --- Рекурсивная замена плейсхолдеров в директории
 local function replace_placeholders_in_dir(dir, replacements)
-    local p = io.popen(string.format("find %q -type f 2>/dev/null", dir))
-    if p then
-        for raw_line in p:lines() do
+    local res = ctx.capture({ "find", dir, "-type", "f" })
+    if res and res.code == 0 and res.stdout then
+        for raw_line in res.stdout:gmatch("[^\r\n]+") do
             local file_path = raw_line:match("^%s*(.-)%s*$")
             if file_path ~= "" and ctx.is_file(file_path) then
                 local f = io.open(file_path, "r")
@@ -171,7 +172,8 @@ local function replace_placeholders_in_dir(dir, replacements)
                     local changed = false
                     for placeholder, val in pairs(replacements) do
                         if content:find(placeholder, 1, true) then
-                            content = content:gsub(placeholder, val)
+                            local safe_val = tostring(val):gsub("%%", "%%%%")
+                            content = content:gsub(placeholder, safe_val)
                             changed = true
                         end
                     end
@@ -185,7 +187,6 @@ local function replace_placeholders_in_dir(dir, replacements)
                 end
             end
         end
-        p:close()
     end
 end
 
@@ -214,7 +215,7 @@ local function classify_stack(user_prompt)
 
 Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
     ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
-    local cres = ctx.capture({ "timeout", "5", aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
+    local cres = ctx.capture({ "timeout", "30", aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
     if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
         local out_l = cres.stdout:lower()
         for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
@@ -232,7 +233,7 @@ local function run_dev(app_dir, prompt, app_name)
     if prompt and prompt ~= "" then
         local dev_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и команды сборки/запуска.", prompt)
         ctx.log(string.format("Запуск субагента Aider для реализации '%s'...", app_name or "app"))
-        local code = ctx.run_process({ "timeout", "5", grime_bin, "aider", "-m", dev_prompt }, app_dir)
+        local code = ctx.run_process({ "timeout", "180", grime_bin, "aider", "-m", dev_prompt }, app_dir)
         if code ~= 0 then
             ctx.warn(string.format("Aider завершился с кодом %d (продолжаем с базовым шаблоном)", code))
         end
@@ -306,78 +307,7 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
     -- Генерация манифеста app.lua при необходимости
     local manifest_path = app_dir .. "/app.lua"
     if not ctx.is_file(manifest_path) then
-        local m_content = ""
-        if lang == "cpp" then
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = "cpp",
-    artifact = "build/%s",
-    build = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
-    run = "build/%s",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc, app_name, app_name)
-        elseif lang == "rust" then
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = "rust",
-    artifact = "target/release/%s",
-    build = "cargo build --release",
-    run = "target/release/%s",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc, snake_name, snake_name)
-        elseif lang == "python" then
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = "python",
-    artifact = "src/main.py",
-    run = "python3 src/main.py",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc)
-        elseif lang == "java" then
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = "java",
-    artifact = "target/%s-1.0-SNAPSHOT.jar",
-    build = "mvn package",
-    run = "java -jar target/%s-1.0-SNAPSHOT.jar",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc, app_name, app_name)
-        elseif lang == "lua" then
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = "lua",
-    artifact = "src/main.lua",
-    run = "lua src/main.lua",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc)
-        else
-            m_content = string.format([[return {
-    name = %q,
-    description = "%s",
-    type = %q,
-    artifact = "main.lua",
-    run = "lua main.lua",
-    box = nil,
-    detached = false,
-}
-]], app_name, desc, lang)
-        end
-
+        local m_content = utils.generate_app_manifest(app_name, lang, desc)
         local f = io.open(manifest_path, "w")
         if f then
             f:write(m_content)
@@ -396,6 +326,11 @@ end
 local function validate_command_security(cmd_str, target_dir)
     if not cmd_str or cmd_str == "" then
         return false, "[Grime Security] Команда отклонена: пустая команда."
+    end
+
+    -- Запрет subshell-инъекций $(...) и `...`
+    if cmd_str:find("%$%(") or cmd_str:find("`") then
+        return false, "[Grime Security] Команда отклонена: инъекции подоболочек $(...) и `...` запрещены."
     end
 
     local lower = " " .. cmd_str:lower() .. " "
@@ -425,11 +360,11 @@ local function validate_command_security(cmd_str, target_dir)
         return false, "[Grime Security] Команда отклонена: обнаружен опасный деструктивный шаблон."
     end
 
-    -- 3. БЕЗУСЛОВНЫЙ ЗАПРЕТ НА ИЗМЕНЕНИЕ СИСТЕМНЫХ ФАЙЛОВ
+    -- 3. БЕЗУСЛОВНЫЙ ЗАПРЕТ НА ИЗМЕНЕНИЕ СИСТЕМНЫХ ФАЙЛОВ И PATH TRAVERSAL
     local home = os.getenv("HOME") or "/home/danny"
     local sys_dirs = { "/etc", "/usr", "/var", "/boot", "/opt", "/root", "/nix", "/sys", "/proc", "/dev", "/bin", "/sbin", "/lib", "/lib64" }
 
-    local eff_cwd = target_dir or "."
+    local eff_cwd = utils.normalize_path(target_dir or (os.getenv("PWD") or home))
     for _, sdir in ipairs(sys_dirs) do
         if eff_cwd == "/" or eff_cwd == sdir or eff_cwd:sub(1, #sdir + 1) == (sdir .. "/") then
             return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
@@ -438,13 +373,25 @@ local function validate_command_security(cmd_str, target_dir)
 
     for token in cmd_str:gmatch("[^%s|;&()]+") do
         local clean = token:gsub("^['\"]+", ""):gsub("['\"]+$", ""):gsub("^>+", "")
+        if clean:sub(1, 2) == "~/" then
+            clean = home .. clean:sub(2)
+        end
+        local resolved_path = nil
         if clean:sub(1, 1) == "/" then
-            if not clean:find(home, 1, true) then
-                if clean == "/" then
-                    return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
+            resolved_path = utils.normalize_path(clean)
+        elseif clean:find("%.%.") then
+            resolved_path = utils.normalize_path(eff_cwd .. "/" .. clean)
+        end
+
+        if resolved_path then
+            local in_home = (resolved_path == home) or (resolved_path:sub(1, #home + 1) == (home .. "/"))
+            local in_tmp = (resolved_path == "/tmp") or (resolved_path:sub(1, 5) == "/tmp/")
+            if not in_home and not in_tmp then
+                if resolved_path == "/" then
+                    return false, "[Grime Security] Команда отклонена: попытка доступа к корневой директории."
                 end
                 for _, sdir in ipairs(sys_dirs) do
-                    if clean == sdir or clean:sub(1, #sdir + 1) == (sdir .. "/") then
+                    if resolved_path == sdir or resolved_path:sub(1, #sdir + 1) == (sdir .. "/") then
                         return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
                     end
                 end
@@ -500,14 +447,11 @@ local function execute_ai_action(cmd_str, target_dir, source_tag)
     local home = os.getenv("HOME") or "/home/danny"
     local shell_cmd = cmd_str:gsub("~/", home .. "/")
 
-    -- Если Aider вывел относительный путь от корня git-репозитория (например 'ghostty/config.ghostty'),
-    -- а рабочей директорией уже является эта самая папка 'ghostty', устраняем лишний префикс
     if target_dir then
         local folder_name = target_dir:match("([^/]+)$")
         if folder_name and folder_name ~= "" then
             local prefix_pattern = "%f[%w]" .. folder_name .. "/"
             if shell_cmd:find(prefix_pattern) then
-                -- Проверяем, существует ли файл без префикса
                 local cand_cmd = shell_cmd:gsub(prefix_pattern, "")
                 shell_cmd = cand_cmd
             end
@@ -538,63 +482,20 @@ local function execute_ai_action(cmd_str, target_dir, source_tag)
     end
 end
 
---- Умный фоллбэк: если пользователь просит действие, а модель вывела shell-команду в markdown без тега
-local function handle_action_fallback(user_prompt, output, working_dir, has_executed_action)
-    if has_executed_action then
-        return
-    end
-    if not user_prompt or user_prompt == "" or not output or output == "" then
-        return
-    end
-
-    local p_low = user_prompt:lower()
-    local is_action_request = false
-    local action_keywords = {
-        "скопируй", "скопировать", "копируй", "копировать",
-        "перемести", "переместить", "перенеси", "перенести",
-        "создай", "создать", "удали", "удалить",
-        "архивируй", "заархивируй", "распакуй", "распаковать",
-        "запусти", "выполни", "сделай",
-        "copy", "move", "create", "delete", "remove", "archive", "extract", "run", "execute"
-    }
-    for _, kw in ipairs(action_keywords) do
-        if p_low:find(kw, 1, true) then
-            is_action_request = true
-            break
-        end
-    end
-
-    if not is_action_request then
-        return
-    end
-
-    for block_type, code_block in output:gmatch("```([a-zA-Z0-9_-]*)\r?\n(.-)```") do
-        local b_low = block_type:lower()
-        if b_low == "sh" or b_low == "bash" or b_low == "shell" or b_low == "zsh" or b_low == "" then
-            for line in code_block:gmatch("[^\r\n]+") do
-                local trimmed = line:match("^%s*(.-)%s*$")
-                if trimmed ~= "" and not trimmed:match("^#") then
-                    trimmed = trimmed:gsub("^%$%s+", "")
-                    execute_ai_action(trimmed, working_dir, "markdown_fallback")
-                end
-            end
-        end
-    end
-end
-
---- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn>, <grime_exec> и <next_agent_prompt>
+--- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn>, <grime_exec>/<grime_action> и <next_agent_prompt>
 local function parse_aider_tags(output, working_dir, user_prompt)
     if not output or output == "" then
         return nil
     end
-
-    local has_executed_action = false
 
     -- 1. Обработка тегов <grime_bus key="..." [type="json"]>...</grime_bus>
     for open_tag, content in output:gmatch("<grime_bus(.-)>(.-)</grime_bus>") do
         local key = open_tag:match('key%s*=%s*"([^"]+)"') or open_tag:match("key%s*=%s*'([^']+)'")
         local b_type = open_tag:match('type%s*=%s*"([^"]+)"') or open_tag:match("type%s*=%s*'([^']+)'")
         if key and key ~= "" then
+            if not key:find("%.") then
+                key = "user." .. key
+            end
             local raw_val = content:match("^%s*(.-)%s*$")
             local val = raw_val
             if b_type == "json" or raw_val:match("^[%[{]") then
@@ -614,14 +515,16 @@ local function parse_aider_tags(output, working_dir, user_prompt)
         end
     end
 
-    -- 2. Обработка тегов <grime_exec [cwd="..."]>...</grime_exec>
-    for open_tag, exec_content in output:gmatch("<grime_exec(.-)>(.-)</grime_exec>") do
-        local target_cwd = open_tag:match('cwd%s*=%s*"([^"]+)"') or open_tag:match("cwd%s*=%s*'([^']+)'") or working_dir
-        target_cwd = ctx.normalize_path(target_cwd)
-        local cmd_str = exec_content:match("^%s*(.-)%s*$")
-        if cmd_str and cmd_str ~= "" then
-            has_executed_action = true
-            execute_ai_action(cmd_str, target_cwd, "grime_exec")
+    -- 2. Обработка тегов <grime_exec [cwd="..."]>...</grime_exec> и <grime_action [cwd="..."]>...</grime_action>
+    for _, tag_name in ipairs({ "grime_exec", "grime_action" }) do
+        local pattern = "<" .. tag_name .. "(.-)>(.-)</" .. tag_name .. ">"
+        for open_tag, exec_content in output:gmatch(pattern) do
+            local target_cwd = open_tag:match('cwd%s*=%s*"([^"]+)"') or open_tag:match("cwd%s*=%s*'([^']+)'") or working_dir
+            target_cwd = ctx.normalize_path(target_cwd)
+            local cmd_str = exec_content:match("^%s*(.-)%s*$")
+            if cmd_str and cmd_str ~= "" then
+                execute_ai_action(cmd_str, target_cwd, tag_name)
+            end
         end
     end
 
@@ -647,7 +550,6 @@ local function parse_aider_tags(output, working_dir, user_prompt)
             target_cwd = ctx.normalize_path(target_cwd)
 
             if target_mod == "cmd" then
-                has_executed_action = true
                 execute_ai_action(prompt, target_cwd, "grime_spawn")
             else
                 ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
@@ -677,12 +579,7 @@ local function parse_aider_tags(output, working_dir, user_prompt)
         end
     end
 
-    -- 4. Умный фоллбэк: если пользователь просит действие, а модель вывела shell-команду в markdown без тега
-    if not has_executed_action and user_prompt then
-        handle_action_fallback(user_prompt, output, working_dir, has_executed_action)
-    end
-
-    -- 5. Извлечение мастер-промпта следующего шага
+    -- 4. Извлечение мастер-промпта следующего шага
     local next_prompt = output:match("<next_agent_prompt>(.-)</next_agent_prompt>")
     if next_prompt then
         local extracted = next_prompt:match("^%s*(.-)%s*$")
@@ -1160,7 +1057,7 @@ function main()
     else
         local tmp_term_file = nil
         if terminal_context_block and active_term_dump then
-            tmp_term_file = "/tmp/grime_term_context.md"
+            tmp_term_file = string.format("/tmp/grime_term_context_%d_%d.md", os.time(), math.random(1000, 9999))
             local f = io.open(tmp_term_file, "w")
             if f then
                 f:write(terminal_context_block)

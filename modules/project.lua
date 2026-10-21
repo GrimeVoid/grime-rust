@@ -2,6 +2,7 @@ local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
 local ACTION_SYNONYMS = {
+    list = "list", ls = "list", l = "list", show = "list",
     delete = "delete", del = "delete", remove = "delete", rm = "delete", d = "delete",
     init = "init", new = "init", create = "init", i = "init",
     build = "build", b = "build", compile = "build", make = "build",
@@ -17,6 +18,7 @@ local LANGUAGE_ADAPTERS = {
     python = require("languages.python"),
     rust = require("languages.rust"),
     java = require("languages.java"),
+    lua = require("languages.lua"),
 }
 
 local LANGUAGE_ALIASES = {
@@ -24,15 +26,17 @@ local LANGUAGE_ALIASES = {
     python = "python", py = "python",
     rust = "rust", rs = "rust",
     java = "java", jav = "java",
+    lua = "lua", luajit = "lua",
 }
 
 local function get_supported_languages()
-    return { "cpp", "python", "rust", "java" }
+    return { "cpp", "python", "rust", "java", "lua" }
 end
 
 local function detect_language(dir)
-    for lang, adp in pairs(LANGUAGE_ADAPTERS) do
-        if adp:detect(dir) then
+    for _, lang in ipairs(get_supported_languages()) do
+        local adp = LANGUAGE_ADAPTERS[lang]
+        if adp and adp:detect(dir) then
             return lang
         end
     end
@@ -91,16 +95,13 @@ local function find_project_dir(lang_dir, query)
         return exact
     end
 
-    -- Перечисление директорий
+    -- Перечисление директорий без вызова шелла
     local subdirs = {}
-    local p = io.popen("ls -1 \"" .. lang_dir .. "\" 2>/dev/null")
-    if p then
-        for line in p:lines() do
-            if not line:match("^%.") and ctx.exists(lang_dir .. "/" .. line) then
-                table.insert(subdirs, line)
-            end
+    local entries = (grime and grime.fs and grime.fs.list and grime.fs.list(lang_dir)) or {}
+    for _, line in ipairs(entries) do
+        if line ~= "" and not line:match("^%.") and ctx.exists(lang_dir .. "/" .. line) then
+            table.insert(subdirs, line)
         end
-        p:close()
     end
 
     -- 2. Точное совпадение без учета регистра
@@ -125,7 +126,7 @@ local function find_project_dir(lang_dir, query)
     end
 
     -- 5. Нечеткий поиск с высоким порогом (порог 0.75)
-    local best, score = grime.fuzzy.find_best_match(query, subdirs, 0.75)
+    local best, _ = grime.fuzzy.find_best_match(query, subdirs, 0.75)
     if best then
         ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
         return lang_dir .. "/" .. best
@@ -152,8 +153,9 @@ local function handle_rename(projects_root, args)
     local renamed_path = nil
 
     for _, lang in ipairs(get_supported_languages()) do
-        local old_dir = projects_root .. "/" .. lang .. "/" .. old_name
-        local new_dir = projects_root .. "/" .. lang .. "/" .. new_name
+        local lang_dir = get_language_dir(projects_root, lang)
+        local old_dir = lang_dir .. "/" .. old_name
+        local new_dir = lang_dir .. "/" .. new_name
         if ctx.exists(old_dir) then
             ctx.move(old_dir, new_dir)
             ctx.log(string.format("Проект %s/%s переименован в %s", lang, old_name, new_name))
@@ -194,28 +196,24 @@ local function resolve_project_context(parsed)
 
     local action = parsed.action or "path"
     local lang = parsed.categories.language
-    local extra_args = parsed.command_tokens
+    local extra_args = {}
 
-    -- 1. Если пришли по конвейеру
-    if ctx.pipeline_input then
-        local target_dir = resolve_abs_path(ctx.target_dir)
-        local detected_lang = lang or detect_language(target_dir) or "cpp"
-        return action, target_dir, detected_lang, extra_args
-    end
-
-    -- 2. Если классификатор определил существующую директорию
+    -- 1. Если классификатор явно определил существующую директорию в аргументах
     if parsed.target_dir and ctx.exists(parsed.target_dir) then
+        for _, a in ipairs(parsed.args) do table.insert(extra_args, a) end
+        for _, a in ipairs(parsed.command_tokens) do table.insert(extra_args, a) end
         local abs_dir = resolve_abs_path(parsed.target_dir)
         local detected_lang = lang or detect_language(abs_dir) or "cpp"
         return action, abs_dir, detected_lang, extra_args
     end
 
-    -- 3. Если передано позиционное имя проекта
+    -- 2. Если явно передано позиционное имя проекта или путь в аргументах (приоритет над pipeline_input)
     if #parsed.args > 0 then
         local project_name = parsed.args[1]
+        for i = 2, #parsed.args do table.insert(extra_args, parsed.args[i]) end
+        for _, a in ipairs(parsed.command_tokens) do table.insert(extra_args, a) end
 
         if action == "init" then
-            -- Если передана точка или относительный/абсолютный путь -> инициализировать прямо в указанной директории
             if project_name == "." or project_name:find("^%./") or project_name:find("^/") or project_name:find("^~") then
                 return action, resolve_abs_path(project_name), lang or "cpp", extra_args
             end
@@ -225,7 +223,7 @@ local function resolve_project_context(parsed)
             return action, target_dir, lang or "cpp", extra_args
         end
 
-        if ctx.exists(project_name) then
+        if ctx.exists(project_name) and ctx.is_dir(project_name) then
             local abs_dir = resolve_abs_path(project_name)
             local detected_lang = lang or detect_language(abs_dir) or "cpp"
             return action, abs_dir, detected_lang, extra_args
@@ -252,6 +250,24 @@ local function resolve_project_context(parsed)
         local default_lang = "cpp"
         local target_lang_dir = get_language_dir(projects_root, default_lang)
         return action, target_lang_dir .. "/" .. project_name, default_lang, extra_args
+    end
+
+    for _, a in ipairs(parsed.command_tokens) do table.insert(extra_args, a) end
+
+    -- 3. Если имя не передано, проверяем вход из конвейера (ctx.pipeline_input / ctx.input)
+    local pipe_in = ctx.pipeline_input or ctx.input
+    if pipe_in then
+        local trimmed_in = grime.str.trim(tostring(pipe_in))
+        local target_dir = nil
+        if #trimmed_in > 0 and ctx.exists(trimmed_in) and ctx.is_dir(trimmed_in) then
+            target_dir = resolve_abs_path(trimmed_in)
+        elseif ctx.target_dir and ctx.exists(ctx.target_dir) and ctx.is_dir(ctx.target_dir) then
+            target_dir = resolve_abs_path(ctx.target_dir)
+        end
+        if target_dir then
+            local detected_lang = lang or detect_language(target_dir) or "cpp"
+            return action, target_dir, detected_lang, extra_args
+        end
     end
 
     -- 4. Язык без имени проекта
@@ -281,6 +297,65 @@ local function resolve_project_context(parsed)
     return action, default_dir, default_lang, extra_args
 end
 
+local function handle_list(projects_root, parsed, return_path_requested)
+    projects_root = ctx.normalize_path(projects_root)
+    local target_lang = parsed.categories and parsed.categories.language or nil
+    local filter = (parsed.args and #parsed.args > 0) and parsed.args[1]:lower() or nil
+
+    local list = {}
+    local seen_paths = {}
+
+    local langs_to_scan = target_lang and { target_lang } or get_supported_languages()
+    for _, lang in ipairs(langs_to_scan) do
+        local lang_dir = get_language_dir(projects_root, lang)
+        if ctx.exists(lang_dir) and ctx.is_dir(lang_dir) then
+            local entries = (grime and grime.fs and grime.fs.list and grime.fs.list(lang_dir)) or {}
+            for _, item in ipairs(entries) do
+                if item ~= "" and not item:match("^%.") then
+                    local pdir = ctx.normalize_path(lang_dir .. "/" .. item)
+                    if ctx.is_dir(pdir) and not seen_paths[pdir] then
+                        if not filter or item:lower():find(filter, 1, true) or lang:lower():find(filter, 1, true) then
+                            seen_paths[pdir] = true
+                            table.insert(list, { name = item, lang = lang, path = pdir })
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b)
+        if a.lang ~= b.lang then return a.lang < b.lang end
+        return a.name:lower() < b.name:lower()
+    end)
+
+    print(string.format("\n\27[1m📂 Проекты разработки (%d):\27[0m", #list))
+    if #list > 0 then
+        local rows = {}
+        for _, p in ipairs(list) do
+            table.insert(rows, { p.name, p.lang, p.path })
+        end
+        if grime and grime.ui and grime.ui.print_table then
+            grime.ui.print_table(rows, { "Проект", "Язык", "Директория" })
+        else
+            for _, p in ipairs(list) do
+                print(string.format("  %-22s %-10s %s", p.name, p.lang, p.path))
+            end
+        end
+    else
+        print("  \27[90m(проекты не найдены)\27[0m")
+    end
+    print()
+
+    if ctx.has_next_step or return_path_requested then
+        local out_paths = {}
+        for _, p in ipairs(list) do
+            table.insert(out_paths, p.path)
+        end
+        ctx.module_return(table.concat(out_paths, "\n"))
+    end
+end
+
 local function print_help()
     print(string.format([[
 %s%sGrime Project%s — Управление проектами по языкам разработки
@@ -290,6 +365,8 @@ local function print_help()
     grime project [язык] [имя_проекта] <команда>
 
 %sКОМАНДЫ:%s
+    %slist, ls%s               Показать список проектов разработки
+                          grime project list [язык] [фильтр]
     %sinit, new, create%s      Создать новый проект по шаблону
                           grime project init cpp MyGame
                           grime project init rust Tool
@@ -308,7 +385,7 @@ local function print_help()
     %shelp, -h, --help%s       Показать эту справку
 
 %sПОДДЕРЖИВАЕМЫЕ ЯЗЫКИ:%s
-    cpp (C++), rust (Rust), python (Python), java (Java)
+    cpp (C++), rust (Rust), python (Python), java (Java), lua (Lua/LuaJIT)
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime project MyGame path : cmd nvim CMakeLists.txt
@@ -325,6 +402,7 @@ local function print_help()
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m"
     ))
@@ -332,7 +410,7 @@ end
 
 function main()
     local raw_args = ctx.args or {}
-    if #raw_args == 0 then
+    if #raw_args == 0 and not ctx.pipeline_input and not ctx.input then
         print_help()
         return
     end
@@ -368,9 +446,15 @@ function main()
     end
     local return_path_requested = parsed.flags.path_requested
 
+    if parsed.action == "list" then
+        handle_list(projects_root, parsed, return_path_requested)
+        return
+    end
+
     if parsed.action == "rename" then
         local renamed = handle_rename(projects_root, parsed.args)
         if return_path_requested and renamed then
+            if ctx.set_target_dir then ctx.set_target_dir(renamed) end
             ctx.module_return(renamed)
         end
         return
@@ -383,6 +467,7 @@ function main()
 
     if action == "path" then
         if ctx.exists(project_dir) then
+            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             ctx.module_return(project_dir)
             return
         else
@@ -421,7 +506,8 @@ function main()
         ctx.mkdir_p(project_dir)
         adapter:init_project(project_dir, ctx)
         ctx.log(string.format("Проект под %s инициализирован: %s", lang, project_dir))
-        if return_path_requested then
+        if ctx.has_next_step or return_path_requested then
+            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             ctx.module_return(project_dir)
         end
     elseif action == "build" then
@@ -434,7 +520,7 @@ function main()
         local missing_tools = {}
 
         if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
-            local ok, missing = adapter:check_dependencies(ctx)
+            local ok, missing = adapter:check_dependencies(ctx, project_dir)
             if not ok then
                 use_nix = true
                 missing_tools = missing
@@ -454,8 +540,9 @@ function main()
             end
             ctx.log("Сборка успешно завершена через Nix!")
             if ctx.has_next_step or return_path_requested then
+                if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
                 local target = adapter:get_target(project_dir)
-                ctx.module_return(target or project_dir)
+                ctx.module_return(return_path_requested and project_dir or (target or project_dir))
             end
             return
         end
@@ -467,8 +554,9 @@ function main()
         end
         ctx.log("Сборка успешно завершена!")
         if ctx.has_next_step or return_path_requested then
+            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             local target = adapter:get_target(project_dir)
-            ctx.module_return(target or project_dir)
+            ctx.module_return(return_path_requested and project_dir or (target or project_dir))
         end
     elseif action == "run" then
         if not ctx.exists(project_dir) then
@@ -483,7 +571,7 @@ function main()
             local use_nix = (parsed.flags and parsed.flags.nix) or false
             local missing_tools = {}
             if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
-                local ok, missing = adapter:check_dependencies(ctx)
+                local ok, missing = adapter:check_dependencies(ctx, project_dir)
                 if not ok then
                     use_nix = true
                     missing_tools = missing
@@ -506,8 +594,13 @@ function main()
             end
         end
 
-        adapter:run(project_dir, extra_args, ctx)
+        local ret = adapter:run(project_dir, extra_args, ctx)
+        if ret and ret ~= 0 then
+            ctx.fail(string.format("Выполнение проекта завершилось с ошибкой (код %d).", ret))
+            return
+        end
         if ctx.has_next_step or return_path_requested then
+            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             ctx.module_return(project_dir)
         end
     elseif action == "delete" then
@@ -528,6 +621,7 @@ function main()
         adapter:init_project(project_dir, ctx)
         ctx.log(string.format("Проект (%s) сброшен к заводским настройкам: %s", lang, project_dir))
         if ctx.has_next_step or return_path_requested then
+            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             ctx.module_return(project_dir)
         end
     else

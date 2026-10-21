@@ -15,6 +15,7 @@ utils.ANSI = {
     BOLD = "\27[1m",
     RESET = "\27[0m",
     DIM = "\27[90m",
+    GRAY = "\27[90m",
     GREEN = "\27[32m",
     YELLOW = "\27[33m",
     RED = "\27[31m",
@@ -77,14 +78,6 @@ function utils.has_binary(bin, ctx)
         binary_cache[bin] = exists
         return exists
     end
-    local p = io.popen("which " .. bin .. " 2>/dev/null")
-    if p then
-        local out = p:read("*all")
-        p:close()
-        local exists = (out and #out > 0) or false
-        binary_cache[bin] = exists
-        return exists
-    end
     return false
 end
 
@@ -96,13 +89,7 @@ function utils.is_root_user(ctx)
     local c = ctx or (grime and grime.ctx)
     if c and c.capture then
         local res = c.capture({ "id", "-u" })
-        return res.code == 0 and res.stdout:match("^0$") ~= nil
-    end
-    local p = io.popen("id -u 2>/dev/null")
-    if p then
-        local out = p:read("*all")
-        p:close()
-        return out and out:match("^0$") ~= nil
+        return res.code == 0 and res.stdout and res.stdout:match("^0%s*$") ~= nil
     end
     return false
 end
@@ -286,22 +273,26 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
         table.insert(native_lines, "            bashInteractive")
     end
 
+    local clean_libs = {}
     local lib_lines = {}
     for _, p in ipairs(lib_pkgs or {}) do
         local clean = p:gsub("^pkgs%.", "")
+        table.insert(clean_libs, clean)
         table.insert(lib_lines, "            " .. clean)
     end
 
+    local safe_name = tostring(name):gsub("''", "'''"):gsub('[\\"$`]', "\\%0")
     local hook_lines = {
-        string.format('echo "⚡ [Grime Flake DevShell] Окружение \'%s\' активировано"', name)
+        string.format('echo "⚡ [Grime Flake DevShell] Окружение \'%s\' активировано"', safe_name)
     }
-    if lib_pkgs and #lib_pkgs > 0 then
-        table.insert(hook_lines, 'export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$LD_LIBRARY_PATH"')
-        table.insert(hook_lines, 'export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" (with pkgs; [ ' .. table.concat(lib_pkgs, " ") .. ' ])}:$PKG_CONFIG_PATH"')
+    if #clean_libs > 0 then
+        local libs_str = table.concat(clean_libs, " ")
+        table.insert(hook_lines, 'export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (with pkgs; [ ' .. libs_str .. ' ])}:$LD_LIBRARY_PATH"')
+        table.insert(hook_lines, 'export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" (with pkgs; [ ' .. libs_str .. ' ])}:$PKG_CONFIG_PATH"')
     end
 
     local build_inputs_block = ""
-    if lib_pkgs and #lib_pkgs > 0 then
+    if #clean_libs > 0 then
         build_inputs_block = string.format([[
 
           buildInputs = with pkgs; [
@@ -338,6 +329,63 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
 ]], desc, table.concat(native_lines, "\n"), build_inputs_block, table.concat(hook_lines, "\n            "))
 end
 
+--- Универсальный генератор манифеста app.lua для всех поддерживаемых языков
+function utils.generate_app_manifest(name, lang, desc)
+    name = name or "app"
+    lang = (lang or "cpp"):lower()
+    local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. name)
+    local snake_name = name:lower():gsub("[%s%-]", "_")
+
+    local profiles = {
+        cpp = {
+            artifact = "build/" .. name,
+            build = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
+            run = "build/" .. name,
+        },
+        rust = {
+            artifact = "target/release/" .. snake_name,
+            build = "cargo build --release",
+            run = "target/release/" .. snake_name,
+        },
+        python = {
+            artifact = "src/main.py",
+            build = "python3 -m py_compile src/main.py",
+            run = "python3 src/main.py",
+        },
+        java = {
+            artifact = "target/" .. name .. "-1.0-SNAPSHOT.jar",
+            build = "mvn -q package",
+            run = "java -jar target/" .. name .. "-1.0-SNAPSHOT.jar",
+        },
+        lua = {
+            artifact = "src/main.lua",
+            build = "luajit -bl src/main.lua >/dev/null",
+            run = "luajit src/main.lua",
+        },
+    }
+
+    local p = profiles[lang] or {
+        artifact = "src/main.lua",
+        run = "luajit src/main.lua",
+    }
+
+    local lines = {
+        "return {",
+        string.format("    name = %q,", name),
+        string.format("    description = %q,", clean_desc),
+        string.format("    type = %q,", lang),
+        string.format("    artifact = %q,", p.artifact),
+    }
+    if p.build then
+        table.insert(lines, string.format("    build = %q,", p.build))
+    end
+    table.insert(lines, string.format("    run = %q,", p.run))
+    table.insert(lines, "    special_dependencies = {},")
+    table.insert(lines, "    detached = false,")
+    table.insert(lines, "}")
+    return table.concat(lines, "\n") .. "\n"
+end
+
 --- Формирование обертки запуска с авто-детектом nixGL (GPU/OpenGL/Vulkan) и sudo
 function utils.build_nixgl_wrapper(cmd, args, use_sudo)
     local escaped_args = {}
@@ -351,9 +399,11 @@ function utils.build_nixgl_wrapper(cmd, args, use_sudo)
         'c=%q; b=$(command -v "$c" 2>/dev/null); ' ..
         'if [ -z "$b" ]; then b=$(find $(echo "$PATH" | tr ":" " ") -maxdepth 1 -iname "$c" 2>/dev/null | head -n 1); fi; ' ..
         'if [ -z "$b" ]; then b="$c"; fi; ' ..
-        'r="$b"; [ -f "$(dirname "$b")/.$c-wrapped" ] && r="$(dirname "$b")/.$c-wrapped"; ' ..
-        'g=$(ls -d /nix/store/*-nixGL/bin/nixGL 2>/dev/null | tail -n 1); w=""; ' ..
-        'if [ -n "$g" ] && command -v readelf >/dev/null 2>&1 && [ -f "$r" ] && readelf -d "$r" 2>/dev/null | grep -Eiq "libGL|libvulkan|libEGL|libX11|libwayland|libglvnd"; then w="$g"; fi; ' ..
+        'r="$b"; [ -f "$(dirname "$b")/.$(basename "$b")-wrapped" ] && r="$(dirname "$b")/.$(basename "$b")-wrapped"; ' ..
+        'g="$HOME/.local/share/grime/nixGL/bin/nixGL"; [ ! -x "$g" ] && g=$(ls -d /nix/store/*-nixGL/bin/nixGL 2>/dev/null | tail -n 1); ' ..
+        'if [ ! -x "$g" ]; then mkdir -p "$HOME/.local/share/grime" && nix build --impure github:nix-community/nixGL#nixGLDefault --out-link "$HOME/.local/share/grime/nixGL" >/dev/null 2>&1 && g="$HOME/.local/share/grime/nixGL/bin/nixGL"; fi; ' ..
+        'w=""; ' ..
+        'if [ -x "$g" ] && command -v readelf >/dev/null 2>&1 && [ -f "$r" ] && readelf -d "$r" 2>/dev/null | grep -Eiq "libGL|libvulkan|libEGL|libX11|libwayland|libglvnd"; then w="$g"; fi; ' ..
         'exec %s$w "$b"%s',
         cmd, sudo_prefix, args_str
     )

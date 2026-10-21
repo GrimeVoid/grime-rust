@@ -1,4 +1,5 @@
 local BaseAdapter = require("languages.base")
+local utils = require("languages.utils")
 
 local RustAdapter = setmetatable({}, { __index = BaseAdapter })
 RustAdapter.__index = RustAdapter
@@ -16,8 +17,42 @@ function RustAdapter.new()
     return self
 end
 
-function RustAdapter:get_nix_packages(root)
+function RustAdapter:get_nix_packages(_root)
     return { "cargo", "rustc", "rust-analyzer" }
+end
+
+function RustAdapter:get_target(root)
+    local root_name = root:match("([^/\\]+)$") or "rust_app"
+    local bin_name = root_name:lower():gsub("[%s%-]", "_")
+
+    local cargo_file = root .. "/Cargo.toml"
+    if utils.file_exists(cargo_file) then
+        local f = io.open(cargo_file, "r")
+        if f then
+            local content = f:read("*all") or ""
+            f:close()
+            local pkg_section = content:match("%[package%](.-)%f[%[]") or content:match("%[package%](.*)") or content
+            local parsed_name = pkg_section:match('name%s*=%s*"([^"]+)"') or pkg_section:match("name%s*=%s*'([^']+)'")
+            if parsed_name and #parsed_name > 0 then
+                bin_name = parsed_name
+            end
+        end
+        local debug_bin = root .. "/target/debug/" .. bin_name
+        if utils.file_exists(debug_bin) then
+            return debug_bin
+        end
+        local release_bin = root .. "/target/release/" .. bin_name
+        if utils.file_exists(release_bin) then
+            return release_bin
+        end
+    end
+
+    local fallback_debug = root .. "/target/debug/" .. bin_name
+    if utils.file_exists(fallback_debug) then
+        return fallback_debug
+    end
+
+    return BaseAdapter.get_target(self, root)
 end
 
 function RustAdapter:create_default_files(root, ctx)
@@ -65,7 +100,7 @@ function RustAdapter:build(root, ctx)
     elseif ctx.exists(root .. "/src/main.rs") or ctx.exists(root .. "/main.rs") then
         local target_src = ctx.exists(root .. "/src/main.rs") and (root .. "/src/main.rs") or (root .. "/main.rs")
         ctx.log("Компиляция " .. target_src .. " через rustc...")
-        local code = ctx.run_shell("rustc " .. target_src .. " -o main", root)
+        local code = ctx.run_process({ "rustc", target_src, "-o", root .. "/main" }, root)
         return code == 0
     else
         ctx.log("Ошибка: в " .. root .. " не найдены файлы для сборки Rust!")
@@ -75,7 +110,7 @@ end
 
 function RustAdapter:get_run_command(root, extra_args)
     local target = self:get_target(root)
-    if target and grime.fs.exists(target) and grime.fs.is_file(target) then
+    if target and grime.fs.exists(target) and grime.fs.is_file(target) and not target:match("%.rs$") then
         local cmd = { target }
         if extra_args then
             for _, a in ipairs(extra_args) do

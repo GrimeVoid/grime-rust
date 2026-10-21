@@ -21,7 +21,7 @@ function argparse:parse(args, default_target_dir)
     local found_dash = false
 
     for _, tok in ipairs(args) do
-        if not found_dash and tok == "--" then
+        if not found_dash and (tok == "--" or tok == "//") then
             found_dash = true
         elseif found_dash then
             table.insert(command_tokens, tok)
@@ -111,7 +111,7 @@ function argparse:parse(args, default_target_dir)
                     -- 4. Автоопределение директории
                     local is_dir_candidate = false
                     if self.detect_dir and not res_target_dir then
-                        if (tok:find("^[./~]") or tok:find("/")) and grime and grime.fs and grime.fs.exists(tok) then
+                        if (tok:find("^[./~]") or tok:find("/")) and grime and grime.fs and grime.fs.exists(tok) and grime.fs.is_dir(tok) then
                             res_target_dir = tok
                             is_dir_candidate = true
                         end

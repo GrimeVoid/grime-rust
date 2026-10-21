@@ -23,18 +23,10 @@ impl GrimeConfig {
         if conf_path.exists() {
             config.read_file(&conf_path);
         } else {
-            // Проверяем наличие example файла
             let example_path = conf_path.with_extension("conf.example");
             if example_path.exists() {
-                if let Ok(content) = fs::read_to_string(&example_path) {
-                    let _ = fs::create_dir_all(conf_path.parent().unwrap_or(&conf_path));
-                    let _ = fs::write(&conf_path, &content);
-                    config.read_file(&conf_path);
-                    config.ensure_defaults();
-                    return config;
-                }
+                config.read_file(&example_path);
             }
-            config.generate_default(&conf_path);
         }
 
         config.ensure_defaults();
@@ -130,7 +122,6 @@ impl GrimeConfig {
             if home_conf.exists() {
                 return home_conf;
             }
-            // По умолчанию пишем в домашнюю папку, если нет локального
             return home_conf;
         }
 
@@ -152,7 +143,12 @@ impl GrimeConfig {
                     if val.eq_ignore_ascii_case("auto") {
                         self.paths.insert(key, "auto".to_string());
                     } else {
-                        let trimmed = val.trim_end_matches('/');
+                        let stripped = val.trim_end_matches('/');
+                        let trimmed = if stripped.is_empty() && val.starts_with('/') {
+                            "/"
+                        } else {
+                            stripped
+                        };
                         let expanded = match shellexpand::full(trimmed) {
                             Ok(exp) => exp.to_string(),
                             Err(_) => shellexpand::tilde(trimmed).to_string(),
@@ -171,7 +167,7 @@ impl GrimeConfig {
         self.ensure_defaults();
     }
 
-    fn generate_default(&mut self, path: &Path) {
+    pub fn generate_default(&mut self, path: &Path) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let default_config = crate::fs_ops::normalize_path(&home.join(".config").join("grime"));
         let default_modules = crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("modules"));
@@ -229,7 +225,7 @@ impl GrimeConfig {
             .unwrap_or_else(|| {
                 self.config_file
                     .parent()
-                    .map(|p| crate::fs_ops::normalize_path(p))
+                    .map(crate::fs_ops::normalize_path)
                     .unwrap_or_else(|| PathBuf::from("."))
             })
     }

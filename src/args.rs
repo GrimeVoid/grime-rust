@@ -71,8 +71,8 @@ fn compute_dl_matrix<T: PartialEq + Copy>(
     for i in 0..=len_a {
         d[i * stride] = i;
     }
-    for j in 0..=len_b {
-        d[j] = j;
+    for (j, cell) in d.iter_mut().enumerate().take(len_b + 1) {
+        *cell = j;
     }
 
     for i in 1..=len_a {
@@ -163,8 +163,8 @@ pub fn fuzzy_match_flag<'a>(
     known_flags: &[&'a str],
     threshold: f64,
 ) -> Option<&'a str> {
-    // 1. Проверка: аргумент обязан быть флагом (начинаться с '-') и не быть разделителем '--'
-    if !token.starts_with('-') || token == "--" {
+    // 1. Проверка: аргумент обязан быть флагом (начинаться с '-') и не быть разделителем '--' или '//'
+    if !token.starts_with('-') || token == "--" || token == "//" {
         return None;
     }
 
@@ -234,10 +234,7 @@ pub fn fuzzy_match_flag<'a>(
                 best_score = sim;
                 best_candidate = Some(cand);
                 best_cand_raw = Some(cand_raw);
-            } else if (sim - best_score).abs() < 1e-4 {
-                // Коллизия разных флагов с одинаковым счетом
-                second_best_score = sim;
-            } else if sim > second_best_score {
+            } else if (sim - best_score).abs() < 1e-4 || sim > second_best_score {
                 second_best_score = sim;
             }
         }
@@ -286,8 +283,7 @@ pub fn fuzzy_match_entity<'a>(
 
         let is_prefix = c.starts_with(q.as_ref()) && len_q >= 2 && (len_c >= len_q) && (len_c - len_q) <= 3;
         let valid_dist = is_prefix || match len_c {
-            0..=3 => dist <= 1,
-            4..=6 => dist <= 1,
+            0..=6 => dist <= 1,
             7..=9 => dist <= 2,
             _ => dist <= 3,
         };
@@ -297,9 +293,7 @@ pub fn fuzzy_match_entity<'a>(
                 second_best_score = best_score;
                 best_score = sim;
                 best_candidate = Some(cand);
-            } else if (sim - best_score).abs() < 1e-4 {
-                second_best_score = sim;
-            } else if sim > second_best_score {
+            } else if (sim - best_score).abs() < 1e-4 || sim > second_best_score {
                 second_best_score = sim;
             }
         }
@@ -337,11 +331,17 @@ pub fn normalize_flag<'a>(token: &'a str, known_flags: &[&'a str]) -> &'a str {
 }
 
 /// Нормализация списка аргументов командной строки.
-/// Строковые позиционные параметры (не начинающиеся с '-') остаются в первозданном виде.
+/// Строковые позиционные параметры (не начинающиеся с '-') и все токены после `--` или `//`
+/// остаются в первозданном виде.
 pub fn normalize_cli_flags(args: &[String], known_flags: &[&str]) -> Vec<String> {
+    let mut passthrough = false;
     args.iter()
         .map(|tok| {
-            if tok.starts_with('-') && tok != "--" {
+            if tok == "--" || tok == "//" {
+                passthrough = true;
+                return tok.clone();
+            }
+            if !passthrough && tok.starts_with('-') {
                 let norm = normalize_flag(tok, known_flags);
                 if norm == tok {
                     tok.clone()

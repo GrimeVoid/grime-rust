@@ -172,12 +172,7 @@ pub fn extract_payload(val: Value) -> Option<PipelinePayload> {
         }
         Value::Table(tbl) => {
             // Если таблица байтов
-            let mut bytes = Vec::new();
-            for item in tbl.sequence_values::<u8>() {
-                if let Ok(b) = item {
-                    bytes.push(b);
-                }
-            }
+            let bytes: Vec<u8> = tbl.sequence_values::<u8>().flatten().collect();
             if !bytes.is_empty() {
                 Some(PipelinePayload::from_vec(bytes))
             } else {

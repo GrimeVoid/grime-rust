@@ -28,18 +28,18 @@ local function print_help()
     grime git <команда|-флаг> [аргументы...]
     grime <директория/модуль> : git <команда|-флаг> [аргументы...]
 
-%sКОМАНДЫ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
-    %sstatus, -s, --status%s           Форматированный статус рабочего дерева и ветки
-    %scommit, -c, --commit [msg]%s     Фиксация изменений (поддерживает --staged и ввод из конвейера)
-    %slog, -l, --log [-n N | N]%s      История коммитов в виде таблицы (по умолчанию 10)
-    %sdiff, -d, --diff [файл]%s        Просмотр незафиксированных изменений
-    %sbranch, -b, --branch [имя]%s     Список веток или создание новой ветки
-    %scheckout, -co, --checkout <в>%s  Переключение на указанную ветку
-    %sls-files, --ls-files [путь]%s    Быстрый срез отслеживаемых файлов без мусора
-    %ssnapshot, --snapshot [msg]%s     Моментальная точка сохранения с временной меткой
-    %sadd, -a, --add [файлы...]%s      Индексация файлов (по умолчанию -A)
-    %sinit, -i, --init [путь]%s        Инициализация нового Git-репозитория
-    %shelp, -h, --help%s               Показать эту справку
+%sКОМАНДЫ И ДЕЙСТВИЯ (строго со знаком '-' или '--'):%s
+    %s-status, -s, --status%s           Форматированный статус рабочего дерева и ветки
+    %s-commit, -c, --commit [msg]%s     Фиксация изменений (поддерживает --staged и ввод из конвейера)
+    %s-log, -l, --log [-n N | N]%s      История коммитов в виде таблицы (по умолчанию 10)
+    %s-diff, -d, --diff [файл]%s        Просмотр незафиксированных изменений
+    %s-branch, -b, --branch [имя]%s     Список веток или создание новой ветки
+    %s-checkout, -co, --checkout <в>%s  Переключение на указанную ветку
+    %s-ls-files, --ls-files [путь]%s    Быстрый срез отслеживаемых файлов без мусора
+    %s-snapshot, --snapshot [msg]%s     Моментальная точка сохранения с временной меткой
+    %s-add, -a, --add [файлы...]%s      Индексация файлов (по умолчанию -A)
+    %s-init, -i, --init [путь]%s        Инициализация нового Git-репозитория
+    %s-help, -h, --help%s               Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime git -status
@@ -342,50 +342,73 @@ function M.snapshot(dir, msg_suffix)
     return M.commit(target, commit_msg, true)
 end
 
-local GIT_COMMANDS = {
-    status = "status", s = "status", st = "status",
-    commit = "commit", c = "commit", ci = "commit",
-    log = "log", l = "log", history = "log",
-    diff = "diff", d = "diff",
-    branch = "branch", b = "branch", br = "branch",
-    checkout = "checkout", co = "checkout", switch = "checkout",
-    ["ls-files"] = "ls-files", files = "ls-files", ls_files = "ls-files", ls = "ls-files",
-    snapshot = "snapshot", snap = "snapshot",
-    add = "add", a = "add",
-    init = "init", i = "init",
-    help = "help", h = "help",
+local ACTIONS = {
+    ["-status"] = "status", ["--status"] = "status", ["-s"] = "status", ["-st"] = "status",
+    ["-commit"] = "commit", ["--commit"] = "commit", ["-c"] = "commit", ["-ci"] = "commit",
+    ["-log"] = "log", ["--log"] = "log", ["-l"] = "log", ["-history"] = "log", ["--history"] = "log",
+    ["-diff"] = "diff", ["--diff"] = "diff", ["-d"] = "diff",
+    ["-branch"] = "branch", ["--branch"] = "branch", ["-b"] = "branch", ["-br"] = "branch",
+    ["-checkout"] = "checkout", ["--checkout"] = "checkout", ["-co"] = "checkout", ["-switch"] = "checkout", ["--switch"] = "checkout",
+    ["-ls-files"] = "ls-files", ["--ls-files"] = "ls-files", ["-files"] = "ls-files", ["--files"] = "ls-files", ["-ls_files"] = "ls-files", ["--ls_files"] = "ls-files", ["-ls"] = "ls-files",
+    ["-snapshot"] = "snapshot", ["--snapshot"] = "snapshot", ["-snap"] = "snapshot", ["--snap"] = "snapshot",
+    ["-add"] = "add", ["--add"] = "add", ["-a"] = "add",
+    ["-init"] = "init", ["--init"] = "init", ["-i"] = "init",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 --- Главная точка входа CLI
 function M.main()
     local args = ctx.args or {}
-    local raw_subcmd = args[1]
-
-    if not raw_subcmd then
+    if #args == 0 then
         print_help()
         return
     end
 
     for _, a in ipairs(args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+        if type(a) == "string" and a:match("^%-") then
+            local matched = grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h", "-help" }, 0.75) or a
+            if matched == "--help" or matched == "-h" or matched == "-help" then
+                print_help()
+                return
+            end
         end
     end
 
-    local clean_cmd = grime.args.strip_dashes(raw_subcmd)
-    local subcmd = GIT_COMMANDS[clean_cmd] or clean_cmd
+    local action = nil
+    local action_idx = nil
+    for i, a in ipairs(args) do
+        if type(a) == "string" and a:match("^%-") then
+            local clean = a:lower()
+            if ACTIONS[clean] then
+                action = ACTIONS[clean]
+                action_idx = i
+                break
+            end
+        end
+    end
 
-    if subcmd == "help" then
+    if not action then
+        ctx.fail("Действие Git не указано или не начинается с дефиса ('" .. tostring(args[1]) .. "'). Используйте '-status', '-commit', '-log', '-diff', '-branch', '-checkout', '-snapshot', '-init'. Подробнее: 'grime git --help'.")
+        return
+    end
+
+    if action == "help" then
         print_help()
         return
+    end
+
+    local subcmd = action
+    local pos_args = {}
+    for i, a in ipairs(args) do
+        if i ~= action_idx and not (type(a) == "string" and a:match("^%-")) then
+            table.insert(pos_args, a)
+        end
     end
 
     local target_dir = ctx.target_dir or "."
 
     if subcmd == "init" then
-        local path = args[2] or target_dir
+        local path = pos_args[1] or target_dir
         local res = M.init(path)
         if res.success then
             grime.ui.success(string.format("Git-репозиторий успешно инициализирован в: %s", path))
@@ -448,10 +471,7 @@ function M.main()
     end
 
     if subcmd == "add" then
-        local files = {}
-        for i = 2, #args do
-            table.insert(files, args[i])
-        end
+        local files = (#pos_args > 0) and pos_args or {}
         local res, err = M.add(target_dir, files)
         if not res then
             ctx.fail(err)
@@ -466,18 +486,19 @@ function M.main()
         local auto_add = true
         local msg_tokens = {}
         local skip_next = false
-        for i = 2, #args do
-            if skip_next then
-                skip_next = false
-            else
-                local a = args[i]
-                if a == "--staged" or a == "-staged" or a == "--no-add" or a == "-no-add" or a == "-s" then
-                    auto_add = false
-                elseif (a == "-m" or a == "--message") and args[i + 1] then
-                    table.insert(msg_tokens, args[i + 1])
-                    skip_next = true
+        for i, a in ipairs(args) do
+            if i ~= action_idx then
+                if skip_next then
+                    skip_next = false
                 else
-                    table.insert(msg_tokens, a)
+                    if a == "--staged" or a == "-staged" or a == "--no-add" or a == "-no-add" or a == "-s" then
+                        auto_add = false
+                    elseif (a == "-m" or a == "--message") and args[i + 1] then
+                        table.insert(msg_tokens, args[i + 1])
+                        skip_next = true
+                    elseif not (type(a) == "string" and a:match("^%-")) then
+                        table.insert(msg_tokens, a)
+                    end
                 end
             end
         end
@@ -488,7 +509,7 @@ function M.main()
         msg = grime.str.trim(msg)
 
         if #msg == 0 then
-            ctx.fail("Укажите сообщение коммита: grime git commit [--staged] <сообщение> или передайте через пайплайн")
+            ctx.fail("Укажите сообщение коммита: grime git -commit [--staged] <сообщение> или передайте через пайплайн")
             return
         end
 
@@ -510,17 +531,19 @@ function M.main()
 
     if subcmd == "log" then
         local limit = 10
-        for i = 2, #args do
-            local a = tostring(args[i])
-            if (a == "-n" or a == "--limit" or a == "-limit") and tonumber(args[i + 1]) then
-                limit = tonumber(args[i + 1])
-                break
-            elseif a:match("^%-n(%d+)$") then
-                limit = tonumber(a:match("^%-n(%d+)$"))
-                break
-            elseif tonumber(a) then
-                limit = tonumber(a)
-                break
+        for i, a in ipairs(args) do
+            if i ~= action_idx then
+                local s = tostring(a)
+                if (s == "-n" or s == "--limit" or s == "-limit") and tonumber(args[i + 1]) then
+                    limit = tonumber(args[i + 1])
+                    break
+                elseif s:match("^%-n(%d+)$") then
+                    limit = tonumber(s:match("^%-n(%d+)$"))
+                    break
+                elseif tonumber(s) and not s:match("^%-") then
+                    limit = tonumber(s)
+                    break
+                end
             end
         end
         local commits, err = M.log(target_dir, limit)
@@ -558,7 +581,7 @@ function M.main()
     end
 
     if subcmd == "diff" then
-        local file = args[2]
+        local file = pos_args[1]
         local out, err = M.diff(target_dir, file)
         if not out then
             ctx.fail(err)
@@ -576,8 +599,7 @@ function M.main()
     end
 
     if subcmd == "branch" then
-        local bname = args[2]
-        if bname and bname:match("^%-") then bname = nil end
+        local bname = pos_args[1]
         local res, err = M.branch(target_dir, bname)
         if not res then
             ctx.fail(err)
@@ -598,8 +620,13 @@ function M.main()
     end
 
     if subcmd == "checkout" then
-        local bname = args[2]
-        if bname == "-b" and args[3] then bname = args[3] end
+        local bname = pos_args[1]
+        for i, a in ipairs(args) do
+            if a == "-b" and args[i + 1] then
+                bname = args[i + 1]
+                break
+            end
+        end
         local res, err = M.checkout(target_dir, bname)
         if not res then
             ctx.fail(err)
@@ -611,7 +638,7 @@ function M.main()
     end
 
     if subcmd == "ls-files" then
-        local filter = args[2]
+        local filter = pos_args[1]
         local files, err = M.ls_files(target_dir, filter)
         if not files then
             ctx.fail(err)
@@ -639,9 +666,11 @@ function M.main()
 
     if subcmd == "snapshot" then
         local msg_tokens = {}
-        for i = 2, #args do
-            if args[i] ~= "-m" and args[i] ~= "--message" then
-                table.insert(msg_tokens, args[i])
+        for i, a in ipairs(args) do
+            if i ~= action_idx then
+                if a ~= "-m" and a ~= "--message" and not (type(a) == "string" and a:match("^%-")) then
+                    table.insert(msg_tokens, a)
+                end
             end
         end
         local extra_msg = table.concat(msg_tokens, " ")
@@ -665,7 +694,7 @@ function M.main()
         return
     end
 
-    ctx.fail("Неизвестная команда git: '" .. tostring(raw_subcmd) .. "'. Используйте 'grime git --help' для справки.")
+    ctx.fail("Неизвестная команда git: '" .. tostring(subcmd) .. "'. Используйте 'grime git --help' для справки.")
 end
 
 -- Если модуль запускается как оркестрируемый скрипт

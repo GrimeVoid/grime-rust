@@ -106,14 +106,21 @@ function main()
     end
 
     for _, a in ipairs(args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+        if a == "--" or a == "//" then break end
+        if grime.args.is_flag(a) then
+            local clean = grime.args.strip_dashes(a:lower())
+            if clean == "help" or clean == "h" then
+                print_help()
+                return
+            end
         end
     end
 
     local raw_action = args[1] or ""
+    if not grime.args.is_flag(raw_action) then
+        ctx.fail("Действие шины bus обязано начинаться с дефиса (-get, -set, -rm, -has, -list, -emit)")
+        return
+    end
     local clean_action = grime.args.strip_dashes(raw_action)
     local action = BUS_ACTIONS[clean_action] or clean_action
 

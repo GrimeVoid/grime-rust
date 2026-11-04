@@ -660,8 +660,8 @@ async fn test_project_overwrite_protection() {
         // 1. Попытка создания без --force в существующей непустой директории должна вернуть ошибку
         let parsed_no_force = parse_pipeline_args(&[
             "project".to_string(),
-            "init".to_string(),
-            "cpp".to_string(),
+            "-init".to_string(),
+            "-cpp".to_string(),
             proj_dir.to_string_lossy().to_string(),
         ]);
         let res = orch.run_pipeline(&parsed_no_force).await;
@@ -677,8 +677,8 @@ async fn test_project_overwrite_protection() {
         let parsed_force = parse_pipeline_args(&[
             "--force".to_string(),
             "project".to_string(),
-            "init".to_string(),
-            "cpp".to_string(),
+            "-init".to_string(),
+            "-cpp".to_string(),
             proj_dir.to_string_lossy().to_string(),
         ]);
         assert!(parsed_force.force);
@@ -1039,4 +1039,69 @@ async fn test_native_args_engine_in_lua() {
     let res = orch.run_pipeline(&parsed).await.expect("test_args pipeline run");
     assert_eq!(res.as_deref(), Some("native_args_ok"));
 }
+
+#[tokio::test]
+async fn test_stage8_strict_dash_and_path_flag() {
+    let tmp = TestTempDir::new("grime_strict_dash");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("test_strict.lua"),
+        r#"
+        function main()
+            -- 1. Бездефисный токен НЕ захватывается как действие или категория
+            local parsed1 = ctx.parse_args({
+                actions = { ["-build"] = "build", ["-b"] = "build" },
+                categories = { language = { ["-rust"] = "rust", ["-cpp"] = "cpp" } },
+                flags = { path = { "-p", "--path", "-path" } },
+            }, { "build", "rust", "my_app" })
+
+            assert(parsed1.action == nil, "action without dash must NOT be intercepted")
+            assert(parsed1.categories.language == nil, "category without dash must NOT be intercepted")
+            assert(#parsed1.args == 3, "all tokens without dash must be in args")
+            assert(parsed1.args[1] == "build" and parsed1.args[2] == "rust" and parsed1.args[3] == "my_app")
+
+            -- 2. Флаг -path становится действием, если основного действия нет
+            local parsed2 = ctx.parse_args({
+                actions = { ["-build"] = "build" },
+                flags = { path = { "-p", "--path", "-path" } },
+            }, { "-path", "my_app" })
+
+            assert(parsed2.action == "path", "path flag should become action when no other action is specified")
+            assert(parsed2.flags.path == true, "flags.path should be true")
+            assert(#parsed2.args == 1 and parsed2.args[1] == "my_app")
+
+            -- 3. Токен -path при наличии другого действия сохраняет основное действие
+            local parsed3 = ctx.parse_args({
+                actions = { ["-build"] = "build" },
+                flags = { path = { "-p", "--path", "-path" } },
+            }, { "-build", "-path", "my_app" })
+
+            assert(parsed3.action == "build", "primary action must be preserved")
+            assert(parsed3.flags.path == true, "flags.path must be true")
+            assert(#parsed3.args == 1 and parsed3.args[1] == "my_app")
+
+            -- 4. Передача категории со знаком минус
+            local parsed4 = ctx.parse_args({
+                actions = { ["-init"] = "init" },
+                categories = { language = { ["-rust"] = "rust" } },
+            }, { "-init", "-rust", "cool_proj" })
+
+            assert(parsed4.action == "init")
+            assert(parsed4.categories.language == "rust")
+            assert(#parsed4.args == 1 and parsed4.args[1] == "cool_proj")
+
+            ctx.success("strict_dash_ok")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["test_strict".to_string()]);
+    let res = orch.run_pipeline(&parsed).await.expect("test_strict pipeline run");
+    assert_eq!(res.as_deref(), Some("strict_dash_ok"));
+}
+
 

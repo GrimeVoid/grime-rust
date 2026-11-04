@@ -20,24 +20,24 @@ local HOME = os.getenv("HOME") or ""
 local ANSI = utils.ANSI
 
 local ACTIONS = {
-    init = "init", create = "init", new = "init", make = "init",
-    flake = "flake", f = "flake",
-    build = "build", b = "build", compile = "build",
-    history = "history", hist = "history", log = "history",
-    rollback = "rollback", revert = "rollback",
-    update = "update", up = "update", u = "update",
-    bundle = "bundle", pack = "bundle",
-    diff = "diff", closures = "diff", d = "diff",
-    gc = "gc", clean = "gc", cleanup = "gc", ["garbage-collect"] = "gc",
-    optimise = "optimise", optimize = "optimise", opt = "optimise", dedup = "optimise",
-    add = "add", append = "add", ["in"] = "add",
-    rm = "rm", remove = "rm", del = "rm", delete = "rm",
-    install = "install", i = "install", ["profile-install"] = "install", get = "install",
-    uninstall = "uninstall", un = "uninstall", ["remove-profile"] = "uninstall", ["rm-profile"] = "uninstall", erase = "uninstall",
-    enter = "enter", shell = "enter", sh = "enter",
-    run = "run", ["exec"] = "run", ["do"] = "run", ["run-in"] = "run", e = "run", r = "run",
-    check = "check", test = "check", validate = "check", c = "check",
-    help = "help",
+    ["-init"] = "init", ["--init"] = "init", ["-create"] = "init", ["--create"] = "init", ["-new"] = "init", ["--new"] = "init",
+    ["-flake"] = "flake", ["--flake"] = "flake", ["-f"] = "flake",
+    ["-build"] = "build", ["--build"] = "build", ["-b"] = "build", ["-compile"] = "build",
+    ["-history"] = "history", ["--history"] = "history", ["-hist"] = "history", ["--hist"] = "history", ["-log"] = "history",
+    ["-rollback"] = "rollback", ["--rollback"] = "rollback", ["-revert"] = "rollback",
+    ["-update"] = "update", ["--update"] = "update", ["-u"] = "update", ["-up"] = "update",
+    ["-bundle"] = "bundle", ["--bundle"] = "bundle", ["-pack"] = "bundle",
+    ["-diff"] = "diff", ["--diff"] = "diff", ["-d"] = "diff",
+    ["-gc"] = "gc", ["--gc"] = "gc", ["-clean"] = "gc", ["--clean"] = "gc",
+    ["-optimise"] = "optimise", ["--optimise"] = "optimise", ["-optimize"] = "optimise", ["-opt"] = "optimise",
+    ["-add"] = "add", ["--add"] = "add",
+    ["-rm"] = "rm", ["--rm"] = "rm", ["-remove"] = "rm", ["--remove"] = "rm", ["-del"] = "rm", ["--del"] = "rm",
+    ["-install"] = "install", ["--install"] = "install", ["-i"] = "install",
+    ["-uninstall"] = "uninstall", ["--uninstall"] = "uninstall", ["-un"] = "uninstall",
+    ["-enter"] = "enter", ["--enter"] = "enter", ["-shell"] = "enter", ["--shell"] = "enter", ["-sh"] = "enter",
+    ["-run"] = "run", ["--run"] = "run", ["-exec"] = "run", ["--exec"] = "run", ["-r"] = "run",
+    ["-check"] = "check", ["--check"] = "check", ["-test"] = "check", ["--test"] = "check", ["-c"] = "check",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 local ROOT_COMMANDS = {
@@ -760,10 +760,13 @@ function main()
     end
 
     for _, a in ipairs(raw_args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+        if a == "--" or a == "//" then break end
+        if grime.args.is_flag(a) then
+            local clean = grime.args.strip_dashes(a:lower())
+            if clean == "help" or clean == "h" then
+                print_help()
+                return
+            end
         end
     end
 
@@ -781,7 +784,7 @@ function main()
             flake = { "--flake", "-flake" },
             gpu = { "--gpu", "--gl", "-gpu", "-gl" },
             nv = { "--nv", "--prime", "--nvidia", "-nv", "-prime", "-nvidia" },
-            help = { "help", "-h", "--help", "-help" },
+            help = { "-h", "--help", "-help" },
         },
         value_flags = {
             to = { "--to", "-to" },

@@ -36,10 +36,12 @@ end
 
 function main()
     for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+        if type(a) == "string" and a:match("^%-") then
+            local matched = grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h", "-help" }, 0.75) or a
+            if matched == "--help" or matched == "-h" or matched == "-help" then
+                print_help()
+                return
+            end
         end
     end
 

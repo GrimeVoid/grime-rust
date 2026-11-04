@@ -5,15 +5,15 @@ description = "Полиглот-оркестратор проектов (C++, Ru
 local ctx = grime.ctx
 
 local ACTION_SYNONYMS = {
-    list = "list", ls = "list", l = "list", show = "list",
-    delete = "delete", del = "delete", remove = "delete", rm = "delete", d = "delete",
-    init = "init", new = "init", create = "init", i = "init",
-    build = "build", b = "build", compile = "build", make = "build",
-    run = "run", r = "run", start = "run", ["exec"] = "run",
-    clear = "clear", clean = "clear", reset = "clear", cls = "clear",
-    rename = "rename", ren = "rename", mv = "rename", move = "rename",
-    path = "path", p = "path",
-    help = "help",
+    ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list", ["-l"] = "list",
+    ["-delete"] = "delete", ["--delete"] = "delete", ["-del"] = "delete", ["-remove"] = "delete", ["--remove"] = "delete", ["-rm"] = "delete", ["--rm"] = "delete", ["-d"] = "delete",
+    ["-init"] = "init", ["--init"] = "init", ["-new"] = "init", ["--new"] = "init", ["-create"] = "init", ["--create"] = "init", ["-i"] = "init",
+    ["-build"] = "build", ["--build"] = "build", ["-b"] = "build", ["-compile"] = "build", ["--compile"] = "build", ["-make"] = "build",
+    ["-run"] = "run", ["--run"] = "run", ["-r"] = "run", ["-start"] = "run", ["--start"] = "run", ["-exec"] = "run", ["--exec"] = "run",
+    ["-clear"] = "clear", ["--clear"] = "clear", ["-clean"] = "clear", ["--clean"] = "clear", ["-reset"] = "clear", ["-cls"] = "clear",
+    ["-rename"] = "rename", ["--rename"] = "rename", ["-ren"] = "rename", ["-mv"] = "rename", ["--mv"] = "rename", ["-move"] = "rename",
+    ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 local LANGUAGE_ADAPTERS = {
@@ -140,20 +140,12 @@ end
 
 local function handle_rename(projects_root, args)
     projects_root = ctx.normalize_path(projects_root)
-    local clean_args = {}
-    for _, a in ipairs(args) do
-        local stripped = tostring(a):lower():gsub("^%-+", "")
-        if stripped ~= "rename" and stripped ~= "ren" and stripped ~= "mv" and stripped ~= "move" and stripped ~= "path" and stripped ~= "p" then
-            table.insert(clean_args, a)
-        end
-    end
-
-    if #clean_args < 2 then
-        ctx.fail("Использование: project rename <СтароеИмя> <НовоеИмя> [path]")
+    if not args or #args < 2 then
+        ctx.fail("Использование: project -rename <СтароеИмя> <НовоеИмя>")
         return nil
     end
 
-    local old_name, new_name = clean_args[1], clean_args[2]
+    local old_name, new_name = args[1], args[2]
     local renamed_path = nil
 
     for _, lang in ipairs(get_supported_languages()) do
@@ -279,13 +271,24 @@ local function resolve_project_context(parsed)
         if action == "init" then
             return action, resolve_abs_path("."), lang, extra_args
         end
-        local target_lang_dir = get_language_dir(projects_root, lang)
-        return action, target_lang_dir, lang, extra_args
+        if action == "path" then
+            local target_lang_dir = get_language_dir(projects_root, lang)
+            return action, target_lang_dir, lang, extra_args
+        end
+        -- Предохранитель: запрещено трогать корень языка для разрушительных или сборочных действий
+        local act_name = (action == "delete" and "-rm") or ("-" .. action)
+        ctx.fail(string.format("Укажите имя проекта: grime project %s <имя_проекта>", act_name))
+        return nil, nil, nil, nil
     end
 
     -- 5. Запрос пути без указания проекта -> возвращаем корень проектов
     if action == "path" then
         return action, projects_root, "cpp", extra_args
+    end
+
+    if action == "delete" or action == "clear" then
+        ctx.fail("Укажите имя проекта: grime project -rm <имя_проекта>")
+        return nil, nil, nil, nil
     end
 
     -- 6. Текущая папка вызова
@@ -426,7 +429,7 @@ function main()
     for _, a in ipairs(raw_args) do
         if a == "--" or a == "//" then break end
         local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h", "-help" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or matched == "-help" or a == "help" then
+        if matched == "--help" or matched == "-h" or matched == "-help" then
             print_help()
             return
         end
@@ -438,8 +441,9 @@ function main()
         actions = ACTION_SYNONYMS,
         default_action = nil,
         flags = {
-            path_requested = { "path", "-p", "--path", "-path" },
-            help = { "help", "-h", "--help", "-help" },
+            path = { "-p", "--path", "-path" },
+            path_requested = { "-p", "--path", "-path" },
+            help = { "-h", "--help", "-help" },
             force = { "-f", "--force", "-force" },
             nix = { "--nix", "-nix" },
         },
@@ -476,13 +480,15 @@ function main()
     end
 
     local action, project_dir, lang, extra_args = resolve_project_context(parsed)
-    if project_dir then
-        project_dir = ctx.normalize_path(project_dir)
+    if not action or not project_dir then
+        return
     end
+    project_dir = ctx.normalize_path(project_dir)
 
     if action == "path" then
         if ctx.exists(project_dir) then
             if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
+            print(project_dir)
             ctx.module_return(project_dir)
             return
         else

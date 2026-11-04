@@ -57,6 +57,16 @@ pub enum FlagValue {
     Str(String),
 }
 
+impl FlagValue {
+    #[inline]
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            FlagValue::Bool(b) => *b,
+            FlagValue::Str(s) => !s.is_empty(),
+        }
+    }
+}
+
 /// Результат работы нативного парсера аргументов
 #[derive(Debug, Clone, Default)]
 pub struct ParsedArgs {
@@ -161,44 +171,46 @@ pub fn parse_tokens(
 
         let mut flag_matched = false;
 
-        // 2. Проверка флагов со значением (value_flags): --flag=val или --flag val
-        for (vname, patterns) in &spec.value_flags {
-            for pat in patterns {
-                let pat_low = pat.to_lowercase();
-                let pat_stripped = strip_dashes(&pat_low);
+        // 2. Проверка флагов со значением (value_flags): только если токен начинается с '-'
+        if is_dash {
+            for (vname, patterns) in &spec.value_flags {
+                for pat in patterns {
+                    let pat_low = pat.to_lowercase();
+                    let pat_stripped = strip_dashes(&pat_low);
 
-                // Формат --flag=val
-                if let Some((prefix, val)) = tok.split_once('=') {
-                    let prefix_low = prefix.to_lowercase();
-                    let prefix_stripped = strip_dashes(&prefix_low);
-                    if prefix_low == pat_low
-                        || (!prefix_stripped.is_empty() && prefix_stripped == pat_stripped)
+                    // Формат --flag=val
+                    if let Some((prefix, val)) = tok.split_once('=') {
+                        let prefix_low = prefix.to_lowercase();
+                        let prefix_stripped = strip_dashes(&prefix_low);
+                        if prefix_low == pat_low
+                            || (!prefix_stripped.is_empty() && prefix_stripped == pat_stripped)
+                        {
+                            res_flags.insert(vname.clone(), FlagValue::Str(val.to_string()));
+                            flag_matched = true;
+                            break;
+                        }
+                    } else if tok_lower == pat_low
+                        || (!stripped.is_empty() && stripped == pat_stripped)
                     {
-                        res_flags.insert(vname.clone(), FlagValue::Str(val.to_string()));
+                        // Формат --flag val
+                        if i + 1 < tokens_before.len() {
+                            i += 1;
+                            res_flags.insert(vname.clone(), FlagValue::Str(tokens_before[i].clone()));
+                        } else {
+                            res_flags.insert(vname.clone(), FlagValue::Bool(true));
+                        }
                         flag_matched = true;
                         break;
                     }
-                } else if tok_lower == pat_low
-                    || (!stripped.is_empty() && stripped == pat_stripped)
-                {
-                    // Формат --flag val
-                    if i + 1 < tokens_before.len() {
-                        i += 1;
-                        res_flags.insert(vname.clone(), FlagValue::Str(tokens_before[i].clone()));
-                    } else {
-                        res_flags.insert(vname.clone(), FlagValue::Bool(true));
-                    }
-                    flag_matched = true;
+                }
+                if flag_matched {
                     break;
                 }
             }
-            if flag_matched {
-                break;
-            }
         }
 
-        // 3. Проверка точного совпадения булевых флагов (flags)
-        if !flag_matched {
+        // 3. Проверка точного совпадения булевых флагов (flags): только если токен начинается с '-'
+        if !flag_matched && is_dash {
             for (flag_name, patterns) in &spec.flags {
                 for pat in patterns {
                     let pat_low = pat.to_lowercase();
@@ -210,7 +222,7 @@ pub fn parse_tokens(
                         res_flags.insert(flag_name.clone(), FlagValue::Bool(true));
                         flag_matched = true;
 
-                        // Если этот же токен одновременно является действием и действие еще не выбрано
+                        // Если этот же токен одновременно является действием
                         let act_cand = spec
                             .actions
                             .get(&tok_lower)
@@ -222,10 +234,17 @@ pub fn parse_tokens(
                                 }
                             });
                         if let Some(act) = act_cand {
-                            if !action_found {
+                            if act == "path" {
+                                res_flags.insert("path".to_string(), FlagValue::Bool(true));
+                                if !action_found {
+                                    res_action = Some("path".to_string());
+                                }
+                            } else if !action_found {
                                 res_action = Some(act.clone());
                                 action_found = true;
                             }
+                        } else if flag_name == "path" && !action_found {
+                            res_action = Some("path".to_string());
                         }
                         break;
                     }
@@ -238,7 +257,7 @@ pub fn parse_tokens(
 
         // 4. Если токен начинается с '-': проверка действий и категорий со знаком минус (-action, --action, -cat)
         if !flag_matched && is_dash && !stripped.is_empty() {
-            // Сначала проверяем категории со знаком минус (-cpp, --rust, -pacman)
+            // 4.1. Сначала проверяем категории со знаком минус (-cpp, --rust, -pacman)
             for (cat_name, cat_dict) in &spec.categories {
                 if !res_categories.contains_key(cat_name) {
                     if let Some(canonical) = cat_dict
@@ -252,14 +271,19 @@ pub fn parse_tokens(
                 }
             }
 
-            // Затем проверяем действия со знаком минус (-list, --build, -update)
+            // 4.2. Затем проверяем действия со знаком минус (-list, --build, -update)
             if !flag_matched {
                 if let Some(act_target) = spec
                     .actions
                     .get(&tok_lower)
                     .or_else(|| spec.actions.get(stripped))
                 {
-                    if !action_found {
+                    if act_target == "path" {
+                        res_flags.insert("path".to_string(), FlagValue::Bool(true));
+                        if !action_found {
+                            res_action = Some("path".to_string());
+                        }
+                    } else if !action_found {
                         res_action = Some(act_target.clone());
                         action_found = true;
                     } else {
@@ -267,6 +291,15 @@ pub fn parse_tokens(
                     }
                     flag_matched = true;
                 }
+            }
+
+            // 4.3. Специальный перехват флага/действия path (-path, --path, -p)
+            if !flag_matched && (stripped == "path" || stripped == "p") {
+                res_flags.insert("path".to_string(), FlagValue::Bool(true));
+                if !action_found {
+                    res_action = Some("path".to_string());
+                }
+                flag_matched = true;
             }
         }
 
@@ -306,8 +339,15 @@ pub fn parse_tokens(
                         .get(best_act)
                         .or_else(|| spec.actions.get(&format!("-{}", best_act)))
                     {
-                        res_action = Some(act_target.clone());
-                        action_found = true;
+                        if act_target == "path" {
+                            res_flags.insert("path".to_string(), FlagValue::Bool(true));
+                            if !action_found {
+                                res_action = Some("path".to_string());
+                            }
+                        } else {
+                            res_action = Some(act_target.clone());
+                            action_found = true;
+                        }
                         flag_matched = true;
                     }
                 }
@@ -326,51 +366,49 @@ pub fn parse_tokens(
             flag_matched = true;
         }
 
-        // 7. Токены без знака минус
+        // 7. Токены без знака минус — СТРОГО позиционные аргументы!
+        // Никакого перехвата действий или категорий без знака минус.
         if !flag_matched {
-            // 7.1. Проверка действий без минуса
-            if !action_found && spec.actions.contains_key(&tok_lower) {
-                res_action = Some(spec.actions[&tok_lower].clone());
-                action_found = true;
-            } else {
-                // 7.2. Проверка категорий без минуса
-                let mut cat_matched = false;
-                for (cat_name, cat_dict) in &spec.categories {
-                    if !res_categories.contains_key(cat_name) {
-                        if let Some(canonical) = cat_dict.get(&tok_lower) {
-                            res_categories.insert(cat_name.clone(), canonical.clone());
-                            cat_matched = true;
-                            break;
-                        }
+            // 7.1. Автоопределение существующей директории (если включено detect_dir и токен похож на путь)
+            let mut is_dir_candidate = false;
+            if spec.detect_dir && res_target_dir.is_none() {
+                let is_path_like = tok.starts_with("./")
+                    || tok.starts_with('/')
+                    || tok.starts_with('~')
+                    || tok.contains('/');
+                if is_path_like {
+                    let expanded = crate::fs_ops::expand_tilde(tok);
+                    if expanded.is_dir() {
+                        res_target_dir = Some(tok.clone());
+                        is_dir_candidate = true;
                     }
                 }
+            }
 
-                if !cat_matched {
-                    // 7.3. Автоопределение существующей директории
-                    let mut is_dir_candidate = false;
-                    if spec.detect_dir && res_target_dir.is_none() {
-                        let is_path_like = tok.starts_with("./")
-                            || tok.starts_with('/')
-                            || tok.starts_with('~')
-                            || tok.contains('/');
-                        if is_path_like {
-                            let expanded = crate::fs_ops::expand_tilde(tok);
-                            if expanded.is_dir() {
-                                res_target_dir = Some(tok.clone());
-                                is_dir_candidate = true;
-                            }
-                        }
-                    }
-
-                    if !is_dir_candidate {
-                        // 7.4. Обычный позиционный аргумент
-                        rest_args.push(tok.clone());
-                    }
-                }
+            if !is_dir_candidate {
+                // 7.2. Обычный позиционный аргумент (название, ключ, текст, поисковый запрос)
+                rest_args.push(tok.clone());
             }
         }
 
         i += 1;
+    }
+
+    // Умная приоритизация флага/действия -path:
+    // Если во входящих аргументах был передан флаг -path (или --path, -p) и при этом
+    // нет других явных действий, то parsed.action = Some("path"), а flags["path"] = true.
+    // Если есть основное действие (action_found == true), то action остаётся основным действием,
+    // а flags["path"] гарантированно выставляется в true.
+    let has_path = res_flags
+        .get("path")
+        .map(|v| v.is_truthy())
+        .unwrap_or(false)
+        || res_action.as_deref() == Some("path");
+    if has_path {
+        res_flags.insert("path".to_string(), FlagValue::Bool(true));
+        if !action_found || res_action.as_deref() == Some("path") {
+            res_action = Some("path".to_string());
+        }
     }
 
     // res_target_dir заполняется ТОЛЬКО если в аргументах был обнаружен явный путь.
@@ -497,11 +535,88 @@ mod tests {
         assert_eq!(res.categories.get("language"), Some(&"rust".to_string()));
         assert_eq!(res.args, vec!["my_app"]);
 
-        // Без минуса
+        // Без минуса: токены build и cpp НЕ перехватываются как действие и категория,
+        // а попадают исключительно в rest_args, action остается default (list)
         let args2 = vec!["build".to_string(), "cpp".to_string()];
         let res2 = parse_tokens(&spec, &args2, None);
-        assert_eq!(res2.action, Some("build".to_string()));
-        assert_eq!(res2.categories.get("language"), Some(&"cpp".to_string()));
+        assert_eq!(res2.action, Some("list".to_string()));
+        assert_eq!(res2.categories.get("language"), None);
+        assert_eq!(res2.args, vec!["build", "cpp"]);
+    }
+
+    #[test]
+    fn test_strict_no_dash_interception() {
+        let mut spec = ArgSpec::default();
+        spec.actions.insert("test".to_string(), "test".to_string());
+        spec.actions.insert("build".to_string(), "build".to_string());
+        spec.actions.insert("run".to_string(), "run".to_string());
+        spec.actions.insert("list".to_string(), "list".to_string());
+        spec.actions.insert("path".to_string(), "path".to_string());
+        spec.flags.insert("help".to_string(), vec!["-h".to_string(), "--help".to_string()]);
+        spec.flags.insert("path".to_string(), vec!["-p".to_string(), "--path".to_string(), "-path".to_string()]);
+
+        let mut langs = HashMap::new();
+        langs.insert("rust".to_string(), "rust".to_string());
+        langs.insert("cpp".to_string(), "cpp".to_string());
+        spec.categories.insert("language".to_string(), langs);
+
+        // Все эти слова переданы БЕЗ дефиса — ни одно из них не должно быть перехвачено!
+        let words = vec![
+            "test".to_string(),
+            "build".to_string(),
+            "run".to_string(),
+            "list".to_string(),
+            "rust".to_string(),
+            "cpp".to_string(),
+            "path".to_string(),
+            "help".to_string(),
+        ];
+        let res = parse_tokens(&spec, &words, None);
+        assert_eq!(res.action, None);
+        assert_eq!(res.flags.get("help"), Some(&FlagValue::Bool(false)));
+        assert_eq!(res.flags.get("path"), Some(&FlagValue::Bool(false)));
+        assert_eq!(res.categories.get("language"), None);
+        assert_eq!(res.args, words);
+    }
+
+    #[test]
+    fn test_path_flag_and_action_priority() {
+        let mut spec = ArgSpec::default();
+        spec.actions.insert("build".to_string(), "build".to_string());
+        spec.actions.insert("run".to_string(), "run".to_string());
+        spec.actions.insert("path".to_string(), "path".to_string());
+        spec.flags.insert(
+            "path".to_string(),
+            vec!["-p".to_string(), "-path".to_string(), "--path".to_string()],
+        );
+
+        // 1. grime app -path test
+        let args1 = vec!["-path".to_string(), "test".to_string()];
+        let res1 = parse_tokens(&spec, &args1, None);
+        assert_eq!(res1.action, Some("path".to_string()));
+        assert_eq!(res1.flags.get("path"), Some(&FlagValue::Bool(true)));
+        assert_eq!(res1.args, vec!["test"]);
+
+        // 2. grime app test -path
+        let args2 = vec!["test".to_string(), "-path".to_string()];
+        let res2 = parse_tokens(&spec, &args2, None);
+        assert_eq!(res2.action, Some("path".to_string()));
+        assert_eq!(res2.flags.get("path"), Some(&FlagValue::Bool(true)));
+        assert_eq!(res2.args, vec!["test"]);
+
+        // 3. grime app -build test -path (действие build сохраняется, флаг path выставляется)
+        let args3 = vec!["-build".to_string(), "test".to_string(), "-path".to_string()];
+        let res3 = parse_tokens(&spec, &args3, None);
+        assert_eq!(res3.action, Some("build".to_string()));
+        assert_eq!(res3.flags.get("path"), Some(&FlagValue::Bool(true)));
+        assert_eq!(res3.args, vec!["test"]);
+
+        // 4. grime app -path test -build
+        let args4 = vec!["-path".to_string(), "test".to_string(), "-build".to_string()];
+        let res4 = parse_tokens(&spec, &args4, None);
+        assert_eq!(res4.action, Some("build".to_string()));
+        assert_eq!(res4.flags.get("path"), Some(&FlagValue::Bool(true)));
+        assert_eq!(res4.args, vec!["test"]);
     }
 
     #[test]
@@ -550,10 +665,10 @@ mod tests {
             vec!["-f".to_string(), "--force".to_string()],
         );
 
-        // В passthrough-режиме для action "run" после первого аргумента (имя утилиты)
+        // В passthrough-режиме для action "-run" после первого аргумента (имя утилиты)
         // все последующие флаги (-f, --help) должны сохраняться в args
         let args = vec![
-            "run".to_string(),
+            "-run".to_string(),
             "my_prog".to_string(),
             "-f".to_string(),
             "--custom-flag".to_string(),

@@ -78,7 +78,7 @@ local GRIME_MODULE_STANDARD = [[
      -- Description: Полное описание модуля
      description = "Краткое описание модуля"
      ```
-   - Все флаги и подкоманды в модуле и в `print_help()` должны поддерживать стандарт со знаком минус (`-list`, `--list`, `-path`, `--path`, `-p`, `-help`, `--help`, `-h`) с сохранением обратной совместимости без минуса.
+   - Все флаги, действия и подкоманды в модуле и в `print_help()` строго обязаны начинаться со знака минус (`-` или `--`), например `-list`, `--list`, `-path`, `--path`, `-p`, `-help`, `--help`, `-h`. Любые токены без минуса трактуются исключительно как позиционные аргументы.
    - В конце файла обязательно возвращать таблицу:
      ```lua
      return {
@@ -846,10 +846,10 @@ local ui = grime.ui
 local ANSI = utils.ANSI
 
 local ACTION_SYNONYMS = {
-    list = "list", ["-list"] = "list", ["--list"] = "list", ls = "list", ["-ls"] = "list",
-    run = "run", ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
-    path = "path", ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
-    help = "help", ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
+    ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list",
+    ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
+    ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 local function print_help()
@@ -1341,7 +1341,7 @@ function main()
 
     local first_arg = raw_cli_args[1]
     if (#raw_cli_args == 0 and not ctx.pipeline_input and not ctx.input)
-        or first_arg == "-h" or first_arg == "--help" or first_arg == "-help" or first_arg == "help"
+        or first_arg == "-h" or first_arg == "--help" or first_arg == "-help"
     then
         print_help()
         return

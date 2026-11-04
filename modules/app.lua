@@ -73,60 +73,43 @@ local LANG_ALIASES = {
 local ACTION_MAP = {
     -- list
     ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list",
-    list = "list", ls = "list",
     -- ps
     ["-ps"] = "ps", ["--ps"] = "ps", ["-running"] = "ps", ["--running"] = "ps",
-    ps = "ps", running = "ps",
     -- new
     ["-new"] = "new", ["--new"] = "new", ["-n"] = "new",
     ["-create"] = "new", ["--create"] = "new", ["-init"] = "new", ["--init"] = "new",
-    new = "new", create = "new", init = "new",
     -- run
     ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
     ["-start"] = "run", ["--start"] = "run", ["-exec"] = "run", ["--exec"] = "run",
-    run = "run", start = "run", exec = "run",
     -- build
     ["-build"] = "build", ["--build"] = "build", ["-b"] = "build",
     ["-compile"] = "build", ["--compile"] = "build",
-    build = "build", compile = "build",
     -- stop
     ["-stop"] = "stop", ["--stop"] = "stop", ["-kill"] = "stop", ["--kill"] = "stop",
-    stop = "stop", kill = "stop",
     -- path
     ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
-    path = "path",
     -- commit
     ["-commit"] = "commit", ["--commit"] = "commit",
-    commit = "commit",
     -- log
     ["-log"] = "log", ["--log"] = "log",
-    log = "log",
     -- diff
     ["-diff"] = "diff", ["--diff"] = "diff",
-    diff = "diff",
     -- snapshot
     ["-snapshot"] = "snapshot", ["--snapshot"] = "snapshot",
-    snapshot = "snapshot",
     -- status
     ["-status"] = "status", ["--status"] = "status",
-    status = "status",
     -- bundle
     ["-bundle"] = "bundle", ["--bundle"] = "bundle",
-    bundle = "bundle",
     -- rollback
     ["-rollback"] = "rollback", ["--rollback"] = "rollback",
     ["-revert"] = "rollback", ["--revert"] = "rollback",
-    rollback = "rollback", revert = "rollback",
     -- test
     ["-test"] = "test", ["--test"] = "test", ["-t"] = "test",
-    test = "test",
     -- rm
     ["-rm"] = "rm", ["--rm"] = "rm", ["-remove"] = "rm", ["--remove"] = "rm",
     ["-delete"] = "rm", ["--delete"] = "rm", ["-del"] = "rm", ["--del"] = "rm",
-    rm = "rm", remove = "rm", delete = "rm", del = "rm",
     -- help
     ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
-    help = "help",
 }
 
 local function get_state_file()
@@ -721,26 +704,24 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
             explicit_lang = LANG_ALIASES[raw_l] or raw_l
         elseif a == "-m" or a == "--message" or a == "-message" then
             -- пропускаем сам флаг -m, следующие слова пойдут в промпт
+        elseif a:match("^%-%-?([%w_%-]+)$") then
+            local clean_cat = a:match("^%-%-?([%w_%-]+)$"):lower()
+            if LANG_ALIASES[clean_cat] then
+                explicit_lang = LANG_ALIASES[clean_cat]
+            end
         elseif not a:match("^%-") then
             table.insert(positional, a)
         end
         i = i + 1
     end
 
-    -- Поддержка синтаксиса `grime app -new <lang> <app_name> [промпт...]` и `grime app -new <app_name> [промпт...]`
+    -- Первый позиционный токен — ВСЕГДА имя приложения! Бездефисный перехват языка запрещен.
     local app_name = nil
     local prompt_tokens = {}
-    if #positional >= 2 and not explicit_lang and LANG_ALIASES[positional[1]:lower()] then
-        explicit_lang = LANG_ALIASES[positional[1]:lower()]
-        app_name = positional[2]
-        for k = 3, #positional do table.insert(prompt_tokens, positional[k]) end
-    elseif #positional >= 1 then
+    if #positional >= 1 then
         app_name = positional[1]
-        if #positional >= 2 and not explicit_lang and LANG_ALIASES[positional[2]:lower()] and #positional > 2 then
-            explicit_lang = LANG_ALIASES[positional[2]:lower()]
-            for k = 3, #positional do table.insert(prompt_tokens, positional[k]) end
-        else
-            for k = 2, #positional do table.insert(prompt_tokens, positional[k]) end
+        for k = 2, #positional do
+            table.insert(prompt_tokens, positional[k])
         end
     end
 
@@ -1623,6 +1604,34 @@ local function print_help()
     ))
 end
 
+local function run_or_create(apps_root, filtered, extra_args, is_detach, explicit_lang, path_requested)
+    local raw_name = filtered[1]
+    local matched_name = find_app_name(apps_root, raw_name)
+    if matched_name then
+        local dir = apps_root .. "/" .. matched_name
+        local m, err = load_manifest(dir, matched_name)
+        if not m then fail_once(err); return end
+        local rargs = {}
+        for i = 2, #filtered do table.insert(rargs, filtered[i]) end
+        for _, ea in ipairs(extra_args) do table.insert(rargs, ea) end
+        local code = run_app(matched_name, m, dir, rargs, is_detach)
+        if code ~= 0 then
+            fail_once(string.format("Приложение '%s' завершилось с кодом %d", matched_name, code))
+        else
+            if ctx.has_next_step or path_requested then
+                if ctx.set_target_dir then ctx.set_target_dir(dir) end
+                ctx.module_return(dir)
+            end
+        end
+    else
+        ctx.log(string.format("Приложение '%s' не найдено. Создание микроприложения...", raw_name))
+        local create_args = { "-new", raw_name }
+        for i = 2, #filtered do table.insert(create_args, filtered[i]) end
+        for _, ea in ipairs(extra_args) do table.insert(create_args, ea) end
+        new_app(apps_root, create_args, explicit_lang, path_requested)
+    end
+end
+
 function main()
     has_failed = false
     local apps_root = get_apps_root()
@@ -1630,6 +1639,7 @@ function main()
     local wants_help = false
     local path_requested = false
     local explicit_lang = nil
+    local explicit_subcmd = nil
     local filtered = {}
 
     local raw_args = ctx.args or {}
@@ -1647,210 +1657,188 @@ function main()
             explicit_lang = LANG_ALIASES[raw_l] or raw_l
         elseif alow == "--detach" or alow == "-detach" or alow == "-d" then
             is_detach = true
-        elseif alow == "--help" or alow == "-help" or alow == "-h" or alow == "help" then
+        elseif alow == "--help" or alow == "-help" or alow == "-h" then
             wants_help = true
-        elseif alow == "--path" or alow == "-path" or alow == "-p" or alow == "path" then
+        elseif alow == "--path" or alow == "-path" or alow == "-p" then
             path_requested = true
         elseif alow == "--force" or alow == "-force" or alow == "-f" or alow == "-9" then
             force = true
         elseif ACTION_MAP[alow] then
-            -- Точное совпадение с действием (например -new, -build, -run, -diff, -ps, -rm)
-            table.insert(filtered, ACTION_MAP[alow])
+            -- Точное совпадение с действием со знаком минус (-new, -build, -run, -diff, -ps, -rm, -test)
+            explicit_subcmd = ACTION_MAP[alow]
         else
-                -- Нечеткое сопоставление только если это неизвестный флаг со знаком минус
-                local fuzzy_matched = nil
-                if type(a) == "string" and a:match("^%-") then
-                    fuzzy_matched = grime.fuzzy.match_flag(a, {
-                        "--detach", "--help", "--path", "--force",
-                        "--new", "--build", "--run", "--stop", "--list", "--rm", "--bundle", "--snapshot", "--rollback", "--diff", "--status",
-                    }, 0.80)
-                end
-                if fuzzy_matched == "--detach" then
-                    is_detach = true
-                elseif fuzzy_matched == "--help" then
-                    wants_help = true
-                elseif fuzzy_matched == "--path" then
-                    path_requested = true
-                elseif fuzzy_matched == "--force" then
-                    force = true
-                elseif fuzzy_matched and ACTION_MAP[fuzzy_matched] then
-                    table.insert(filtered, ACTION_MAP[fuzzy_matched])
-                else
-                    table.insert(filtered, a)
-                end
+            -- Нечеткое сопоставление только если это неизвестный флаг со знаком минус
+            local fuzzy_matched = nil
+            if type(a) == "string" and a:match("^%-") then
+                fuzzy_matched = grime.fuzzy.match_flag(a, {
+                    "--detach", "--help", "--path", "--force",
+                    "--new", "--build", "--run", "--stop", "--list", "--rm", "--bundle", "--snapshot", "--rollback", "--diff", "--status", "--test",
+                }, 0.80)
             end
+            if fuzzy_matched == "--detach" then
+                is_detach = true
+            elseif fuzzy_matched == "--help" then
+                wants_help = true
+            elseif fuzzy_matched == "--path" then
+                path_requested = true
+            elseif fuzzy_matched == "--force" then
+                force = true
+            elseif fuzzy_matched and ACTION_MAP[fuzzy_matched] then
+                explicit_subcmd = ACTION_MAP[fuzzy_matched]
+            else
+                table.insert(filtered, a)
+            end
+        end
         idx = idx + 1
     end
 
     if wants_help then
         print_help()
-        return
+        return 0
     end
 
-    -- Поддержка обратного порядка: `grime app <app_name> -build` / `grime app <app_name> -stop`
-    if #filtered >= 2 and not ACTION_MAP[filtered[1]:lower()] and ACTION_MAP[filtered[2]:lower()] then
-        local act = ACTION_MAP[filtered[2]:lower()]
-        if act ~= "run" then
-            local app_tok = filtered[1]
-            filtered[1] = act
-            filtered[2] = app_tok
-        end
-    end
+    local subcmd = explicit_subcmd
 
-    -- Обработка запроса пути (-path / --path / -p / path):
-    -- 1) grime app -path -> apps_root (или из входа конвейера)
+    -- Обработка запроса пути (-path / --path / -p / subcmd == "path"):
+    -- 1) grime app -path -> apps_root
     -- 2) grime app -path <app> -> apps_root/<app>
     -- 3) grime app <app> -path -> apps_root/<app>
-    if path_requested then
-        local known_actions = {
-            run = true, build = true, new = true,
-            commit = true, log = true, diff = true, status = true,
-            snapshot = true, bundle = true, rollback = true,
-            test = true, rm = true, stop = true, ps = true, list = true,
-        }
-        local is_subcmd_action = (#filtered > 0 and known_actions[filtered[1]])
-        if not is_subcmd_action then
-            local target_query = filtered[1]
-            if not target_query or target_query == "" then
-                local pipe_in = ctx.pipeline_input or ctx.input
-                if pipe_in and type(pipe_in) == "string" then
-                    local trimmed = grime.str.trim(pipe_in)
-                    if #trimmed > 0 and not trimmed:find("\n") and not ctx.is_dir(trimmed) then
-                        target_query = trimmed
-                    end
+    if path_requested or subcmd == "path" then
+        local target_query = filtered[1]
+        if not target_query or target_query == "" then
+            local pipe_in = ctx.pipeline_input or ctx.input
+            if pipe_in and type(pipe_in) == "string" then
+                local trimmed = grime.str.trim(pipe_in)
+                if #trimmed > 0 and not trimmed:find("\n") and not ctx.is_dir(trimmed) then
+                    target_query = trimmed
                 end
-            end
-
-            if not target_query or target_query == "" then
-                if ctx.set_target_dir then ctx.set_target_dir(apps_root) end
-                ctx.module_return(apps_root)
-                return
-            else
-                local matched_name = find_app_name(apps_root, target_query)
-                if not matched_name then
-                    fail_once(string.format("Приложение '%s' не найдено в %s", target_query, apps_root))
-                    return
-                end
-                local dir = ctx.normalize_path(apps_root .. "/" .. matched_name)
-                if ctx.set_target_dir then ctx.set_target_dir(dir) end
-                ctx.module_return(dir)
-                return
             end
         end
+
+        local app_dir = apps_root
+        if target_query and target_query ~= "" then
+            local matched_name = find_app_name(apps_root, target_query)
+            app_dir = ctx.normalize_path(apps_root .. "/" .. (matched_name or target_query))
+        end
+
+        if ctx.set_target_dir then ctx.set_target_dir(app_dir) end
+        print(app_dir)
+        ctx.module_return(app_dir)
+        return 0
     end
 
-    local subcmd = filtered[1]
-    if not subcmd or subcmd == "list" then
-        list_apps(apps_root, path_requested)
-        if not ctx.has_next_step and not path_requested then
-            print("\27[90mДля подробной справки используйте: grime app -help\27[0m\n")
+    if not subcmd then
+        if #filtered == 0 then
+            list_apps(apps_root, false)
+            if not ctx.has_next_step then
+                print("\27[90mДля подробной справки используйте: grime app -help\27[0m\n")
+            end
+            return 0
         end
-        return
+    elseif subcmd == "list" then
+        list_apps(apps_root, false)
+        return 0
     elseif subcmd == "ps" then
         ps_apps(apps_root)
-        return
+        return 0
     elseif subcmd == "stop" then
-        if not filtered[2] then
+        if not filtered[1] then
             fail_once("Укажите имя приложения: grime app -stop <app_name> [-9/-force]")
-            return
+            return 1
         end
-        stop_app(apps_root, filtered[2], force)
-        return
+        stop_app(apps_root, filtered[1], force)
+        return 0
     elseif subcmd == "new" then
         for _, ea in ipairs(extra_args) do table.insert(filtered, ea) end
         new_app(apps_root, filtered, explicit_lang, path_requested)
-        return
+        return 0
     elseif subcmd == "build" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -build <app_name>"); return end
-        local app_name = resolve_app_name(apps_root, filtered[2])
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -build <app_name>"); return 1 end
+        local app_name = resolve_app_name(apps_root, filtered[1])
         local dir = apps_root .. "/" .. app_name
         if not ctx.exists(dir) then
-            fail_once(string.format("Приложение '%s' не найдено в %s", filtered[2], apps_root))
-            return
+            fail_once(string.format("Приложение '%s' не найдено в %s", filtered[1], apps_root))
+            return 1
         end
         local m, err = load_manifest(dir, app_name)
-        if not m then fail_once(err or "Манифест не найден"); return end
+        if not m then fail_once(err or "Манифест не найден"); return 1 end
         local ok = build_app(app_name, m, dir)
         if ok and (ctx.has_next_step or path_requested) then
             if ctx.set_target_dir then ctx.set_target_dir(dir) end
             ctx.module_return(dir)
         end
-        return
+        return 0
     elseif subcmd == "commit" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -commit <app_name> [сообщение]"); return end
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -commit <app_name> [сообщение]"); return 1 end
         local msg_tokens = {}
-        for i = 3, #filtered do table.insert(msg_tokens, filtered[i]) end
+        for i = 2, #filtered do table.insert(msg_tokens, filtered[i]) end
         for _, ea in ipairs(extra_args) do table.insert(msg_tokens, ea) end
-        commit_app(apps_root, filtered[2], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
-        return
+        commit_app(apps_root, filtered[1], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
+        return 0
     elseif subcmd == "snapshot" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -snapshot <app_name> [сообщение]"); return end
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -snapshot <app_name> [сообщение]"); return 1 end
         local msg_tokens = {}
-        for i = 3, #filtered do table.insert(msg_tokens, filtered[i]) end
+        for i = 2, #filtered do table.insert(msg_tokens, filtered[i]) end
         for _, ea in ipairs(extra_args) do table.insert(msg_tokens, ea) end
-        snapshot_app(apps_root, filtered[2], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
-        return
+        snapshot_app(apps_root, filtered[1], #msg_tokens > 0 and table.concat(msg_tokens, " ") or nil)
+        return 0
     elseif subcmd == "log" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -log <app_name> [n]"); return end
-        log_app(apps_root, filtered[2], filtered[3])
-        return
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -log <app_name> [n]"); return 1 end
+        log_app(apps_root, filtered[1], filtered[2])
+        return 0
     elseif subcmd == "diff" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -diff <app_name> [файл]"); return end
-        diff_app(apps_root, filtered[2], filtered[3])
-        return
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -diff <app_name> [файл]"); return 1 end
+        diff_app(apps_root, filtered[1], filtered[2])
+        return 0
     elseif subcmd == "status" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -status <app_name>"); return end
-        local app_name = resolve_app_name(apps_root, filtered[2])
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -status <app_name>"); return 1 end
+        local app_name = resolve_app_name(apps_root, filtered[1])
         local dir = apps_root .. "/" .. app_name
         local m, _ = load_manifest(dir, app_name)
         if m and type(m.status) == "function" then
             m.status(dir, m)
-            return
+            return 0
         end
-        status_app(apps_root, filtered[2])
-        return
+        status_app(apps_root, filtered[1])
+        return 0
     elseif subcmd == "test" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -test <app_name>"); return end
-        local app_name = resolve_app_name(apps_root, filtered[2])
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -test <app_name>"); return 1 end
+        local app_name = resolve_app_name(apps_root, filtered[1])
         local dir = apps_root .. "/" .. app_name
         local m, err = load_manifest(dir, app_name)
-        if not m then fail_once(err or "Манифест не найден"); return end
+        if not m then fail_once(err or "Манифест не найден"); return 1 end
         if type(m.test) == "function" then
             local ok, res = pcall(m.test, dir, m)
             if not ok or res == false or (type(res) == "number" and res ~= 0) then
                 fail_once(string.format("Тесты приложения '%s' завершились с ошибкой: %s", app_name, tostring(res)))
-                return
+                return 1
             end
             ctx.log(string.format("✓ Все тесты приложения '%s' успешно пройдены.", app_name))
         elseif type(m.test) == "string" and m.test ~= "" then
             local code = exec_cmd(m, m.test, dir)
-            if code ~= 0 then fail_once(string.format("Тесты завершились с кодом %d", code)); return end
+            if code ~= 0 then fail_once(string.format("Тесты завершились с кодом %d", code)); return 1 end
             ctx.log(string.format("✓ Все тесты приложения '%s' успешно пройдены.", app_name))
         else
             ctx.log(string.format("Тесты для приложения '%s' не определены в app.lua.", app_name))
         end
-        return
+        return 0
     elseif subcmd == "bundle" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -bundle <app_name>"); return end
-        bundle_app(apps_root, filtered[2])
-        return
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -bundle <app_name>"); return 1 end
+        bundle_app(apps_root, filtered[1])
+        return 0
     elseif subcmd == "rollback" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -rollback <app_name> [commit]"); return end
-        rollback_app(apps_root, filtered[2], filtered[3])
-        return
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -rollback <app_name> [commit]"); return 1 end
+        rollback_app(apps_root, filtered[1], filtered[2])
+        return 0
     elseif subcmd == "rm" then
-        if not filtered[2] then fail_once("Укажите имя приложения: grime app -rm <app_name>"); return end
-        local app_name = resolve_app_name(apps_root, filtered[2])
+        if not filtered[1] then fail_once("Укажите имя приложения: grime app -rm <app_name>"); return 1 end
+        local app_name = resolve_app_name(apps_root, filtered[1])
         rm_app(apps_root, app_name)
-        return
-    end
-
-    -- Обработка подкоманд запуска (-run / --run / -r / run)
-    if subcmd == "run" then
-        table.remove(filtered, 1)
-        if #filtered == 0 then
+        return 0
+    elseif subcmd == "run" then
+        if not filtered[1] then
             fail_once("Укажите имя приложения: grime app -run <app_name> [аргументы...]")
-            return
+            return 1
         end
     end
 
@@ -1858,7 +1846,7 @@ function main()
     local segments = {}
     local cur_seg = {}
     for _, tok in ipairs(filtered) do
-        if tok == "->" or tok == ":" or tok == "to" or tok == "::" then
+        if tok == "->" or tok == ":" or tok == "::" then
             if #cur_seg > 0 then table.insert(segments, cur_seg); cur_seg = {} end
         else
             table.insert(cur_seg, tok)
@@ -1875,26 +1863,8 @@ function main()
         local code = run_chain(apps_root, segments)
         if code ~= 0 then fail_once(string.format("Цепочка приложений завершилась с ошибкой (код %d)", code)) end
     else
-        local name = resolve_app_name(apps_root, filtered[1])
-        local dir = apps_root .. "/" .. name
-        if not ctx.exists(dir) then
-            fail_once(string.format("Приложение '%s' не найдено в %s.\nИспользуйте 'grime app -new %s' для создания.", name, apps_root, name))
-            return
-        end
-        local m, err = load_manifest(dir, name)
-        if not m then fail_once(err); return end
-        local rargs = {}
-        for i = 2, #filtered do table.insert(rargs, filtered[i]) end
-        for _, ea in ipairs(extra_args) do table.insert(rargs, ea) end
-        local code = run_app(name, m, dir, rargs, is_detach)
-        if code ~= 0 then
-            fail_once(string.format("Приложение '%s' завершилось с кодом %d", name, code))
-        else
-            if ctx.has_next_step or path_requested then
-                if ctx.set_target_dir then ctx.set_target_dir(dir) end
-                ctx.module_return(dir)
-            end
-        end
+        -- Запуск существующего или создание нового приложения (gap <app_name>)
+        run_or_create(apps_root, filtered, extra_args, is_detach, explicit_lang, path_requested)
     end
 end
 
@@ -1920,4 +1890,5 @@ return {
     snapshot_app = snapshot_app,
     bundle_app = bundle_app,
     rollback_app = rollback_app,
+    run_or_create = run_or_create,
 }

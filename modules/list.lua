@@ -447,19 +447,21 @@ function main()
 
     for _, a in ipairs(args) do
         local raw = tostring(a)
-        local clean = grime.args.strip_dashes(raw)
-        if clean == "help" or clean == "h" then
-            print_help()
-            return
-        elseif clean == "modules" or clean == "module" or clean == "mod" or clean == "m" then
-            section = "modules"
-        elseif clean == "apps" or clean == "app" or clean == "a" then
-            section = "apps"
-        elseif clean == "projects" or clean == "project" or clean == "proj" or clean == "p" then
-            section = "projects"
-        elseif clean == "all" then
-            section = "all"
-        elseif not raw:match("^%-") then
+        if grime.args.is_flag(raw) then
+            local clean = grime.args.strip_dashes(raw)
+            if clean == "help" or clean == "h" then
+                print_help()
+                return
+            elseif clean == "modules" or clean == "module" or clean == "mod" or clean == "m" then
+                section = "modules"
+            elseif clean == "apps" or clean == "app" or clean == "a" then
+                section = "apps"
+            elseif clean == "projects" or clean == "project" or clean == "proj" or clean == "p" then
+                section = "projects"
+            elseif clean == "all" then
+                section = "all"
+            end
+        else
             filter = raw:lower()
         end
     end

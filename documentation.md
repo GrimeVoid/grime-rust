@@ -126,39 +126,40 @@ end
 ##### Параметры спецификации `spec`:
 ```lua
 local spec = {
-    -- Таблица действий и их синонимов (алиасов)
+    -- Таблица действий и их синонимов (СТРОГО со знаком минус: '-' или '--')
     actions = {
-        list = "list", ls = "list", l = "list",
-        init = "init", new = "init", i = "init",
-        build = "build", b = "build",
-        run = "run", r = "run",
-        path = "path", p = "path",
+        ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["-l"] = "list",
+        ["-init"] = "init", ["--init"] = "init", ["-new"] = "init", ["-i"] = "init",
+        ["-build"] = "build", ["--build"] = "build", ["-b"] = "build",
+        ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
+        ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
     },
     
-    -- Действие по умолчанию (если ни одно не распознано в аргументах)
+    -- Действие по умолчанию (если ни одно действие со знаком минус не распознано в аргументах)
     default_action = "list",
     
-    -- Булевы флаги (сопоставляются с '-' и '--' автоматически)
+    -- Булевы флаги (сопоставляются строго со знаком '-' и '--')
     flags = {
-        force = { "-f", "--force" },
-        all   = { "-a", "--all" },
-        help  = { "-h", "--help" },
+        force = { "-f", "--force", "-force" },
+        all   = { "-a", "--all", "-all" },
+        help  = { "-h", "--help", "-help" },
+        path  = { "-p", "--path", "-path" },
     },
     
     -- Флаги со значением (поддерживают синтаксис: --lang=rust, --lang rust, -l rust)
     value_flags = {
-        lang  = { "-l", "--lang" },
-        limit = { "-n", "--limit" },
+        lang  = { "-l", "--lang", "-lang" },
+        limit = { "-n", "--limit", "-limit" },
     },
     
-    -- Словари категорий (сопоставляются со знаком минус и без него)
+    -- Словари категорий (сопоставляются строго со знаком минус: '-rust', '--rust')
     categories = {
         language = {
-            cpp = "cpp", ["c++"] = "cpp",
-            rust = "rust", rs = "rust",
-            python = "python", py = "python",
-            java = "java",
-            lua = "lua",
+            ["-cpp"] = "cpp", ["--cpp"] = "cpp", ["-c++"] = "cpp",
+            ["-rust"] = "rust", ["--rust"] = "rust", ["-rs"] = "rust",
+            ["-python"] = "python", ["--python"] = "python", ["-py"] = "python",
+            ["-java"] = "java", ["--java"] = "java",
+            ["-lua"] = "lua", ["--lua"] = "lua",
         },
     },
     
@@ -184,11 +185,15 @@ local parsed = ctx.parse_args(spec)
 -- parsed.flags: table         Таблица флагов ({ force = true, all = false, lang = "rust" })
 -- parsed.categories: table    Таблица категорий ({ language = "rust" })
 -- parsed.target_dir: string   Найденный путь к существующей директории (если detect_dir = true)
--- parsed.args: table          Массив очищенных позиционных аргументов
 -- parsed.command_tokens: table Массив токенов, переданных после разделителя '//' или '--'
 -- parsed.unknown_flags: table Массив неизвестных флагов, начинающихся с '-'
 -- parsed.has_separator: bool  Присутствовал ли разделитель '//' или '--'
 ```
+
+##### Строгий дефисный стандарт (Strict Dash Standard):
+- **Императив:** Любые действия (`actions`), категории (`categories`) и флаги (`flags`, `value_flags`) распознаются **ТОЛЬКО** если переданный токен начинается со знака дефиса (`-` или `--`).
+- **Позиционные аргументы:** Любой токен без дефиса безоговорочно трактуется как позиционный аргумент (название проекта, путь, текст сообщения, поисковый фильтр) и попадает в `parsed.args`. Это полностью исключает случайный перехват пользовательских имён (например, проектов или микроприложений с именами `test`, `build`, `run`, `list`, `help`, `status`).
+- **Приоритизация флага `-path`:** Флаги пути (`-path`, `--path`, `-p`) обладают умной семантикой. Если в шаге конвейера не указано основное действие со знаком минус, флаг `-path` автоматически становится действием (`parsed.action = "path"`), а также устанавливает `parsed.flags.path = true`. Если же основное действие указано (например, `-build -path`), основное действие сохраняется, а флаг `parsed.flags.path` остаётся активным.
 
 #### `grime.args.split_passthrough([raw_args: table]) -> table, table, boolean`
 (Алиас: `grime.args.split`)

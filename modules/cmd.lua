@@ -19,7 +19,7 @@ local function print_help()
     Поддерживает сквозной ввод из конвейера через ctx.input.
 
 %sКОМАНДЫ И ФЛАГИ:%s
-    %shelp, -h, --help%s       Показать эту справку
+    %s-help, -h, --help%s       Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime project MyGame path : cmd nvim CMakeLists.txt
@@ -68,7 +68,7 @@ function main()
     end
 
     local program = args[1]
-    if not skipped_sep and (program == "--help" or program == "-help" or program == "-h" or program == "help") then
+    if not has_sep and (program == "--help" or program == "-help" or program == "-h") then
         print_help()
         return
     end

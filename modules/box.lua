@@ -6,15 +6,15 @@ local utils = require("languages.utils")
 local ctx = grime.ctx
 
 local ACTIONS = {
-    list = "list", ls = "list", status = "list", ps = "list", l = "list",
-    enter = "enter", shell = "enter", sh = "enter", e = "enter",
-    run = "run", runner = "run", ["exec"] = "run", wrap = "run", ["do"] = "run", r = "run",
-    export = "export", exp = "export",
-    create = "create", new = "create", init = "create", c = "create",
-    stop = "stop", s = "stop",
-    rm = "rm", delete = "rm", remove = "rm", del = "rm", d = "rm",
-    keepalive = "keepalive", idle = "keepalive",
-    help = "help",
+    ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list", ["-l"] = "list", ["-ps"] = "list", ["--ps"] = "list",
+    ["-enter"] = "enter", ["--enter"] = "enter", ["-sh"] = "enter", ["--sh"] = "enter", ["-shell"] = "enter", ["--shell"] = "enter", ["-e"] = "enter",
+    ["-run"] = "run", ["--run"] = "run", ["-r"] = "run", ["-exec"] = "run", ["--exec"] = "run",
+    ["-export"] = "export", ["--export"] = "export", ["-exp"] = "export", ["--exp"] = "export",
+    ["-create"] = "create", ["--create"] = "create", ["-new"] = "create", ["--new"] = "create", ["-init"] = "create", ["--init"] = "create", ["-c"] = "create",
+    ["-stop"] = "stop", ["--stop"] = "stop", ["-s"] = "stop",
+    ["-rm"] = "rm", ["--rm"] = "rm", ["-delete"] = "rm", ["--delete"] = "rm", ["-remove"] = "rm", ["--remove"] = "rm", ["-del"] = "rm", ["-d"] = "rm",
+    ["-keepalive"] = "keepalive", ["--keepalive"] = "keepalive",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 --- Получение списка контейнеров Distrobox без захардкоженного ядра Rust
@@ -375,11 +375,15 @@ local function print_help()
 end
 
 function main()
-    for _, a in ipairs(ctx.args or {}) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+    local raw_args = ctx.args or {}
+    for _, a in ipairs(raw_args) do
+        if a == "--" or a == "//" then break end
+        if grime.args.is_flag(a) then
+            local clean = grime.args.strip_dashes(a:lower())
+            if clean == "help" or clean == "h" then
+                print_help()
+                return
+            end
         end
     end
 
@@ -396,7 +400,7 @@ function main()
         default_action = "list",
         categories = { box = box_cats },
         flags = {
-            help = { "help", "-h", "--help", "-help" },
+            help = { "-h", "--help", "-help" },
         },
     })
     local action = parsed.action or "list"

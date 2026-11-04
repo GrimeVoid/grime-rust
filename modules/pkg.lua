@@ -18,17 +18,15 @@ local utf8_len = utils.utf8_len
 local pad_utf8 = utils.pad_utf8
 
 local ACTIONS = {
-    list = "list", ls = "list", l = "list", show = "list",
-    install = "install", i = "install", ["in"] = "install", add = "install", get = "install",
-    update = "update", upgrade = "update", up = "update", u = "update",
+    ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list", ["-l"] = "list",
+    ["-install"] = "install", ["--install"] = "install", ["-i"] = "install", ["-add"] = "install", ["--add"] = "install",
     ["-update"] = "update", ["--update"] = "update", ["-u"] = "update", ["--upgrade"] = "update", ["-upgrade"] = "update", ["-up"] = "update", ["--up"] = "update",
-    remove = "remove", rm = "remove", uninstall = "remove", del = "remove", delete = "remove",
     ["-remove"] = "remove", ["--remove"] = "remove", ["-rm"] = "remove", ["--rm"] = "remove", ["-uninstall"] = "remove", ["--uninstall"] = "remove", ["-del"] = "remove", ["--del"] = "remove",
-    run = "run", r = "run", ["try"] = "run",
-    init = "init", shell = "init", sh = "init", new = "init",
-    search = "search", find = "search", s = "search", f = "search",
-    ["not-found"] = "not_found", ["not_found"] = "not_found", cnf = "not_found",
-    help = "help", ["--help"] = "help", ["-h"] = "help",
+    ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
+    ["-init"] = "init", ["--init"] = "init", ["-shell"] = "init", ["--shell"] = "init",
+    ["-search"] = "search", ["--search"] = "search", ["-s"] = "search", ["-find"] = "search", ["--find"] = "search",
+    ["-not-found"] = "not_found", ["--not-found"] = "not_found", ["-cnf"] = "not_found",
+    ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
 local CANONICAL_MANAGERS = {
@@ -1974,11 +1972,12 @@ end
 
 local function lookup_pkg_action(tok)
     if not tok or type(tok) ~= "string" then return nil end
+    if not grime.args.is_flag(tok) then return nil end
     local low = tok:lower()
     if ACTIONS[low] then return ACTIONS[low] end
-    if low:sub(1, 1) == "-" then
-        local stripped = low:gsub("^%-+", "")
-        return ACTIONS[stripped]
+    local stripped = low:gsub("^%-+", "")
+    if ACTIONS["-" .. stripped] then
+        return ACTIONS["-" .. stripped]
     end
     return nil
 end
@@ -1986,13 +1985,13 @@ end
 function main()
     local raw_args = ctx.args or {}
 
-    -- Проверка явного вызова общей справки: grime pkg help, grime pkg -h, grime pkg --help, grime pkg flatpak --help
+    -- Проверка явного вызова общей справки: grime pkg -h, grime pkg --help, grime pkg -flatpak --help
     if #raw_args > 0 then
         local first_action = lookup_pkg_action(raw_args[1])
         if first_action ~= "run" and first_action ~= "not_found" then
             for _, a in ipairs(raw_args) do
                 if a == "--" or a == "//" then break end
-                if a == "--help" or a == "-h" or a == "-help" or a == "help" then
+                if a == "--help" or a == "-h" or a == "-help" then
                     print_help()
                     return
                 end
@@ -2013,7 +2012,7 @@ function main()
         end
     end
 
-    -- Специальная изолированная обработка действия 'run' / '-run' / '--run' / '-r'
+    -- Специальная изолированная обработка действия '-run' / '--run' / '-r'
     -- (гарантирует, что флаги утилиты вроде -h, -a, -v не перехватываются как флаги Grime Pkg)
     if #raw_args > 0 then
         local first_action = lookup_pkg_action(raw_args[1])
@@ -2024,7 +2023,7 @@ function main()
             end
 
             local second = raw_args[2]
-            if second == "--help" or second == "-h" or second == "-help" or second == "help" then
+            if second == "--help" or second == "-h" or second == "-help" then
                 print_run_help()
                 return
             end
@@ -2043,12 +2042,15 @@ function main()
             end
             run_tokens = clean_run_tokens
 
-            -- Проверяем, является ли первый токен именем менеджера
+            -- Проверяем, является ли первый токен именем менеджера СО ЗНАКОМ МИНУС (-nix, -pacman, -flatpak, -box)
+            -- Без знака минус токены (например python, cargo, man) считаются именем бинарника!
             local mgr = nil
-            local resolved = resolve_manager(run_tokens[1])
-            if resolved and #run_tokens > 1 then
-                mgr = resolved
-                table.remove(run_tokens, 1)
+            if run_tokens[1] and grime.args.is_flag(run_tokens[1]) then
+                local resolved = resolve_manager(run_tokens[1])
+                if resolved and #run_tokens > 1 then
+                    mgr = resolved
+                    table.remove(run_tokens, 1)
+                end
             end
 
             handle_run(mgr, run_tokens, cmd_tokens)
@@ -2056,16 +2058,18 @@ function main()
         end
     end
 
-    -- Также поддерживаем случай `grime pkg <mgr> -run <cmd>` до общего парсера
+    -- Также поддерживаем случай `grime pkg -<mgr> -run <cmd>` до общего парсера
     if #raw_args >= 2 then
-        local mgr_first = resolve_manager(raw_args[1])
-        local act_second = lookup_pkg_action(raw_args[2])
-        if mgr_first and act_second == "run" then
-            local raw_slice = {}
-            for i = 3, #raw_args do table.insert(raw_slice, raw_args[i]) end
-            local run_tokens, cmd_tokens = grime.args.split_passthrough(raw_slice)
-            handle_run(mgr_first, run_tokens, cmd_tokens)
-            return
+        if grime.args.is_flag(raw_args[1]) then
+            local mgr_first = resolve_manager(raw_args[1])
+            local act_second = lookup_pkg_action(raw_args[2])
+            if mgr_first and act_second == "run" then
+                local raw_slice = {}
+                for i = 3, #raw_args do table.insert(raw_slice, raw_args[i]) end
+                local run_tokens, cmd_tokens = grime.args.split_passthrough(raw_slice)
+                handle_run(mgr_first, run_tokens, cmd_tokens)
+                return
+            end
         end
     end
 

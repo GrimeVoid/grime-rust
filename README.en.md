@@ -54,10 +54,10 @@ flowchart LR
 
 Every module in GRIME follows the same syntax rules:
 
-- **All flags and actions start with a dash (`-` or `--`).**
-  For example: `-list` (`-ls`), `-path` (`-p`), `-new` (`-n`), `-build` (`-b`), `-run` (`-r`), `-rm`, `-update` (`-u`), `-help` (`-h`). Short and long forms are interchangeable.
+- **All flags, actions, and categories strictly start with a dash (`-` or `--`).**
+  For example: `-list` (`-ls`), `-path` (`-p`), `-new` (`-n`), `-build` (`-b`), `-run` (`-r`), `-rm`, `-update` (`-u`), `-help` (`-h`), `-rust`, `-cpp`. Any token without a leading dash is treated purely as a positional argument (project or app name, file path, message text, search filter). This ensures names like `test`, `build`, `run`, `list`, or `help` are never accidentally hijacked as commands.
 - **Flexible target and flag order.**
-  Both `grime project -path grime_pj` and `grime project grime_pj -path` work identically and support fuzzy matching on project and app names.
+  Both `grime project -path grime_pj` and `grime project grime_pj -path` work identically. Likewise for micro-apps: `grime app -path my_app` and `grime app my_app -path`.
 - **Argument separator `//` (or `--`).**
   To pass flags directly to an external binary without GRIME intercepting them, place `//` before the external arguments:
   ```bash
@@ -84,8 +84,8 @@ Manages C++, Rust, Python, Java, and Lua projects. Supports fuzzy directory look
 
 ```bash
 # Initialize a new project for a specific language
-grime project -init rust fast_proxy
-grime project -init cpp render_core
+grime project -new -rust fast_proxy
+grime project -new -cpp render_core
 
 # Resolve project path (useful for quick navigation in Fish/Bash)
 cd (grime project -path grime_pj)

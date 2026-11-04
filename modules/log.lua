@@ -314,19 +314,22 @@ function M.main()
     local raw_subcmd = args[1]
 
     for _, a in ipairs(args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
-            print_help()
-            return
+        if a == "--" or a == "//" then break end
+        if grime.args.is_flag(a) then
+            local clean = grime.args.strip_dashes(a:lower())
+            if clean == "help" or clean == "h" then
+                print_help()
+                return
+            end
         end
     end
 
-    local subcmd = raw_subcmd
-    if type(raw_subcmd) == "string" then
-        local clean = grime.args.strip_dashes(raw_subcmd)
+    local subcmd = nil
+    if type(raw_subcmd) == "string" and grime.args.is_flag(raw_subcmd) then
+        local clean = grime.args.strip_dashes(raw_subcmd:lower())
         if LOG_COMMANDS[clean] then
             subcmd = LOG_COMMANDS[clean]
-        elseif clean == "info" or clean == "warn" or clean == "error" then
+        elseif clean == "info" or clean == "warn" or clean == "error" or clean == "debug" then
             subcmd = clean:upper()
         end
     end
@@ -336,8 +339,8 @@ function M.main()
         return
     end
 
-    -- Обработка пайплайна: echo "msg" : grime log [уровень]
-    if input and #input > 0 and (not subcmd or subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR") then
+    -- Обработка пайплайна: echo "msg" : grime log [-info/-warn/-error]
+    if input and #input > 0 and (not subcmd or subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR" or subcmd == "DEBUG") then
         local level = subcmd or "INFO"
         local entry = M.add(level, input, "pipeline")
         grime.ui.success(string.format("Запись добавлена в лог [%s]: %s", level, input))
@@ -438,11 +441,11 @@ function M.main()
         return
     end
 
-    -- Вывод обычного списка логов (grime log или grime log list [n])
+    -- Вывод обычного списка логов (grime log или grime log -list [n])
     local limit = 20
     if subcmd == "list" then
         limit = extract_log_limit(args, 2, 20)
-    elseif subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR" then
+    elseif subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR" or subcmd == "DEBUG" then
         local msg_tokens = {}
         for i = 2, #args do table.insert(msg_tokens, args[i]) end
         local msg = table.concat(msg_tokens, " ")
@@ -453,19 +456,15 @@ function M.main()
             ctx.success(grime.json.encode(entry))
             return
         end
-    elseif tonumber(subcmd) then
-        limit = tonumber(subcmd)
-    elseif raw_subcmd and tostring(raw_subcmd):match("^%-") then
-        limit = extract_log_limit(args, 1, 20)
-    elseif subcmd and subcmd ~= "" then
-        -- Если передан произвольный текст как лог-сообщение
-        local msg_tokens = {}
-        for i = 1, #args do table.insert(msg_tokens, args[i]) end
-        local msg = table.concat(msg_tokens, " ")
+    elseif not subcmd and #args > 0 then
+        -- Если передан произвольный текст без дефиса (например: grime log c или grime log Hello World)
+        local msg = table.concat(args, " ")
         local entry = M.add("INFO", msg, "user")
         grime.ui.success(string.format("Запись добавлена в лог [INFO]: %s", msg))
         ctx.success(grime.json.encode(entry))
         return
+    else
+        limit = extract_log_limit(args, 1, 20)
     end
 
     local entries = M.get_history(limit)

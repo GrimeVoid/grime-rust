@@ -7,13 +7,13 @@ local utils = require("languages.utils")
 local ctx = grime.ctx
 
 local ACTIONS = {
-    list = "list", ls = "list", status = "list", ps = "list",
-    enter = "enter", shell = "enter", sh = "enter",
-    run = "run", runner = "run", ["exec"] = "run", wrap = "run", ["do"] = "run",
+    list = "list", ls = "list", status = "list", ps = "list", l = "list",
+    enter = "enter", shell = "enter", sh = "enter", e = "enter",
+    run = "run", runner = "run", ["exec"] = "run", wrap = "run", ["do"] = "run", r = "run",
     export = "export", exp = "export",
-    create = "create", new = "create", init = "create",
-    stop = "stop",
-    rm = "rm", delete = "rm", remove = "rm", del = "rm",
+    create = "create", new = "create", init = "create", c = "create",
+    stop = "stop", s = "stop",
+    rm = "rm", delete = "rm", remove = "rm", del = "rm", d = "rm",
     keepalive = "keepalive", idle = "keepalive",
     help = "help",
 }
@@ -334,31 +334,31 @@ local function print_help()
 %s%sGrime Box%s — Управление контейнерами Distrobox и запуск задач
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime box [команда] [имя_контейнера] [-- аргументы_или_команда...]
+    grime box [команда|-флаг] [имя_контейнера] [-- аргументы_или_команда...]
 
-%sКОМАНДЫ:%s
-    %slist, ls, status%s      Список доступных контейнеров Distrobox (по умолчанию)
-                         grime box list
-    %senter, shell, sh%s      Интерактивный вход в контейнер
-                         grime box enter [контейнер]
-    %srun, exec%s             Выполнение команды внутри контейнера
-                         grime box run <контейнер> -- <команда...>
-                         grime box [контейнер] <команда...>
-    %screate, new%s           Создать новый контейнер Distrobox
-                         grime box create <имя> [--image <образ>]
-    %sstop%s                  Остановить работающий контейнер
-                         grime box stop <имя>
-    %srm, delete%s            Удалить контейнер Distrobox
-                         grime box rm <имя>
-    %sexport%s                Экспорт бинарника или desktop-файла из контейнера на хост
-                         grime box export [имя] --app <приложение> | --bin <путь>
-    %shelp, -h, --help%s      Показать эту справку
+%sКОМАНДЫ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
+    %slist, -l, --list%s          Список доступных контейнеров Distrobox (по умолчанию)
+                              grime box --list
+    %senter, -e, --enter%s        Интерактивный вход в контейнер
+                              grime box --enter [контейнер]
+    %srun, -r, --run, --exec%s    Выполнение команды внутри контейнера
+                              grime box --run <контейнер> -- <команда...>
+                              grime box [контейнер] <команда...>
+    %screate, -c, --create%s      Создать новый контейнер Distrobox
+                              grime box --create <имя> [--image <образ>]
+    %sstop, -s, --stop%s          Остановить работающий контейнер
+                              grime box --stop <имя>
+    %srm, -d, --rm, --delete%s    Удалить контейнер Distrobox
+                              grime box --rm <имя>
+    %sexport, --export%s          Экспорт бинарника или desktop-файла из контейнера на хост
+                              grime box --export [имя] --app <приложение> | --bin <путь>
+    %shelp, -h, --help%s          Показать эту справку
 
 %sПРИМЕРЫ:%s
     grime box                               # Обзор статуса всех контейнеров
-    grime box enter fedora-box              # Вход в контейнер
-    grime box run fedora-box gcc --version  # Выполнение команды в контейнере
-    grime box create mybox                  # Создание нового контейнера
+    grime box -enter fedora-box             # Вход в контейнер
+    grime box --run fedora-box gcc --version # Выполнение команды в контейнере
+    grime box -create mybox                 # Создание нового контейнера
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -378,7 +378,7 @@ end
 function main()
     for _, a in ipairs(ctx.args or {}) do
         local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" then
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
             print_help()
             return
         end
@@ -396,12 +396,15 @@ function main()
         actions = ACTIONS,
         default_action = "list",
         categories = { box = box_cats },
+        flags = {
+            help = { "help", "-h", "--help", "-help" },
+        },
     })
 
     local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "list"
 
-    if action == "help" then
+    if action == "help" or parsed.flags.help then
         print_help()
         return
     end

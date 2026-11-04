@@ -334,7 +334,9 @@ function utils.generate_app_manifest(name, lang, desc)
     name = name or "app"
     lang = (lang or "cpp"):lower()
     local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. name)
-    local snake_name = name:lower():gsub("[%s%-]", "_")
+    local snake_name = (grime and grime.str and grime.str.to_snake_case)
+        and grime.str.to_snake_case(name)
+        or name:lower():gsub("[%s%-]", "_")
 
     local profiles = {
         cpp = {
@@ -353,9 +355,12 @@ function utils.generate_app_manifest(name, lang, desc)
             run = "python3 src/main.py",
         },
         java = {
-            artifact = "target/" .. name .. "-1.0-SNAPSHOT.jar",
-            build = "mvn -q package",
-            run = "java -jar target/" .. name .. "-1.0-SNAPSHOT.jar",
+            artifact = "build/" .. name .. ".jar",
+            build = string.format(
+                "mkdir -p build/classes && javac -encoding UTF-8 -d build/classes $(find src -name '*.java') && jar --create --file build/%s.jar --main-class Main -C build/classes .",
+                name
+            ),
+            run = "java -jar build/" .. name .. ".jar",
         },
         lua = {
             artifact = "src/main.lua",

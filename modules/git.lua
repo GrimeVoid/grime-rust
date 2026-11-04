@@ -25,30 +25,34 @@ local function print_help()
 %s%sGrime Git%s — Полноценное управление Git-репозиториями и версионированием
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime git <команда> [аргументы...]
-    grime <директория/модуль> : git <команда> [аргументы...]
+    grime git <команда|-флаг> [аргументы...]
+    grime <директория/модуль> : git <команда|-флаг> [аргументы...]
 
-%sКОМАНДЫ:%s
-    %sstatus%s                   Форматированный статус рабочего дерева и ветки
-    %scommit [сообщение]%s        Фиксация изменений (поддерживает ввод из конвейера)
-    %slog [n]%s                  История коммитов в виде таблицы (по умолчанию 10)
-    %sdiff [файл]%s              Просмотр незафиксированных изменений
-    %sbranch [имя]%s             Список веток или создание новой ветки
-    %scheckout <ветка>%s         Переключение на указанную ветку
-    %sls-files [путь]%s          Быстрый срез отслеживаемых файлов без мусора
-    %ssnapshot [сообщение]%s     Моментальная точка сохранения с временной меткой
-    %sinit [путь]%s              Инициализация нового Git-репозитория
-    %shelp, -h, --help%s         Показать эту справку
+%sКОМАНДЫ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
+    %sstatus, -s, --status%s           Форматированный статус рабочего дерева и ветки
+    %scommit, -c, --commit [msg]%s     Фиксация изменений (поддерживает --staged и ввод из конвейера)
+    %slog, -l, --log [-n N | N]%s      История коммитов в виде таблицы (по умолчанию 10)
+    %sdiff, -d, --diff [файл]%s        Просмотр незафиксированных изменений
+    %sbranch, -b, --branch [имя]%s     Список веток или создание новой ветки
+    %scheckout, -co, --checkout <в>%s  Переключение на указанную ветку
+    %sls-files, --ls-files [путь]%s    Быстрый срез отслеживаемых файлов без мусора
+    %ssnapshot, --snapshot [msg]%s     Моментальная точка сохранения с временной меткой
+    %sadd, -a, --add [файлы...]%s      Индексация файлов (по умолчанию -A)
+    %sinit, -i, --init [путь]%s        Инициализация нового Git-репозитория
+    %shelp, -h, --help%s               Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime git status
-    echo "feat: добавить логирование" | grime git commit
-    grime git log 5
-    grime app MyTool : git status
+    grime git -status
+    echo "feat: добавить логирование" | grime git --commit
+    grime git -log 5
+    grime app MyTool : git -s
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
@@ -338,12 +342,42 @@ function M.snapshot(dir, msg_suffix)
     return M.commit(target, commit_msg, true)
 end
 
+local GIT_COMMANDS = {
+    status = "status", s = "status", st = "status",
+    commit = "commit", c = "commit", ci = "commit",
+    log = "log", l = "log", history = "log",
+    diff = "diff", d = "diff",
+    branch = "branch", b = "branch", br = "branch",
+    checkout = "checkout", co = "checkout", switch = "checkout",
+    ["ls-files"] = "ls-files", files = "ls-files", ls_files = "ls-files", ls = "ls-files",
+    snapshot = "snapshot", snap = "snapshot",
+    add = "add", a = "add",
+    init = "init", i = "init",
+    help = "help", h = "help",
+}
+
 --- Главная точка входа CLI
 function M.main()
     local args = ctx.args or {}
-    local subcmd = args[1]
+    local raw_subcmd = args[1]
 
-    if not subcmd or subcmd == "help" or subcmd == "-h" or subcmd == "--help" then
+    if not raw_subcmd then
+        print_help()
+        return
+    end
+
+    for _, a in ipairs(args) do
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
+            print_help()
+            return
+        end
+    end
+
+    local clean_cmd = tostring(raw_subcmd):lower():gsub("^%-+", "")
+    local subcmd = GIT_COMMANDS[clean_cmd] or clean_cmd
+
+    if subcmd == "help" then
         print_help()
         return
     end
@@ -363,7 +397,7 @@ function M.main()
     end
 
     if subcmd ~= "init" and not M.is_git_repo(target_dir) then
-        ctx.fail("[Grime Git] Каталог не является Git-репозиторием: " .. tostring(target_dir))
+        ctx.fail("Каталог не является Git-репозиторием: " .. tostring(target_dir))
         return
     end
 
@@ -431,12 +465,20 @@ function M.main()
     if subcmd == "commit" then
         local auto_add = true
         local msg_tokens = {}
+        local skip_next = false
         for i = 2, #args do
-            local a = args[i]
-            if a == "--staged" or a == "--no-add" or a == "-s" then
-                auto_add = false
+            if skip_next then
+                skip_next = false
             else
-                table.insert(msg_tokens, a)
+                local a = args[i]
+                if a == "--staged" or a == "-staged" or a == "--no-add" or a == "-no-add" or a == "-s" then
+                    auto_add = false
+                elseif (a == "-m" or a == "--message") and args[i + 1] then
+                    table.insert(msg_tokens, args[i + 1])
+                    skip_next = true
+                else
+                    table.insert(msg_tokens, a)
+                end
             end
         end
         local msg = table.concat(msg_tokens, " ")
@@ -467,7 +509,20 @@ function M.main()
     end
 
     if subcmd == "log" then
-        local limit = tonumber(args[2]) or 10
+        local limit = 10
+        for i = 2, #args do
+            local a = tostring(args[i])
+            if (a == "-n" or a == "--limit" or a == "-limit") and tonumber(args[i + 1]) then
+                limit = tonumber(args[i + 1])
+                break
+            elseif a:match("^%-n(%d+)$") then
+                limit = tonumber(a:match("^%-n(%d+)$"))
+                break
+            elseif tonumber(a) then
+                limit = tonumber(a)
+                break
+            end
+        end
         local commits, err = M.log(target_dir, limit)
         if not commits then
             ctx.fail(err)
@@ -522,6 +577,7 @@ function M.main()
 
     if subcmd == "branch" then
         local bname = args[2]
+        if bname and bname:match("^%-") then bname = nil end
         local res, err = M.branch(target_dir, bname)
         if not res then
             ctx.fail(err)
@@ -543,6 +599,7 @@ function M.main()
 
     if subcmd == "checkout" then
         local bname = args[2]
+        if bname == "-b" and args[3] then bname = args[3] end
         local res, err = M.checkout(target_dir, bname)
         if not res then
             ctx.fail(err)
@@ -553,7 +610,7 @@ function M.main()
         return
     end
 
-    if subcmd == "ls-files" or subcmd == "files" or subcmd == "ls_files" then
+    if subcmd == "ls-files" then
         local filter = args[2]
         local files, err = M.ls_files(target_dir, filter)
         if not files then
@@ -580,10 +637,12 @@ function M.main()
         return
     end
 
-    if subcmd == "snapshot" or subcmd == "snap" then
+    if subcmd == "snapshot" then
         local msg_tokens = {}
         for i = 2, #args do
-            table.insert(msg_tokens, args[i])
+            if args[i] ~= "-m" and args[i] ~= "--message" then
+                table.insert(msg_tokens, args[i])
+            end
         end
         local extra_msg = table.concat(msg_tokens, " ")
         if #extra_msg == 0 then
@@ -606,7 +665,7 @@ function M.main()
         return
     end
 
-    ctx.fail("Неизвестная команда git: '" .. subcmd .. "'. Используйте 'grime git --help' для справки.")
+    ctx.fail("Неизвестная команда git: '" .. tostring(raw_subcmd) .. "'. Используйте 'grime git --help' для справки.")
 end
 
 -- Если модуль запускается как оркестрируемый скрипт

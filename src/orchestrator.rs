@@ -248,8 +248,10 @@ impl Orchestrator {
                 pipeline_payload.as_ref(),
                 parsed.force,
             ) {
+                let err_msg = format!("Ошибка установки контекста для '{}': {}", mod_name, e);
+                eprintln!("{} {}", "[Grime Error]".red().bold(), err_msg);
                 Self::run_cleanup(&self.engine, &executed_modules);
-                return Err(format!("Ошибка установки контекста для '{}': {}", mod_name, e));
+                return Err(err_msg);
             }
 
             // Событие старта шага
@@ -267,15 +269,35 @@ impl Orchestrator {
             let result = match self.engine.execute_module(&mod_name) {
                 Ok(res) => res,
                 Err(e) => {
+                    let err_str = e.to_string();
+                    if self.canceller.is_cancelled() || err_str.contains("[CANCELLATION]") {
+                        let reason = self
+                            .canceller
+                            .get_reason()
+                            .unwrap_or_else(|| "Конвейер прерван пользователем".to_string());
+                        eprintln!("{} {}", "[Grime Cancelled]".yellow().bold(), reason);
+                        Self::run_cleanup(&self.engine, &executed_modules);
+                        self.engine.emit_event(
+                            "pipeline.failed",
+                            serde_json::json!({
+                                "module": mod_name,
+                                "cancelled": true,
+                                "reason": reason
+                            }),
+                        );
+                        return Err(format!("Конвейер прерван: {}", reason));
+                    }
+                    let full_err = format!("Ошибка выполнения модуля '{}': {}", mod_name, err_str);
+                    eprintln!("{} {}", "[Grime Error]".red().bold(), full_err);
                     Self::run_cleanup(&self.engine, &executed_modules);
                     self.engine.emit_event(
                         "pipeline.failed",
                         serde_json::json!({
                             "module": mod_name,
-                            "error": e.to_string()
+                            "error": err_str
                         }),
                     );
-                    return Err(format!("Ошибка выполнения модуля '{}': {}", mod_name, e));
+                    return Err(full_err);
                 }
             };
 
@@ -283,7 +305,15 @@ impl Orchestrator {
                 let err_msg = result
                     .error_message
                     .unwrap_or_else(|| format!("Модуль '{}' завершился со статусом ошибки", mod_name));
-                eprintln!("{} {}", "[Grime Error]".red().bold(), err_msg);
+                let clean_display = err_msg
+                    .trim_start_matches("[Grime Error] ")
+                    .trim_start_matches("[Grime] ")
+                    .trim_start_matches("[ERROR] ");
+                if parsed.force {
+                    eprintln!("{} {}", "[Grime Ignored Error]".yellow().bold(), clean_display);
+                } else {
+                    eprintln!("{} {}", "[Grime Error]".red().bold(), clean_display);
+                }
 
                 // Вызов функции cleanup() у задействованных модулей в порядке LIFO
                 Self::run_cleanup(&self.engine, &executed_modules);

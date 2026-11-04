@@ -9,19 +9,35 @@ use mlua::{Lua, Table};
 pub fn register_ui_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
     let ui_tbl = lua.create_table()?;
 
-    // grime.ui.log(msg)
-    ui_tbl.set(
-        "log",
-        lua.create_function(|_, msg: String| {
-            eprintln!("{} {}", "[Grime]".cyan().bold(), msg);
-            Ok(())
-        })?,
-    )?;
+    // grime.ui.log(msg) и grime.ui.info(msg)
+    let log_fn = lua.create_function(|_, msg: String| {
+        eprintln!("{} {}", "[Grime]".cyan().bold(), msg);
+        Ok(())
+    })?;
+    ui_tbl.set("log", log_fn.clone())?;
+    ui_tbl.set("info", log_fn)?;
 
-    // grime.ui.error(msg)
+    // grime.ui.error(msg) — сохраняет ошибку в контексте шага для однократного вывода ядром Grime
     ui_tbl.set(
         "error",
-        lua.create_function(|_, msg: String| {
+        lua.create_function(|lua_ctx, msg: String| {
+            if let Ok(g) = lua_ctx.globals().get::<Table>("grime") {
+                if let Ok(c) = g.get::<Table>("ctx") {
+                    let existing = c.get::<mlua::Value>("_error_message").ok();
+                    let has_existing = match existing {
+                        Some(mlua::Value::String(s)) => s
+                            .to_str()
+                            .map(|s_ref| !s_ref.is_empty() && s_ref != "Шаг конвейера завершился ошибкой")
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if !has_existing {
+                        let _ = c.set("_error_message", msg.clone());
+                    }
+                    let _ = c.set("_ui_error_msg", msg);
+                    return Ok(());
+                }
+            }
             eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
             Ok(())
         })?,

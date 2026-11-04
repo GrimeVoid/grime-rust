@@ -26,9 +26,9 @@ local ACTIONS = {
     build = "build", b = "build", compile = "build",
     history = "history", hist = "history", log = "history",
     rollback = "rollback", revert = "rollback",
-    update = "update", up = "update",
+    update = "update", up = "update", u = "update",
     bundle = "bundle", pack = "bundle",
-    diff = "diff", closures = "diff",
+    diff = "diff", closures = "diff", d = "diff",
     gc = "gc", clean = "gc", cleanup = "gc", ["garbage-collect"] = "gc",
     optimise = "optimise", optimize = "optimise", opt = "optimise", dedup = "optimise",
     add = "add", append = "add", ["in"] = "add",
@@ -36,8 +36,8 @@ local ACTIONS = {
     install = "install", i = "install", ["profile-install"] = "install", get = "install",
     uninstall = "uninstall", un = "uninstall", ["remove-profile"] = "uninstall", ["rm-profile"] = "uninstall", erase = "uninstall",
     enter = "enter", shell = "enter", sh = "enter",
-    run = "run", ["exec"] = "run", ["do"] = "run", ["run-in"] = "run", e = "run",
-    check = "check", test = "check", validate = "check",
+    run = "run", ["exec"] = "run", ["do"] = "run", ["run-in"] = "run", e = "run", r = "run",
+    check = "check", test = "check", validate = "check", c = "check",
     help = "help",
 }
 
@@ -407,7 +407,7 @@ local function handle_run(target_dir, command_tokens, pure)
     -- Аудит безопасности путей (Path Sovereignty)
     local allowed, reason = utils.classify_paths(cmd_target, cmd_args, target_dir, ctx)
     if not allowed then
-        ctx.fail(string.format("[Grime Nix] Отказ: %s", reason))
+        ctx.fail(string.format("Отказ: %s", reason))
         return
     end
 
@@ -679,52 +679,52 @@ local function print_help()
 %s%sGrime Nix%s — Управление Flake-окружениями разработки и профилями Nix
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime nix [команда] [аргументы/пакеты...]
+    grime nix [команда|-флаг] [аргументы/пакеты...]
 
-%sКОМАНДЫ:%s
-    %sbuild, b%s                Сборка проекта в изолированном Nix Flake (без загрязнения репозитория)
-                          grime nix build [проект/путь]
-    %sinit, create, new, flake%s Создать постоянный flake.nix в проекте (авто-тулчейн)
-                          grime nix init [пакеты...] [--force]
-    %senter, shell, sh%s      Войти в изолированный devShell (nix develop)
-                          grime nix enter [--pure]
-    %srun, exec%s             Выполнить команду в Flake devShell окружении
-                          grime nix run <команда...> [--pure]
-    %shistory, hist%s          История поколений профиля пользователя Nix
-                          grime nix history
-    %srollback%s               Откатить профиль Nix на предыдущее или указанное поколение
-                          grime nix rollback [--to <N>]
-    %supdate, up%s             Обновить входные зависимости флейка (nix flake update)
-                          grime nix update [каталог]
-    %sbundle%s                 Упаковать цель в автономный переносимый бинарник (nix bundle)
-                          grime nix bundle [цель] [-o вывод]
-    %sdiff%s                   Анализ изменений замыканий профиля (diff-closures)
-                          grime nix diff
-    %sinstall, i%s            Установить пакеты в профиль пользователя Nix
-                          grime nix install <пакеты...>
-    %suninstall%s              Удалить пакеты из профиля пользователя Nix
-                          grime nix uninstall <пакеты...>
-    %sgc, clean%s              Очистить неиспользуемые пути в Nix store (garbage collector)
-                          grime nix gc
-    %soptimise, opt%s          Дедупликация жестких ссылок в Nix store
-                          grime nix optimise
-    %scheck, validate%s        Проверить валидность конфигурации flake.nix
-                          grime nix check
-    %shelp, -h, --help%s       Показать эту справку
+%sКОМАНДЫ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
+    %sbuild, -b, --build%s          Сборка проекта в изолированном Nix Flake (без загрязнения репозитория)
+                                grime nix --build [проект/путь]
+    %sinit, -init, --flake%s        Создать постоянный flake.nix в проекте (авто-тулчейн)
+                                grime nix --init [пакеты...] [--force]
+    %senter, --enter, --shell%s     Войти в изолированный devShell (nix develop)
+                                grime nix --enter [--pure]
+    %srun, -r, --run, --exec%s      Выполнить команду в Flake devShell окружении
+                                grime nix --run <команда...> [--pure]
+    %shistory, --history, --hist%s  История поколений профиля пользователя Nix
+                                grime nix --history
+    %srollback, --rollback%s        Откатить профиль Nix на предыдущее или указанное поколение
+                                grime nix --rollback [--to <N>]
+    %supdate, -u, --update%s        Обновить входные зависимостей флейка (nix flake update)
+                                grime nix --update [каталог]
+    %sbundle, --bundle%s            Упаковать цель в автономный переносимый бинарник (nix bundle)
+                                grime nix --bundle [цель] [-o вывод]
+    %sdiff, -d, --diff%s            Анализ изменений замыканий профиля (diff-closures)
+                                grime nix --diff
+    %sinstall, -i, --install%s      Установить пакеты в профиль пользователя Nix
+                                grime nix --install <пакеты...>
+    %suninstall, --uninstall%s      Удалить пакеты из профиля пользователя Nix
+                                grime nix --uninstall <пакеты...>
+    %sgc, --gc, --clean%s           Очистить неиспользуемые пути в Nix store (garbage collector)
+                                grime nix --gc
+    %soptimise, --optimise%s        Дедупликация жестких ссылок в Nix store
+                                grime nix --optimise
+    %scheck, -c, --check%s          Проверить валидность конфигурации flake.nix
+                                grime nix --check
+    %shelp, -h, --help%s            Показать эту справку
 
-%sФЛАГИ:%s
-    %s--force, -f%s           Перезаписать существующий файл flake.nix
-    %s--pure%s                Изолированный запуск без переменных хоста
-    %s--to <N>%s              Целевое поколение для отката (rollback)
-    %s-o, --out-link%s        Путь для сохранения бандла (bundle)
+%sДОПОЛНИТЕЛЬНЫЕ ФЛАГИ:%s
+    %s--force, -f%s                 Перезаписать существующий файл flake.nix
+    %s--pure, -pure%s               Изолированный запуск без переменных хоста
+    %s--to, -to <N>%s               Целевое поколение для отката (rollback)
+    %s-o, --out-link <путь>%s       Путь для сохранения бандла (bundle)
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime nix init : nix build              # Генерация flake.nix и сборка
-    grime nix run cargo test                # Запуск тестов внутри Flake devShell
-    grime nix history                       # Просмотр истории поколений профиля
-    grime nix rollback                      # Откат профиля на предыдущую версию
-    grime nix update                        # Обновление зависимостей flake.lock
-    grime nix bundle nixpkgs#hello          # Упаковка в автономный переносимый бинарник
+    grime nix --init : nix --build          # Генерация flake.nix и сборка
+    grime nix -run cargo test               # Запуск тестов внутри Flake devShell
+    grime nix -history                      # Просмотр истории поколений профиля
+    grime nix -rollback --to 3              # Откат профиля на указанную версию
+    grime nix -update                       # Обновление зависимостей flake.lock
+    grime nix -bundle nixpkgs#hello         # Упаковка в автономный переносимый бинарник
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
@@ -762,7 +762,7 @@ function main()
 
     for _, a in ipairs(raw_args) do
         local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" then
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
             print_help()
             return
         end
@@ -777,11 +777,16 @@ function main()
         actions = ACTIONS,
         default_action = "init",
         flags = {
-            force = { "-f", "--force" },
-            pure = { "--pure" },
-            flake = { "--flake" },
-            gpu = { "--gpu", "--gl" },
-            nv = { "--nv", "--prime", "--nvidia" },
+            force = { "-f", "--force", "-force" },
+            pure = { "--pure", "-pure" },
+            flake = { "--flake", "-flake" },
+            gpu = { "--gpu", "--gl", "-gpu", "-gl" },
+            nv = { "--nv", "--prime", "--nvidia", "-nv", "-prime", "-nvidia" },
+            help = { "help", "-h", "--help", "-help" },
+        },
+        value_flags = {
+            to = { "--to", "-to" },
+            out_link = { "-o", "--out-link", "-out-link" },
         },
         detect_dir = true,
     })
@@ -789,7 +794,7 @@ function main()
     local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "init"
 
-    if action == "help" then
+    if action == "help" or parsed.flags.help then
         print_help()
         return
     end
@@ -840,27 +845,29 @@ function main()
     elseif action == "history" then
         handle_history()
     elseif action == "rollback" then
-        local to_gen = nil
-        for i, a in ipairs(command_tokens) do
-            if a == "--to" and command_tokens[i + 1] then
-                to_gen = command_tokens[i + 1]
-                break
-            elseif tostring(a):match("^%d+$") then
-                to_gen = a
-                break
+        local to_gen = parsed.flags.to
+        if not to_gen then
+            for i, a in ipairs(command_tokens) do
+                if (a == "--to" or a == "-to") and command_tokens[i + 1] then
+                    to_gen = command_tokens[i + 1]
+                    break
+                elseif tostring(a):match("^%d+$") then
+                    to_gen = a
+                    break
+                end
             end
         end
         handle_rollback(to_gen)
     elseif action == "update" then
         handle_update(target_dir)
     elseif action == "bundle" then
-        local out_link = nil
+        local out_link = parsed.flags.out_link
         local clean_tokens = {}
         local skip_next = false
         for i, a in ipairs(command_tokens) do
             if skip_next then
                 skip_next = false
-            elseif (a == "-o" or a == "--out-link") and command_tokens[i + 1] then
+            elseif (a == "-o" or a == "--out-link" or a == "-out-link") and command_tokens[i + 1] then
                 out_link = command_tokens[i + 1]
                 skip_next = true
             else

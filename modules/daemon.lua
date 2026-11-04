@@ -8,15 +8,16 @@ local function print_help()
     print(string.format([[
 %s%sGrime Daemon%s — Управление фоновым сервисом-демоном (grime --daemon-server) и контекстом терминала
 
-%sИСПОЛЬЗОВАНИЕ:%s
-    grime daemon status                                 Проверить статус демона и сокета
-    grime daemon ping                                   Проверить отклик демона
-    grime daemon start                                  Запустить демон в фоне (grime --daemon-server)
-    grime daemon stop                                   Остановить работающий демон
-    grime daemon restart                                Перезапустить демон
-    grime daemon feed <cmd> [code] [cwd] [output]       Записать событие терминала в StateBus
-    grime daemon dump                                   Показать сохраненный терминальный контекст
-    grime daemon clear                                  Очистить контекст терминала в шине
+%sИСПОЛЬЗОВАНИЕ (все команды поддерживаются с '-' / '--' и без):%s
+    grime daemon [status|-s|--status]                   Проверить статус демона и сокета
+    grime daemon <ping|-p|--ping>                       Проверить отклик демона
+    grime daemon <start|--start>                        Запустить демон в фоне (grime --daemon-server)
+    grime daemon <stop|--stop|--kill>                   Остановить работающий демон
+    grime daemon <restart|-r|--restart>                 Перезапустить демон
+    grime daemon <feed|--feed> <cmd> [code] [cwd] [out] Записать событие терминала в StateBus
+    grime daemon <dump|-d|--dump>                       Показать сохраненный терминальный контекст
+    grime daemon <clear|-c|--clear>                     Очистить контекст терминала в шине
+    grime daemon <help|-h|--help>                       Показать эту справку
 
 %sОПИСАНИЕ:%s
     Управляет жизненным циклом демона Grime и оперативным контекстом активного терминала,
@@ -145,11 +146,33 @@ local function analyze_terminal_history(history)
     }
 end
 
+local DAEMON_ACTIONS = {
+    status = "status", s = "status", st = "status",
+    ping = "ping", p = "ping",
+    start = "start", run = "start",
+    stop = "stop", kill = "stop",
+    restart = "restart", r = "restart", reload = "restart",
+    feed = "feed", record = "feed",
+    dump = "dump", d = "dump",
+    clear = "clear", c = "clear", reset = "clear",
+    help = "help", h = "help",
+}
+
 function main()
     local args = ctx.args or {}
-    local action = args[1] or "status"
+    for _, a in ipairs(args) do
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
+            print_help()
+            return
+        end
+    end
 
-    if action == "help" or action == "-h" or action == "--help" then
+    local raw_action = tostring(args[1] or "status")
+    local clean_action = raw_action:lower():gsub("^%-+", "")
+    local action = DAEMON_ACTIONS[clean_action] or clean_action
+
+    if action == "help" then
         print_help()
         return
     end

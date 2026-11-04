@@ -8,22 +8,23 @@ local function print_help()
     print(string.format([[
 %s%sGrime Bus%s — Управление разделяемым состоянием (StateBus) и событиями (EventBus)
 
-%sИСПОЛЬЗОВАНИЕ:%s
-    grime bus get <ключ>
-    grime bus set <ключ> <значение>
-    grime bus has <ключ>
-    grime bus rm <ключ>
-    grime bus list [префикс]
-    grime bus emit <событие> [json_данные]
+%sИСПОЛЬЗОВАНИЕ (все команды поддерживаются с '-' / '--' и без):%s
+    grime bus <get|-g|--get> <ключ>
+    grime bus <set|-s|--set> <ключ> <значение>
+    grime bus <has|--has> <ключ>
+    grime bus <rm|-d|--rm|--delete> <ключ>
+    grime bus <list|-l|--list|--keys> [префикс]
+    grime bus <emit|-e|--emit> <событие> [json_данные]
+    grime bus <help|-h|--help>
 
 %sОПИСАНИЕ:%s
     Предоставляет интерфейс командной строки для чтения и записи разделяемого
     состояния Grime, а также для публикации событий шины конвейера.
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime bus set pipeline.target "release" : cmd cargo build
-    grime bus get pipeline.counter
-    grime bus list
+    grime bus --set pipeline.target "release" : cmd cargo build
+    grime bus -get pipeline.counter
+    grime bus --list
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -87,6 +88,16 @@ local function normalize_bus_key(key)
     return trimmed
 end
 
+local BUS_ACTIONS = {
+    get = "get", g = "get",
+    set = "set", s = "set",
+    has = "has", exists = "has",
+    rm = "rm", delete = "rm", del = "rm", d = "rm", remove = "rm",
+    list = "list", ls = "list", keys = "list", l = "list",
+    emit = "emit", e = "emit", pub = "emit",
+    help = "help", h = "help",
+}
+
 function main()
     local args = ctx.args or {}
     if #args == 0 then
@@ -94,8 +105,19 @@ function main()
         return
     end
 
-    local action = args[1]
-    if action == "help" or action == "-h" or action == "--help" then
+    for _, a in ipairs(args) do
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
+            print_help()
+            return
+        end
+    end
+
+    local raw_action = tostring(args[1] or "")
+    local clean_action = raw_action:lower():gsub("^%-+", "")
+    local action = BUS_ACTIONS[clean_action] or clean_action
+
+    if action == "help" then
         print_help()
         return
     end
@@ -182,7 +204,7 @@ function main()
             return
         end
         ctx.success(tostring(exists))
-    elseif action == "rm" or action == "delete" or action == "del" then
+    elseif action == "rm" then
         local raw_key = args[2] or ctx.input or ctx.pipeline_input
         local key = normalize_bus_key(raw_key)
         if not key or #key == 0 then
@@ -198,7 +220,7 @@ function main()
         end
         ctx.log("Ключ '" .. key .. "' удален из шины")
         ctx.success(key)
-    elseif action == "list" or action == "ls" or action == "keys" then
+    elseif action == "list" then
         local prefix = args[2]
         local keys_map = {}
         if grime.bus.keys then
@@ -251,7 +273,7 @@ function main()
             ctx.fail("Не удалось опубликовать событие '" .. event_name .. "': " .. tostring(err))
         end
     else
-        ctx.fail("Неизвестная команда bus: " .. action)
+        ctx.fail("Неизвестная команда bus: " .. raw_action)
     end
 end
 

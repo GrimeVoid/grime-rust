@@ -100,6 +100,7 @@ pub fn init_context_table(
             let c: Table = g.get("ctx")?;
             c.set("_status", true)?;
             c.set("_error_message", Value::Nil)?;
+            c.set("_ui_error_msg", Value::Nil)?;
 
             if let Some(v) = val {
                 if let Some(payload) = extract_payload(v.clone()) {
@@ -132,7 +133,7 @@ pub fn init_context_table(
         })?,
     )?;
 
-    // ctx.fail(msg)
+    // ctx.fail(msg) — сохраняет первопричину ошибки при каскадных вызовах
     ctx_tbl.set(
         "fail",
         lua.create_function(|lua_ctx, msg: Option<String>| {
@@ -140,10 +141,16 @@ pub fn init_context_table(
             let g: Table = globals.get("grime")?;
             let c: Table = g.get("ctx")?;
             c.set("_status", false)?;
-            c.set(
-                "_error_message",
-                msg.unwrap_or_else(|| "Шаг конвейера завершился ошибкой".to_string()),
-            )?;
+            let new_msg = msg.unwrap_or_else(|| "Шаг конвейера завершился ошибкой".to_string());
+            if let Ok(Value::String(existing)) = c.get::<Value>("_error_message") {
+                let existing_str = existing.to_str()?.to_string();
+                if !existing_str.is_empty() && existing_str != "Шаг конвейера завершился ошибкой" {
+                    c.set("_return_value", Value::Nil)?;
+                    c.set("_return_payload", Value::Nil)?;
+                    return Ok(());
+                }
+            }
+            c.set("_error_message", new_msg)?;
             c.set("_return_value", Value::Nil)?;
             c.set("_return_payload", Value::Nil)?;
             Ok(())
@@ -203,7 +210,24 @@ pub fn init_context_table(
     )?;
     ctx_tbl.set(
         "error",
-        lua.create_function(|_, msg: String| {
+        lua.create_function(|lua_ctx, msg: String| {
+            if let Ok(g) = lua_ctx.globals().get::<Table>("grime") {
+                if let Ok(c) = g.get::<Table>("ctx") {
+                    let existing = c.get::<Value>("_error_message").ok();
+                    let has_existing = match existing {
+                        Some(Value::String(s)) => s
+                            .to_str()
+                            .map(|s_ref| !s_ref.is_empty() && s_ref != "Шаг конвейера завершился ошибкой")
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if !has_existing {
+                        let _ = c.set("_error_message", msg.clone());
+                    }
+                    let _ = c.set("_ui_error_msg", msg);
+                    return Ok(());
+                }
+            }
             eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
             Ok(())
         })?,
@@ -669,6 +693,7 @@ pub fn update_step_context(
     ctx.set("_status", true)?;
     ctx.set("_exit_code", 0)?;
     ctx.set("_error_message", Value::Nil)?;
+    ctx.set("_ui_error_msg", Value::Nil)?;
     ctx.set("_return_value", Value::Nil)?;
     ctx.set("_return_payload", Value::Nil)?;
     ctx.set("_target_dir_changed", false)?;

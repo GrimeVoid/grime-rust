@@ -212,8 +212,8 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
             0
         }
         Ok(None) => 0,
-        Err(err) => {
-            eprintln!("[Grime] Конвейер остановлен из-за ошибки: {}", err);
+        Err(_err) => {
+            // Сообщение об ошибке уже выведено ядром (Orchestrator) в едином формате [Grime Error]
             1
         }
     }

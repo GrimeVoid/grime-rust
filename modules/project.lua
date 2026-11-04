@@ -143,7 +143,8 @@ local function handle_rename(projects_root, args)
     projects_root = ctx.normalize_path(projects_root)
     local clean_args = {}
     for _, a in ipairs(args) do
-        if a ~= "rename" and a ~= "mv" and a ~= "path" and a ~= "-p" and a ~= "--path" then
+        local stripped = tostring(a):lower():gsub("^%-+", "")
+        if stripped ~= "rename" and stripped ~= "ren" and stripped ~= "mv" and stripped ~= "move" and stripped ~= "path" and stripped ~= "p" then
             table.insert(clean_args, a)
         end
     end
@@ -365,35 +366,37 @@ local function print_help()
 %s%sGrime Project%s — Управление проектами по языкам разработки
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime project <команда> [язык] [имя_проекта] [аргументы...]
-    grime project [язык] [имя_проекта] <команда>
+    grime project <команда|-флаг> [язык] [имя_проекта] [аргументы...]
+    grime project [язык] [имя_проекта] <команда|-флаг>
 
-%sКОМАНДЫ:%s
-    %slist, ls%s               Показать список проектов разработки
-                          grime project list [язык] [фильтр]
-    %sinit, new, create%s      Создать новый проект по шаблону
-                          grime project init cpp MyGame
-                          grime project init rust Tool
-    %sbuild, b, compile%s      Сборка проекта
-                          grime project build MyGame
-    %srun, r, start%s          Запуск проекта (с автосборкой при изменениях)
-                          grime project run MyGame [аргументы...]
-    %sdelete, rm%s             Удалить проект
-                          grime project rm MyGame
-    %sclear, clean, reset%s    Сбросить проект к чистому шаблону
-                          grime project clear MyGame
-    %srename, mv%s             Переименовать проект
-                          grime project rename OldName NewName
-    %spath, -p%s               Получить путь к директории проекта (для конвейеров)
-                          grime project path MyGame
-    %shelp, -h, --help%s       Показать эту справку
+%sКОМАНДЫ И ФЛАГИ ДЕЙСТВИЙ (с '-' / '--' или без):%s
+    %s-l, --list, list, ls%s       Показать список проектов разработки
+                              grime project -list [язык] [фильтр]
+    %s-i, --init, init, new%s      Создать новый проект по шаблону
+                              grime project -init cpp MyGame
+                              grime project init rust Tool
+    %s-b, --build, build%s         Сборка проекта
+                              grime project -build MyGame
+    %s-r, --run, run, start%s      Запуск проекта (с автосборкой при изменениях)
+                              grime project -run MyGame [-- аргументы...]
+    %s-rm, --delete, delete, rm%s  Удалить проект
+                              grime project -rm MyGame
+    %s--clear, clear, clean%s      Сбросить проект к чистому шаблону
+                              grime project --clear MyGame
+    %s--rename, rename, mv%s       Переименовать проект
+                              grime project --rename OldName NewName
+    %s-p, --path, path%s           Получить путь к директории проекта (для конвейеров)
+                              grime project -path MyGame
+    %s--nix, -nix%s                Принудительная сборка/запуск в изолированном Nix Flake
+    %s--force, -f%s                Перезаписать непустую директорию при инициализации
+    %s-h, --help, help%s           Показать эту справку
 
 %sПОДДЕРЖИВАЕМЫЕ ЯЗЫКИ:%s
-    cpp (C++), rust (Rust), python (Python), java (Java), lua (Lua/LuaJIT)
+    cpp (-cpp, C++), rust (-rust, -rs), python (-python, -py), java (-java), lua (-lua)
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime project MyGame path : cmd nvim CMakeLists.txt
-    grime project MyTool path : aider "Добавь тесты для парсера"
+    grime project MyGame -path : cmd nvim CMakeLists.txt
+    grime project MyTool -path : aider "Добавь тесты для парсера"
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -406,6 +409,8 @@ local function print_help()
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
+    "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m"
@@ -420,8 +425,9 @@ function main()
     end
 
     for _, a in ipairs(raw_args) do
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
-        if matched == "--help" or matched == "-h" or a == "help" then
+        if a == "--" or a == "//" then break end
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--help", "-h", "-help" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or matched == "-help" or a == "help" then
             print_help()
             return
         end
@@ -434,15 +440,23 @@ function main()
         default_action = nil,
         flags = {
             path_requested = { "path", "-p", "--path", "-path" },
-            help = { "help", "-h", "--help" },
+            help = { "help", "-h", "--help", "-help" },
             force = { "-f", "--force", "-force" },
-            nix = { "--nix" },
+            nix = { "--nix", "-nix" },
+        },
+        value_flags = {
+            lang = { "--lang", "-lang" },
         },
         categories = { language = LANGUAGE_ALIASES },
         detect_dir = true,
     })
 
     local parsed = cls:parse(ctx.args, ctx.target_dir)
+
+    if parsed.flags.lang and type(parsed.flags.lang) == "string" then
+        local l_low = parsed.flags.lang:lower():gsub("^%-+", "")
+        parsed.categories.language = LANGUAGE_ALIASES[l_low] or l_low
+    end
 
     if parsed.flags.help or parsed.action == "help" then
         print_help()

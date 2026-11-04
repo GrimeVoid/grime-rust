@@ -732,7 +732,11 @@ impl GrimeLuaEngine {
         let ctx: mlua::Table = grime.get("ctx")?;
 
         let mut status: bool = ctx.get("_status").unwrap_or(true);
-        let mut error_msg: Option<String> = ctx.get("_error_message").ok();
+        let mut error_msg: Option<String> = ctx
+            .get::<Option<String>>("_error_message")
+            .ok()
+            .flatten()
+            .or_else(|| ctx.get::<Option<String>>("_ui_error_msg").ok().flatten());
         let mut ret_val: Option<String> = ctx.get("_return_value").ok();
         let mut ret_payload: Option<PipelinePayload> = ctx
             .get::<Option<PipelinePayload>>("_return_payload")

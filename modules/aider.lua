@@ -4,10 +4,11 @@ description = "AI-ассистент парного программирован
 
 local ctx = grime.ctx
 local utils = require("languages.utils")
+local scanner = require("languages.scanner")
 
 local GRIME_CONVENTIONS = [[
 
-[GRIME CONVENTIONS & EXECUTION PROTOCOL]:
+[GRIME CONVENTIONS & SYSTEM ARCHITECTURE]:
 1. СТРОГИЙ КОНТРОЛЬ ЗАПУСКА (ЗАПРЕТ САМОВОЛЬНОГО ИСПОЛНЕНИЯ):
    - Если пользователь задал теоретический вопрос, запросил справку, консультацию, анализ кода или архитектурный совет:
      ОТВЕЧАЙ ТОЛЬКО ТЕКСТОМ В MARKDOWN! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО генерировать исполняемые теги <grime_exec> или <grime_spawn>!
@@ -19,17 +20,71 @@ local GRIME_CONVENTIONS = [[
    - При явной просьбе пользователя команды выполняются через:
      <grime_exec [cwd="..."]>команда</grime_exec>
    - СТРОЖАЙШЕ ЗАПРЕЩЕНЫ sudo, su, doas, pkexec и любые операции за пределами $HOME.
-3. АКТУАЛЬНЫЙ СТЕК GRIME (Single-Binary Rust v1.1.0, манифест "Всё, что может быть не установлено, не должно быть установлено"):
-   - Модуль пакетов: `grime pkg search <запрос>`, `grime pkg run <утилита> [args]` (вместо устаревшего gpsearch).
-   - Модуль проектов: `grime project init <lang> [name|.]`, `grime project build [name|.]`, `grime project run [name|.]` (Auto-Toolchain / Nix Zero-Dirty-Tree). Поддерживаются C++, Rust, Python, Java.
-   - Модуль приложений: `grime app new`, `grime app run [--detach]`, `grime app bundle`, `grime app snapshot`, `grime app rollback`.
-   - Модуль контейнеров: `grime box [name] run <cmd>` (вместо устаревшего dbox-run).
-   - Синтаксис конвейеров: модули разделяются двоеточием `:`, приложения разделяются "->", флаги утилит после `--`.
+3. ВЫСОКОУРОВНЕВАЯ ЭКОСИСТЕМА GRIME (Grime-RS v1.1.0, High-Level First):
+   - Стандарт флагов: все флаги и действия указываются со знаком минус (`-` или `--`), например `-new`, `-build`, `-run`, `-path`, `-list`, `-rm`, `-lang`, `-detach`, `-force`, `-help`. Для передачи флагов внешним утилитам без перехвата ядром используется разделитель `//` или `--`.
+   - Модуль проектов (`project`): `grime project -init <lang> <name>`, `grime project -build [name]`, `grime project -run [name]`, `grime project -path <name>`, `grime project -list`, `grime project -clear <name>`, `grime project -rm <name>`. Поддерживаются: `cpp`, `rust`, `python`, `java`, `lua`.
+   - Модуль приложений (`app`): `grime app -new <name> [-lang <lang>] [промпт]`, `grime app -build <name>`, `grime app -run <name> [-detach]`, `grime app -stop <name>`, `grime app -path [name]`, `grime app -list`, `grime app -ps`, `grime app -bundle <name>`, `grime app -snapshot <name>`, `grime app -rollback <name>`, `grime app -diff <name>`, `grime app -rm <name>`.
+   - Модуль пакетов (`pkg`): `grime pkg -search <запрос>`, `grime pkg -list`, `grime pkg -run <утилита> [args]`, `grime pkg pacman -install <pkg>`, `grime pkg nix -install <pkg>`.
+   - Модуль Nix (`nix`): `grime nix -init`, `grime nix -build`, `grime nix -run`, `grime nix -history`, `grime nix -rollback`, `grime nix -update`, `grime nix -bundle`, `grime nix -gc`, `grime nix -optimise`.
+   - Модуль контейнеров (`box`): `grime box <name> -run <cmd>`, `grime box -list`, `grime box -export bin <path>`.
+   - Модуль Git (`git`): `grime git -status`, `grime git -diff`, `grime git -commit <msg>`, `grime git -snapshot [msg]`, `grime git -log`, `grime git -ls-files`.
+   - Модули диагностики и инфраструктуры: `grime doctor`, `grime bus -set <k> <v>`, `grime bus -get <k>`, `grime log`, `grime list`, `grime daemon`.
+   - Синтаксис конвейеров: шаги разделяются двоеточием `:` (например: `grime project -path MyProj : box fedora-box : project -build : host : project -run`). Модуль `host` возвращает исполнение из контейнера/DevShell обратно на хост.
+   - Принцип разделения ответственности (Rust Core vs Lua Modules): нативное ядро Grime на Rust (`src/*.rs`) отвечает ТОЛЬКО за управление модулями, парсинг конвейера, изоляцию потоков и шину состояния (`StateBus`). Вся прикладная логика, команды, сборка и интеграции реализуются ИСКЛЮЧИТЕЛЬНО внутри декларативных Lua-модулей (`modules/*.lua`).
 4. ШИНА И КОНВЕЙЕР:
    - Сохранение данных в StateBus (RAM демона):
      <grime_bus key="pipeline.<key>" type="json">{"k":"v"}</grime_bus>
    - Передача промпта следующему шагу конвейера:
      <next_agent_prompt>инструкция</next_agent_prompt>
+]]
+
+local GRIME_MODULE_STANDARD = [[
+
+[СТАНДАРТ РАЗРАБОТКИ И ДОРАБОТКИ МОДУЛЕЙ GRIME (LuaJIT + Grime-RS API)]:
+При создании нового модуля или доработке существующего модуля в `modules/*.lua` ты ОБЯЗАН строго соблюдать архитектуру GRIME и переиспользовать общий код:
+- АРХИТЕКТУРНЫЙ ИМПЕРАТИВ: Ядро Grime на Rust отвечает только за диспетчеризацию модулей, конвейер и шину памяти. Вся логика конкретного функционала должна быть полностью реализована в Lua-модуле без необходимости менять Rust-ядро.
+
+1. ОБЯЗАТЕЛЬНОЕ ПЕРЕИСПОЛЬЗОВАНИЕ СУЩЕСТВУЮЩИХ МОДУЛЕЙ (`modules/languages/*.lua`):
+   - Парсинг аргументов и флагов со знаком минус:
+     `local argparse = require("languages.argparse")`
+     Используй `argparse.new({ actions = ..., flags = ..., categories = ..., detect_dir = ... })` и `cls:parse(ctx.args, ctx.target_dir)`.
+   - Общие утилиты, цвета, проверка бинарников и путей:
+     `local utils = require("languages.utils")`
+     Переиспользуй: `utils.ANSI`, `utils.utf8_len`, `utils.pad_utf8`, `utils.has_binary(bin, ctx)`, `utils.shell_escape(s)`, `utils.normalize_path(p, cwd, ctx)`, `utils.classify_paths(cmd, args, cwd, ctx)`, `utils.get_apps_root(ctx)`, `utils.get_projects_root(ctx)`, `utils.generate_flake_nix(...)`, `utils.generate_app_manifest(...)`.
+   - Для языковых адаптеров (`modules/languages/<lang>.lua`):
+     Наследуйся от `local BaseAdapter = require("languages.base")` через `setmetatable(BaseAdapter.new({...}), LangAdapter)`.
+   - Для логирования и Git при необходимости используй `local log = require("log")` и `local git = require("git")`.
+
+2. НАТИВНОЕ API ЯДРА GRIME-RS (глобальная таблица `grime`):
+   - `local ctx = grime.ctx`:
+     * `ctx.args` (таблица аргументов шага), `ctx.target_dir` (текущая рабочая папка шага), `ctx.pipeline_input` / `ctx.input` (вход от предыдущего шага конвейера), `ctx.has_next_step` (bool: есть ли следующий шаг в конвейере), `ctx.force` (bool).
+     * `ctx.set_target_dir(dir)` — смена рабочей директории для следующих шагов конвейера.
+     * `ctx.module_return(val)` / `ctx.success(val)` — возврат результата шага в конвейер.
+     * `ctx.fail(msg)` — завершение шага с ошибкой. ВАЖНО: вызывай ТОЛЬКО `ctx.fail(msg)` и `return`! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать `grime.ui.error(msg)` или `io.stderr:write(msg)` с тем же текстом перед `ctx.fail(msg)`, так как ядро Grime само выводит сообщение из `ctx.fail`!
+     * `ctx.run_process(argv, cwd, env)` -> код возврата (int); `ctx.capture(argv_or_cmd, cwd, env)` -> `{ code, stdout, stderr }`.
+     * `ctx.exists(path)`, `ctx.is_dir(path)`, `ctx.is_file(path)`, `ctx.mkdir_p(path)`, `ctx.delete(path, recursive)`, `ctx.copy(src, dst)`, `ctx.move(src, dst)`, `ctx.normalize_path(path)`, `ctx.log(msg)`, `ctx.warn(msg)`.
+   - `grime.fs`: `read(path)`, `write(path, content)`, `list(dir)`, `exists(path)`, `is_dir(path)`, `is_file(path)`, `normalize(path)`.
+   - `grime.ui`: `info(msg)`, `ok(msg)` / `success(msg)`, `warn(msg)`, `error(msg)`, `step(msg)`, `header(msg)`, `print_table(rows, headers)`.
+   - `grime.bus`: `set(key, val)`, `get(key)`, `remove(key)`, `list(prefix)`.
+   - `grime.fuzzy`: `find_best_match(query, candidates, threshold)`, `match_flag(tok, flags, threshold)`, `similarity(a, b)`.
+   - `grime.str`: `trim(s)`, `split(s, sep)`, `starts_with(s, prefix)`, `ends_with(s, suffix)`, `shell_escape(s)`, `to_snake_case(s)`.
+   - ЗАПРЕЩЕНО использовать `os.exit()` и `io.popen()` внутри модулей!
+
+3. СТРУКТУРА ФАЙЛА МОДУЛЯ:
+   - Первые строки файла:
+     ```lua
+     -- Summary: Краткое описание модуля
+     -- Description: Полное описание модуля
+     description = "Краткое описание модуля"
+     ```
+   - Все флаги и подкоманды в модуле и в `print_help()` должны поддерживать стандарт со знаком минус (`-list`, `--list`, `-path`, `--path`, `-p`, `-help`, `--help`, `-h`) с сохранением обратной совместимости без минуса.
+   - В конце файла обязательно возвращать таблицу:
+     ```lua
+     return {
+         main = main,
+         description = description,
+     }
+     ```
 ]]
 
 local TERMINAL_DIAGNOSTIC_RULES = [[
@@ -38,6 +93,325 @@ local TERMINAL_DIAGNOSTIC_RULES = [[
 1. ИССЛЕДОВАНИЕ ФАЙЛОВ (ОБЯЗАТЕЛЬНО): Если в выводе терминала/компилятора есть пути к файлам и номера строк, ты ОБЯЗАН изучить эти файлы и проблемные строки перед внесением правок. Запрещено гадать без проверки реального кода.
 2. ЭВРИСТИКА УСПЕХА: Если в истории терминала команда падала, но позже аналогичная команда завершилась успешно (exit code 0), считай проблему уже решенной пользователем и не пытайся её чинить повторно.
 ]]
+
+--- Приведение строки к нижнему регистру с поддержкой UTF-8 кириллицы (А-Я, Ё) и ASCII (A-Z)
+local function utf8_lower(s)
+    if type(s) ~= "string" or s == "" then return "" end
+    local res = s:lower()
+    -- А..П (U+0410..U+041F: \208\144..\208\159) -> а..п (\208\176..\208\191)
+    res = res:gsub("\208([\144-\159])", function(c)
+        return "\208" .. string.char(c:byte(1) + 32)
+    end)
+    -- Р..Я (U+0420..U+042F: \208\160..\208\175) -> р..я (\209\128..\209\143)
+    res = res:gsub("\208([\160-\175])", function(c)
+        return "\209" .. string.char(c:byte(1) - 32)
+    end)
+    -- Ё (U+0401: \208\129) -> ё (\209\145)
+    res = res:gsub("\208\129", "\209\145")
+    return res
+end
+
+--- Проверка вхождения отдельного слова (или основы слова) с учетом границ UTF-8/ASCII
+local function has_word_token(low_text, word)
+    local padded = " " .. low_text:gsub("[%p%s]+", " ") .. " "
+    return padded:find(" " .. word .. " ", 1, true) ~= nil
+end
+
+local function has_word_prefix(low_text, prefix)
+    local padded = " " .. low_text:gsub("[.,!?;:\"'%(%)%[%]%{%}/\\|<>]+", " ") .. " "
+    for tok in padded:gmatch("%S+") do
+        if tok:sub(1, #prefix) == prefix then
+            return true
+        end
+    end
+    return false
+end
+
+--- Приоритетное извлечение явно указанного языка/стека из текста пользовательского промпта
+local function extract_lang_from_prompt(user_prompt)
+    if type(user_prompt) ~= "string" or user_prompt == "" then
+        return nil
+    end
+
+    local low = utf8_lower(user_prompt)
+    -- Убираем упоминание служебного манифеста app.lua, чтобы не путать его с выбором языка Lua
+    low = low:gsub("app%.lua", " ")
+
+    -- Удаляем конструкции с явным отрицанием ("не на c++", "без python", "not in java", "instead of cpp")
+    local negation_patterns = {
+        "не на%s+[%S]+",
+        "без%s+[%S]+",
+        "кроме%s+[%S]+",
+        "вместо%s+[%S]+",
+        "not%s+in%s+[%S]+",
+        "not%s+on%s+[%S]+",
+        "not%s+[%S]+",
+        "instead%s+of%s+[%S]+",
+        "without%s+[%S]+",
+    }
+    local cleaned = low
+    for _, pat in ipairs(negation_patterns) do
+        cleaned = cleaned:gsub(pat, " ")
+    end
+
+    -- 1. Высший приоритет: явные целевые конструкции ("на питоне", "на python", "на джаве", "in python", "using java", "стек python")
+    local explicit_targets = {
+        { lang = "python", patterns = {
+            "на%s+python", "на%s+pyhon", "на%s+phyton", "на%s+питон", "на%s+пайтон", "на%s+py%f[%A]",
+            "in%s+python", "using%s+python", "with%s+python",
+            "язык[еа]?%s+python", "язык[еа]?%s+питон", "язык[еа]?%s+пайтон",
+            "стек[еа]?%s+python", "стек[еа]?%s+питон", "стек[еа]?%s+пайтон",
+        }},
+        { lang = "java", patterns = {
+            "на%s+java%f[%A]", "на%s+джав", "на%s+яв[еуыой]",
+            "in%s+java%f[%A]", "using%s+java%f[%A]", "with%s+java%f[%A]",
+            "язык[еа]?%s+java%f[%A]", "язык[еа]?%s+джав", "язык[еа]?%s+яв[аеу]",
+            "стек[еа]?%s+java%f[%A]", "стек[еа]?%s+джав",
+        }},
+        { lang = "rust", patterns = {
+            "на%s+rust", "на%s+раст", "на%s+rs%f[%A]",
+            "in%s+rust", "using%s+rust", "with%s+rust",
+            "язык[еа]?%s+rust", "язык[еа]?%s+раст",
+            "стек[еа]?%s+rust", "стек[еа]?%s+раст",
+        }},
+        { lang = "lua", patterns = {
+            "на%s+lua", "на%s+luajit", "на%s+луа",
+            "in%s+lua", "using%s+lua", "with%s+lua",
+            "язык[еа]?%s+lua", "язык[еа]?%s+луа",
+            "стек[еа]?%s+lua", "стек[еа]?%s+луа",
+        }},
+        { lang = "cpp", patterns = {
+            "на%s+c%+%+", "на%s+cpp", "на%s+cxx", "на%s+си%+%+", "на%s+с%+%+", "на%s+плюсах",
+            "in%s+c%+%+", "in%s+cpp", "using%s+c%+%+", "using%s+cpp",
+            "язык[еа]?%s+c%+%+", "язык[еа]?%s+cpp", "язык[еа]?%s+си%+%+",
+            "стек[еа]?%s+c%+%+", "стек[еа]?%s+cpp",
+        }},
+    }
+
+    for _, group in ipairs(explicit_targets) do
+        for _, pat in ipairs(group.patterns) do
+            if cleaned:find(pat) then
+                return group.lang
+            end
+        end
+    end
+
+    -- 2. Проверка по прямому упоминанию языков, компиляторов и ключевых фреймворков
+    -- Python (включая частые опечатки pyhon / phyton / piton)
+    if has_word_prefix(cleaned, "python")
+        or has_word_prefix(cleaned, "pyhon")
+        or has_word_prefix(cleaned, "phyton")
+        or has_word_prefix(cleaned, "piton")
+        or has_word_prefix(cleaned, "питон")
+        or has_word_prefix(cleaned, "пайтон")
+        or has_word_token(cleaned, "py")
+        or cleaned:find("%.py%f[%A]")
+        or has_word_token(cleaned, "fastapi")
+        or has_word_token(cleaned, "flask")
+        or has_word_token(cleaned, "django")
+        or has_word_token(cleaned, "asyncio")
+        or has_word_token(cleaned, "aiohttp")
+        or has_word_token(cleaned, "pandas")
+        or has_word_token(cleaned, "numpy")
+        or has_word_token(cleaned, "pytest")
+        or has_word_token(cleaned, "pydantic")
+    then
+        return "python"
+    end
+
+    -- Java (исключая javascript)
+    local cleaned_no_js = cleaned:gsub("javascript", " ")
+    if has_word_token(cleaned_no_js, "java")
+        or has_word_prefix(cleaned_no_js, "джав")
+        or has_word_token(cleaned_no_js, "ява")
+        or has_word_token(cleaned_no_js, "яве")
+        or has_word_token(cleaned_no_js, "яву")
+        or has_word_token(cleaned_no_js, "явой")
+        or has_word_token(cleaned_no_js, "jvm")
+        or has_word_token(cleaned_no_js, "jdk")
+        or has_word_token(cleaned_no_js, "javac")
+        or has_word_token(cleaned_no_js, "maven")
+        or has_word_token(cleaned_no_js, "gradle")
+        or has_word_token(cleaned_no_js, "spring")
+        or has_word_token(cleaned_no_js, "springboot")
+        or cleaned_no_js:find("%.java%f[%A]")
+    then
+        return "java"
+    end
+
+    -- Rust (проверяем точные словоформы, чтобы не срабатывать на "возраст" / "растение")
+    if has_word_token(cleaned, "rust")
+        or has_word_token(cleaned, "rustc")
+        or has_word_token(cleaned, "раст")
+        or has_word_token(cleaned, "расте")
+        or has_word_token(cleaned, "раста")
+        or has_word_token(cleaned, "растом")
+        or has_word_token(cleaned, "расту")
+        or has_word_token(cleaned, "cargo")
+        or has_word_token(cleaned, "tokio")
+        or has_word_token(cleaned, "axum")
+        or has_word_token(cleaned, "actix")
+        or has_word_token(cleaned, "serde")
+        or cleaned:find("%.rs%f[%A]")
+    then
+        return "rust"
+    end
+
+    -- Lua
+    if has_word_token(cleaned, "lua")
+        or has_word_token(cleaned, "luajit")
+        or has_word_token(cleaned, "луа")
+        or cleaned:find("%.lua%f[%A]")
+    then
+        return "lua"
+    end
+
+    -- C++
+    if cleaned:find("c%+%+")
+        or cleaned:find("си%+%+")
+        or cleaned:find("с%+%+")
+        or has_word_token(cleaned, "cpp")
+        or has_word_token(cleaned, "cxx")
+        or has_word_token(cleaned, "плюсах")
+        or has_word_token(cleaned, "плюсы")
+        or has_word_token(cleaned, "cmake")
+        or has_word_token(cleaned, "g++")
+        or has_word_token(cleaned, "clang++")
+        or cleaned:find("%.cpp%f[%A]")
+        or cleaned:find("%.hpp%f[%A]")
+    then
+        return "cpp"
+    end
+
+    return nil
+end
+
+--- Предметная эвристика выбора стека (когда язык не назван в промпте явно)
+local function heuristic_stack_from_prompt(user_prompt)
+    if type(user_prompt) ~= "string" or user_prompt == "" then
+        return "python"
+    end
+    local low = utf8_lower(user_prompt)
+
+    -- Задачи для Lua (плагины, хуки, модули Grime, конфигураторы)
+    local lua_keywords = { "плагин", "plugin", "модуль grime", "grime module", "хук", "hook", "neovim", "nvim" }
+    for _, kw in ipairs(lua_keywords) do
+        if low:find(kw, 1, true) then return "lua" end
+    end
+
+    -- Задачи для C++ (3D, графика, шейдеры, игры, OpenGL/Vulkan, низкоуровневая физика/матрицы)
+    local cpp_keywords = { "opengl", "vulkan", "raylib", "sdl", "шейдер", "shader", "3d", "рендер", "render", "движок", "игр", "game", "физик", "симуляц" }
+    for _, kw in ipairs(cpp_keywords) do
+        if low:find(kw, 1, true) then return "cpp" end
+    end
+
+    -- Задачи для Java (корпоративные системы, банкинг, учет, склад, магазин, расписание, ООП-сервисы)
+    local java_keywords = { "банк", "бухгалтер", "склад", "инвентар", "магазин", "заказ", "платеж", "предприят", "enterprise", "crm", "erp", "реестр", "библиотек" }
+    for _, kw in ipairs(java_keywords) do
+        if low:find(kw, 1, true) then return "java" end
+    end
+
+    -- Задачи для Rust (системные демоны, сокеты, прокси, сети, шифрование, криптография, мониторы ресурсов)
+    local rust_keywords = { "демон", "daemon", "сокет", "socket", "прокси", "proxy", "шифрован", "крипто", "crypto", "бенчмарк", "benchmark", "монитор систем", "сниффер", "многопоточ" }
+    for _, kw in ipairs(rust_keywords) do
+        if low:find(kw, 1, true) then return "rust" end
+    end
+
+    -- Для скриптов, парсеров, работы с текстом/JSON/CSV/API/CLI/аналитикой/автоматизацией и общих задач — Python
+    return "python"
+end
+
+--- Парсинг ответа LLM при классификации стека
+local function parse_llm_stack_response(stdout)
+    if type(stdout) ~= "string" or stdout == "" then
+        return nil
+    end
+    local allowed = {
+        python = "python", py = "python", python3 = "python",
+        java = "java",
+        rust = "rust", rs = "rust",
+        lua = "lua", luajit = "lua",
+        cpp = "cpp", ["c++"] = "cpp", cxx = "cpp",
+    }
+
+    local lines = {}
+    for line in stdout:gmatch("[^\r\n]+") do
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed ~= ""
+            and not trimmed:match("^Tokens:")
+            and not trimmed:match("^Cost:")
+            and not trimmed:match("^Warning:")
+            and not trimmed:match("^Aider ")
+            and not trimmed:match("^Model:")
+            and not trimmed:match("^Git ")
+            and not trimmed:match("^Repo%-map:")
+        then
+            table.insert(lines, trimmed:lower())
+        end
+    end
+
+    -- Ищем с конца вывода точное слово-ответ модели
+    for i = #lines, 1, -1 do
+        local ln = lines[i]:gsub("[`*'\".,!?;:()<>%[%]%{%}]+", " ")
+        local first_tok = ln:match("^%s*(%S+)%s*$")
+        if first_tok and allowed[first_tok] then
+            return allowed[first_tok]
+        end
+        for tok in ln:gmatch("%S+") do
+            if allowed[tok] then
+                return allowed[tok]
+            end
+        end
+    end
+
+    return nil
+end
+
+--- Определение оптимального стека: сначала 100% приоритет языка из промпта, затем LLM/эвристика
+local function classify_stack(user_prompt)
+    if not user_prompt or user_prompt == "" then
+        return "python"
+    end
+
+    -- 1. Безусловный приоритет: если пользователь явно указал язык в промпте — выбираем его!
+    local explicit = extract_lang_from_prompt(user_prompt)
+    if explicit then
+        return explicit
+    end
+
+    -- 2. Запрос к Aider-Архитектору (в изолированной директории /tmp без сканирования чужого репозитория)
+    local config_aider = ctx.get_config and ctx.get_config("aider", "auto") or "auto"
+    local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
+    if utils.has_binary(aider_bin, ctx) then
+        local classify_prompt = string.format([[Выбери наиболее подходящий язык программирования для реализации следующей задачи:
+"%s"
+
+Доступные стеки:
+- python : скрипты, парсеры, обработка текста/JSON/CSV, CLI-утилиты, автоматизация, веб/API, вычисления, быстрые утилиты.
+- java   : приложения со структурированной ООП-моделью, бизнес-логика, учетные системы, кроссплатформенные сервисы.
+- rust   : системные утилиты, сетевые демоны, высоконагруженные сервисы, работа с бинарными данными и ОС.
+- lua    : легкие плагины, конфигурационные скрипты, расширения экосистемы Grime.
+- cpp    : 3D-графика, игры, низкоуровневые алгоритмы реального времени, работа с памятью/железом.
+
+Ответь СТРОГО ОДНИМ СЛОВОМ из списка (python, java, rust, lua, cpp) без пояснений и знаков препинания.]], user_prompt)
+        ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
+        local cres = ctx.capture({
+            "timeout", "15",
+            aider_bin,
+            "--no-git", "--map-tokens", "0", "--exit", "--yes-always", "--no-fancy-input", "--no-pretty",
+            "-m", classify_prompt,
+        }, "/tmp")
+        if cres and cres.code == 0 and cres.stdout and cres.stdout ~= "" then
+            local parsed_lang = parse_llm_stack_response(cres.stdout)
+            if parsed_lang then
+                return parsed_lang
+            end
+        end
+    end
+
+    -- 3. Предметная эвристика, если LLM не вызвана или не ответила
+    return heuristic_stack_from_prompt(user_prompt)
+end
 
 --- Получение текущего дампа терминального контекста из StateBus или state.json
 local function get_terminal_dump()
@@ -138,14 +512,7 @@ local function resolve_dir_or_project(arg)
     end
 
     -- 2. Проверяем в projects_root
-    local projects_root = (ctx.paths and ctx.paths.projects)
-        or (ctx.get_path and ctx.get_path("projects"))
-        or (ctx.projects_root and ctx.projects_root())
-    if not projects_root or projects_root == "" then
-        local home = os.getenv("HOME") or ""
-        projects_root = (home ~= "" and (home .. "/Projects")) or "./projects"
-    end
-    projects_root = ctx.normalize_path(projects_root)
+    local projects_root = utils.get_projects_root(ctx)
     if projects_root and ctx.exists(projects_root) then
         for _, lang in ipairs({ "cpp", "python", "rust", "java", "lua", "C++" }) do
             local cand = projects_root .. "/" .. lang .. "/" .. arg
@@ -159,6 +526,15 @@ local function resolve_dir_or_project(arg)
         end
     end
 
+    -- 3. Проверяем в apps_root
+    local apps_root = utils.get_apps_root(ctx)
+    if apps_root and ctx.exists(apps_root) then
+        local app_cand = apps_root .. "/" .. arg
+        if ctx.is_dir(app_cand) then
+            return app_cand
+        end
+    end
+
     return nil
 end
 
@@ -168,7 +544,7 @@ local function replace_placeholders_in_dir(dir, replacements)
     if res and res.code == 0 and res.stdout then
         for raw_line in res.stdout:gmatch("[^\r\n]+") do
             local file_path = raw_line:match("^%s*(.-)%s*$")
-            if file_path ~= "" and ctx.is_file(file_path) then
+            if file_path ~= "" and not file_path:find("/%.git/") and ctx.is_file(file_path) then
                 local f = io.open(file_path, "r")
                 if f then
                     local content = f:read("*a")
@@ -194,70 +570,100 @@ local function replace_placeholders_in_dir(dir, replacements)
     end
 end
 
---- Определение оптимального стека через Aider
-local function classify_stack(user_prompt)
-    if not user_prompt or user_prompt == "" then
-        return "cpp"
+--- Генерация актуального манифеста app.lua с учётом специфики сборки языков (включая быстрый автономный Java JAR)
+local function build_app_manifest_content(app_name, lang, desc)
+    lang = (lang or "python"):lower()
+    if lang == "java" then
+        local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. app_name)
+        local lines = {
+            "return {",
+            string.format("    name = %q,", app_name),
+            string.format("    description = %q,", clean_desc),
+            '    type = "java",',
+            string.format("    artifact = %q,", "build/" .. app_name .. ".jar"),
+            string.format(
+                "    build = %q,",
+                string.format(
+                    "mkdir -p build/classes && javac -encoding UTF-8 -d build/classes $(find src -name '*.java') && jar --create --file build/%s.jar --main-class Main -C build/classes .",
+                    app_name
+                )
+            ),
+            string.format("    run = %q,", "java -jar build/" .. app_name .. ".jar"),
+            "    special_dependencies = {},",
+            "    detached = false,",
+            "}",
+        }
+        return table.concat(lines, "\n") .. "\n"
     end
-    local low = user_prompt:lower()
-    if low:find("python") or low:find("питон") then return "python" end
-    if low:find("rust") or low:find("раст") then return "rust" end
-    if low:find("cpp") or low:find("c%+%+") or low:find("си%+%+") then return "cpp" end
-    if low:find("java") or low:find("джава") then return "java" end
-    if low:find("lua") or low:find("луа") then return "lua" end
+    return utils.generate_app_manifest(app_name, lang, desc)
+end
 
-    local config_aider = ctx.get_config and ctx.get_config("aider", "auto") or "auto"
-    local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
-    local classify_prompt = string.format([[Выбери оптимальный язык программирования для следующей задачи консольного приложения:
-"%s"
-
-Допустимые варианты: cpp, rust, python, java, lua.
-Критерии выбора:
-1. Ноль внешних зависимостей (zero external dependencies).
-2. Максимальная скорость исполнения и производительность.
-3. Минимальный вес артефакта и потребление ресурсов.
-
-Ответь СТРОГО ОДНИМ СЛОВОМ из списка: cpp, rust, python, java, lua. Не добавляй никаких пояснений, знаков препинания или другого текста.]], user_prompt)
-    ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
-    local cres = ctx.capture({ "timeout", "30", aider_bin, "--no-git", "--exit", "--yes-always", "--no-fancy-input", "-m", classify_prompt })
-    if cres.code == 0 and cres.stdout and cres.stdout ~= "" then
-        local out_l = cres.stdout:lower()
-        for _, l in ipairs({ "cpp", "rust", "python", "java", "lua" }) do
-            if out_l:find(l, 1, true) then
-                return l
-            end
+--- Определение основного файла исходного кода по языку
+local function get_entry_file_for_lang(lang, app_dir)
+    local map = {
+        python = "src/main.py",
+        java   = "src/Main.java",
+        rust   = "src/main.rs",
+        lua    = "src/main.lua",
+        cpp    = "src/main.cpp",
+    }
+    local cand = map[(lang or "python"):lower()] or "src/main.py"
+    if app_dir and ctx.exists(app_dir .. "/" .. cand) then
+        return cand
+    end
+    local fallbacks = { "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp" }
+    for _, f in ipairs(fallbacks) do
+        if app_dir and ctx.exists(app_dir .. "/" .. f) then
+            return f
         end
     end
-    return "cpp"
+    return cand
 end
 
 --- Запуск субагента Aider для реализации приложения
-local function run_dev(app_dir, prompt, app_name)
+local function run_dev(app_dir, prompt, app_name, lang)
     local grime_bin = os.getenv("GRIME_BIN") or "grime"
+    local stack_lang = lang or (prompt and extract_lang_from_prompt(prompt)) or (app_name and extract_lang_from_prompt(app_name)) or "python"
+    local entry_file = get_entry_file_for_lang(stack_lang, app_dir)
     if prompt and prompt ~= "" then
-        local dev_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и команды сборки/запуска.", prompt)
-        ctx.log(string.format("Запуск субагента Aider для реализации '%s'...", app_name or "app"))
-        local code = ctx.run_process({ "timeout", "180", grime_bin, "aider", "-m", dev_prompt }, app_dir)
+        local dev_prompt = string.format(
+            "%s\n\n[GRIME APP REQUIREMENT]:\n" ..
+            "- Целевой язык и стек приложения: %s (СТРОГО используй язык %s!).\n" ..
+            "- Редактируй существующий исходный файл `%s` в директории `%s` (НЕ создавай дублирующие файлы в корне проекта мимо `src/`!).\n" ..
+            "- Убедись, что код компилируется/выполняется без ошибок, а манифест `app.lua` содержит актуальные поля `type = %q`, `artifact`, `build` и `run`.",
+            prompt, stack_lang, stack_lang, entry_file, app_dir, stack_lang
+        )
+        ctx.log(string.format("Запуск субагента Aider для реализации '%s' (стек: %s, файл: %s)...", app_name or "app", stack_lang, entry_file))
+        local cmd = { "timeout", "180", grime_bin, "aider" }
+        if ctx.exists(app_dir .. "/" .. entry_file) then
+            table.insert(cmd, entry_file)
+        end
+        if ctx.exists(app_dir .. "/app.lua") then
+            table.insert(cmd, "app.lua")
+        end
+        table.insert(cmd, "-m")
+        table.insert(cmd, dev_prompt)
+        local code = ctx.run_process(cmd, app_dir)
         if code ~= 0 then
             ctx.warn(string.format("Aider завершился с кодом %d (продолжаем с базовым шаблоном)", code))
         end
         return code
     else
         ctx.log("Запуск интерактивной сессии Aider для проектирования приложения...")
-        return ctx.run_process({ grime_bin, "aider" }, app_dir)
+        local cmd = { grime_bin, "aider" }
+        if ctx.exists(app_dir .. "/" .. entry_file) then
+            table.insert(cmd, entry_file)
+        end
+        if ctx.exists(app_dir .. "/app.lua") then
+            table.insert(cmd, "app.lua")
+        end
+        return ctx.run_process(cmd, app_dir)
     end
 end
 
 --- Получение корня каталога приложений
 local function get_apps_root()
-    local root = (ctx.paths and ctx.paths.apps)
-        or (ctx.get_path and ctx.get_path("apps"))
-        or (ctx.apps_root and ctx.apps_root())
-    if not root or root == "" then
-        local home = os.getenv("HOME") or ""
-        root = (home ~= "" and (home .. "/.config/grime/apps")) or "./apps"
-    end
-    root = ctx.normalize_path(root)
+    local root = utils.get_apps_root(ctx)
     if not ctx.exists(root) then
         ctx.mkdir_p(root)
     end
@@ -266,11 +672,11 @@ end
 
 --- Скаффолдинг структуры приложения
 local function scaffold_app(app_dir, app_name, lang, prompt)
+    lang = (lang or "python"):lower()
     if not ctx.exists(app_dir) then
         ctx.mkdir_p(app_dir)
     end
 
-    -- Поиск шаблона
     local templates_root = (ctx.paths and ctx.paths.templates)
         or (ctx.get_path and ctx.get_path("templates"))
         or (ctx.templates_root and ctx.templates_root())
@@ -281,49 +687,276 @@ local function scaffold_app(app_dir, app_name, lang, prompt)
     templates_root = ctx.normalize_path(templates_root)
     local tpl_dir = templates_root .. "/" .. lang
     if not ctx.exists(tpl_dir) then
-        local dotfiles_tpl = "/home/danny/dotfiles/grime/templates/" .. lang
-        if ctx.exists(dotfiles_tpl) then
+        local home = os.getenv("HOME") or ""
+        local dotfiles_tpl = home .. "/dotfiles/grime/templates/" .. lang
+        if home ~= "" and ctx.exists(dotfiles_tpl) then
             tpl_dir = dotfiles_tpl
         end
     end
 
     if ctx.exists(tpl_dir) then
         ctx.copy(tpl_dir, app_dir)
-        ctx.log(string.format("Каркас проекта скопирован из шаблона '%s'", lang))
+        ctx.log(string.format("Каркас приложения скопирован из шаблона '%s'", lang))
     else
         ctx.mkdir_p(app_dir .. "/src")
     end
 
-    local desc = (prompt and prompt ~= "") and prompt or ("Grime application " .. app_name)
-    desc = desc:gsub("\n", " "):gsub('"', '\\"')
+    -- Для Java: удаляем устаревший шаблонный pom.xml с несуществующим com.example.App,
+    -- чтобы сборка шла быстро и надежно через javac + jar
+    if lang == "java" and ctx.exists(app_dir .. "/pom.xml") then
+        local pf = io.open(app_dir .. "/pom.xml", "r")
+        if pf then
+            local pcontent = pf:read("*a") or ""
+            pf:close()
+            if pcontent:find("com%.example%.App") and not ctx.exists(app_dir .. "/src/main/java") then
+                ctx.delete(app_dir .. "/pom.xml", true)
+            end
+        end
+    end
 
-    -- Плейсхолдеры для замены
+    -- Гарантируем наличие базового исходного файла точки входа для каждого языка
+    ctx.mkdir_p(app_dir .. "/src")
+    local ok_adp, adp = pcall(require, "languages." .. lang)
+    if ok_adp and adp and adp.create_default_files then
+        adp:create_default_files(app_dir, ctx, prompt)
+    end
+
+    local raw_desc = (prompt and prompt ~= "") and prompt or ("Grime application " .. app_name)
+    local escaped_desc = raw_desc:gsub("\n", " "):gsub('"', '\\"')
+
     local snake_name = grime.str.to_snake_case(app_name)
+    local kebab_name = app_name:lower():gsub("[%s_]", "-")
     local replacements = {
         ["{{PROJECT_NAME}}"] = app_name,
         ["{{PROJECT_NAME_LOWER}}"] = app_name:lower(),
         ["{{PROJECT_NAME_UPPER}}"] = app_name:upper(),
         ["{{PROJECT_NAME_SNAKE}}"] = snake_name,
-        ["{{PROJECT_DESCRIPTION}}"] = desc,
+        ["{{PROJECT_NAME_KEBAB}}"] = kebab_name,
+        ["{{PROJECT_DESCRIPTION}}"] = escaped_desc,
     }
     replace_placeholders_in_dir(app_dir, replacements)
 
-    -- Генерация манифеста app.lua при необходимости
+    -- Всегда записываем актуальный манифест app.lua по современному стандарту
     local manifest_path = app_dir .. "/app.lua"
-    if not ctx.is_file(manifest_path) then
-        local m_content = utils.generate_app_manifest(app_name, lang, desc)
-        local f = io.open(manifest_path, "w")
-        if f then
-            f:write(m_content)
-            f:close()
-            ctx.log("Сгенерирован манифест app.lua")
+    local m_content = build_app_manifest_content(app_name, lang, raw_desc)
+    local f = io.open(manifest_path, "w")
+    if f then
+        f:write(m_content)
+        f:close()
+    end
+
+    -- Автогенерация flake.nix
+    local flake_path = app_dir .. "/flake.nix"
+    if not ctx.is_file(flake_path) then
+        local scan = scanner.scan_project(app_dir, ctx)
+        local native_pkgs, lib_pkgs = utils.split_packages(scan.toolchain or {}, scanner)
+        local flake_content = utils.generate_flake_nix(app_name, native_pkgs, lib_pkgs)
+        local ff = io.open(flake_path, "w")
+        if ff then
+            ff:write(flake_content)
+            ff:close()
         end
     end
 
-    -- Инициализируем Git-репозиторий в папке приложения, если он еще не инициализирован
-    if not is_git_repo(app_dir) then
+    if not ctx.exists(app_dir .. "/.git") then
         ctx.capture({ "git", "init" }, app_dir)
     end
+    ctx.capture({ "git", "add", "-N", "." }, app_dir)
+end
+
+--- Определение путей к каталогам модулей GRIME (репозиторий и пользовательский конфиг)
+local function get_grime_modules_dirs()
+    local home = os.getenv("HOME") or "/home/danny"
+    local repo_dir = home .. "/Archive/_Programing_/rust/grime_pj/modules"
+    local config_dir = ((ctx.config_dir and ctx.config_dir()) or (home .. "/.config/grime")) .. "/modules"
+    local primary = ctx.exists(repo_dir) and repo_dir or config_dir
+    return primary, repo_dir, config_dir
+end
+
+--- Автораспознавание запроса на создание/доработку модуля GRIME из текста промпта
+local function detect_module_request(user_prompt, working_dir)
+    local primary_mods, repo_mods, config_mods = get_grime_modules_dirs()
+    if working_dir then
+        local norm_wd = utils.normalize_path(working_dir)
+        if norm_wd == repo_mods or norm_wd == config_mods
+            or norm_wd:find("/grime_pj/modules", 1, true)
+            or norm_wd:find("/%.config/grime/modules")
+            or norm_wd:find("/dotfiles/grime/modules", 1, true)
+        then
+            return true, nil
+        end
+    end
+
+    if type(user_prompt) ~= "string" or user_prompt == "" then
+        return false, nil
+    end
+
+    local low = utf8_lower(user_prompt)
+    local module_triggers = {
+        "модуль%s+([%a][%w_%-]*)",
+        "модуля%s+([%a][%w_%-]*)",
+        "модулю%s+([%a][%w_%-]*)",
+        "module%s+([%a][%w_%-]*)",
+    }
+
+    local is_mod_intent = low:find("новый модуль")
+        or low:find("допиши модуль")
+        or low:find("напиши модуль")
+        or low:find("создай модуль")
+        or low:find("добавь модуль")
+        or low:find("обнови модуль")
+        or low:find("исправь модуль")
+        or low:find("модуль grime")
+        or low:find("grime module")
+
+    if is_mod_intent then
+        local stop_words = {
+            grime = true, ["для"] = true, ["на"] = true, ["в"] = true,
+            ["который"] = true, ["с"] = true, ["по"] = true, ["и"] = true,
+            lua = true, luajit = true,
+        }
+        for _, pat in ipairs(module_triggers) do
+            for cand in low:gmatch(pat) do
+                if not stop_words[cand] then
+                    return true, cand:gsub("%.lua$", "")
+                end
+            end
+        end
+        return true, nil
+    end
+
+    return false, nil
+end
+
+--- Генерация стартового каркаса нового модуля GRIME по стандарту (с переиспользованием argparse и utils)
+local function scaffold_grime_module(mod_path, mod_name, prompt)
+    if ctx.exists(mod_path) then
+        return
+    end
+    local clean_desc = (prompt and prompt ~= "") and prompt:gsub("\n", " "):gsub('"', '\\"') or ("Модуль расширения Grime: " .. mod_name)
+    local template = string.format([[-- Summary: %s
+-- Description: %s
+description = %q
+
+local argparse = require("languages.argparse")
+local utils = require("languages.utils")
+
+local ctx = grime.ctx
+local ui = grime.ui
+local ANSI = utils.ANSI
+
+local ACTION_SYNONYMS = {
+    list = "list", ["-list"] = "list", ["--list"] = "list", ls = "list", ["-ls"] = "list",
+    run = "run", ["-run"] = "run", ["--run"] = "run", ["-r"] = "run",
+    path = "path", ["-path"] = "path", ["--path"] = "path", ["-p"] = "path",
+    help = "help", ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
+}
+
+local function print_help()
+    print(string.format(]] .. "[[" .. [[
+
+%%s%%sGrime %s%%s — %s
+
+%%sИСПОЛЬЗОВАНИЕ:%%s
+    grime %s [-команда] [аргументы...]
+
+%%sКОМАНДЫ И ФЛАГИ:%%s
+    %%s-list, --list, -ls%%s     Показать список элементов
+    %%s-run, --run, -r%%s        Выполнить основное действие модуля
+    %%s-path, --path, -p%%s      Получить путь (для конвейеров)
+    %%s-help, --help, -h%%s      Показать эту справку
+]] .. "]]" .. [[,
+    ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.BOLD, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET
+    ))
+end
+
+function main()
+    local raw_args = ctx.args or {}
+    for _, a in ipairs(raw_args) do
+        if a == "-h" or a == "--help" or a == "-help" or a == "help" then
+            print_help()
+            return
+        end
+    end
+
+    local cls = argparse.new({
+        actions = ACTION_SYNONYMS,
+        default_action = "run",
+        flags = {
+            help = { "-h", "--help", "-help", "help" },
+            path = { "-p", "-path", "--path", "path" },
+            force = { "-f", "-force", "--force" },
+        },
+    })
+
+    local parsed = cls:parse(raw_args, ctx.target_dir)
+    if parsed.flags.help or parsed.action == "help" then
+        print_help()
+        return
+    end
+
+    local pipe_in = ctx.pipeline_input or ctx.input
+    if parsed.action == "path" or parsed.flags.path then
+        local target = ctx.target_dir or "."
+        if ctx.set_target_dir then ctx.set_target_dir(target) end
+        ctx.module_return(target)
+        return
+    end
+
+    local result = (#parsed.args > 0 and table.concat(parsed.args, " ")) or pipe_in or "%s: ok"
+    if ctx.has_next_step then
+        ctx.module_return(result)
+    else
+        ui.ok(result)
+    end
+end
+
+return {
+    main = main,
+    description = description,
+}
+]], clean_desc, clean_desc, clean_desc, mod_name, clean_desc, mod_name, mod_name)
+
+    local f = io.open(mod_path, "w")
+    if f then
+        f:write(template)
+        f:close()
+        ctx.log(string.format("Создан базовый каркас модуля Grime по стандарту: %s", mod_path))
+    end
+end
+
+--- Валидация байткода модуля через luajit -bl и синхронизация между репозиторием и ~/.config/grime/modules
+local function validate_and_sync_module(mod_path)
+    if not mod_path or not ctx.is_file(mod_path) then return true end
+    if utils.has_binary("luajit", ctx) then
+        local vres = ctx.capture({ "luajit", "-bl", mod_path })
+        if vres.code ~= 0 then
+            ctx.warn(string.format("Предупреждение: ошибка синтаксиса LuaJIT в %s:\n%s", mod_path, vres.stderr or ""))
+            return false
+        end
+        ctx.log(string.format("✓ Синтаксис модуля '%s' успешно проверен (luajit -bl).", mod_path))
+    end
+
+    local _, repo_mods, config_mods = get_grime_modules_dirs()
+    local fname = mod_path:match("([^/]+%.lua)$")
+    if fname then
+        local norm_src = utils.normalize_path(mod_path)
+        local repo_target = utils.normalize_path(repo_mods .. "/" .. fname)
+        local cfg_target = utils.normalize_path(config_mods .. "/" .. fname)
+        if norm_src ~= repo_target and ctx.exists(repo_mods) then
+            pcall(ctx.copy, norm_src, repo_target)
+        end
+        if norm_src ~= cfg_target and ctx.exists(config_mods) then
+            pcall(ctx.copy, norm_src, cfg_target)
+        end
+    end
+    return true
 end
 
 --- Проверка безопасности команд перед исполнением
@@ -407,7 +1040,7 @@ local function validate_command_security(cmd_str, target_dir)
 end
 
 --- Выполнение системного действия с информированием и валидацией безопасности
-local function execute_ai_action(cmd_str, target_dir, source_tag)
+local function execute_ai_action(cmd_str, target_dir, _source_tag)
     cmd_str = cmd_str:match("^%s*(.-)%s*$")
     if not cmd_str or cmd_str == "" then
         return false
@@ -440,7 +1073,6 @@ local function execute_ai_action(cmd_str, target_dir, source_tag)
 
     local ok, err_msg = validate_command_security(cmd_str, target_dir)
     if not ok then
-        io.stderr:write(string.format("\27[1;31m%s\27[0m\n", err_msg))
         ctx.warn(err_msg)
         return false, err_msg
     end
@@ -487,7 +1119,7 @@ local function execute_ai_action(cmd_str, target_dir, source_tag)
 end
 
 --- Парсинг вывода Aider с поддержкой тегов <grime_bus>, <grime_spawn>, <grime_exec>/<grime_action> и <next_agent_prompt>
-local function parse_aider_tags(output, working_dir, user_prompt)
+local function parse_aider_tags(output, working_dir, _user_prompt)
     if not output or output == "" then
         return nil
     end
@@ -647,33 +1279,34 @@ end
 
 local function print_help()
     print(string.format([[
-%s%sGrime Aider%s — AI-ассистент парного программирования и генерации кода
+%s%sGrime Aider%s — AI-ассистент парного программирования, генерации приложений и модулей Grime
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime aider [путь_или_проект] [файлы...] [промпт...]
     grime aider [опции] -m "сообщение"
-    grime aider --app <имя> [--lang <язык>] [промпт...]
+    grime aider -app <имя> [-lang <язык>] [промпт...]
+    grime aider -module <имя_модуля> [промпт...]
     grime <модуль_с_контекстом> : aider [файлы...] [промпт...]
 
 %sРЕЖИМЫ РАБОТЫ:%s
     %sИнтерактивный%s         grime aider [проект] [файлы...]
-    %sHeadless (-m)%s         grime aider "Добавь тесты для функции парсинга"
-    %sСоздание приложения%s   grime aider --app MyTool --lang rust "CLI утилита"
-    %sКонвейерный%s           grime project MyProj path : aider "Рефакторинг CMake"
+    %sHeadless (-m)%s         grime aider -m "Добавь тесты для функции парсинга"
+    %sСоздание приложения%s   grime aider -app MyTool -lang python "CLI утилита"
+    %sРазработка модуля%s     grime aider -module mymod "Модуль мониторинга"
+    %sКонвейерный%s           grime project -path MyProj : aider "Рефакторинг CMake"
 
-%sФЛАГИ:%s
-    %s--app <name>%s          Создание и скаффолдинг приложения Grime App
-    %s-l, --lang <lang>%s     Язык шаблона (cpp, rust, python, java, lua)
-    %s-m, --message <msg>%s   Сообщение / промпт для неинтерактивного режима
-    %s--model <model>%s       Модель LLM (например, claude-3-5-sonnet, gpt-4o)
-    %shelp, -h, --help%s      Показать эту справку
+%sФЛАГИ (стандарт со знаком минус):%s
+    %s-a, -app, --app <name>%s        Создание и скаффолдинг приложения Grime App
+    %s-mod, -module, --module <m>%s   Создание или доработка модуля Grime по стандарту
+    %s-l, -lang, --lang <lang>%s      Язык шаблона (python, java, rust, cpp, lua)
+    %s-m, -message, --message <msg>%s Сообщение / промпт для неинтерактивного режима
+    %s-model, --model <model>%s       Модель LLM (например, claude-3-5-sonnet, gpt-4o)
+    %s-h, -help, --help%s             Показать эту справку
 
-%sИНТЕГРАЦИЯ С ШИНОЙ GRIME:%s
-    Aider автоматически поддерживает теги в выводе:
-    • <grime_exec [cwd="..."]>...</grime_exec>         — выполнение команд хоста (по явной просьбе)
-    • <grime_bus key="..." type="json">...</grime_bus> — запись в шину состояния
-    • <grime_spawn module="...">...</grime_spawn>       — вызов других модулей
-    • <next_agent_prompt>...</next_agent_prompt>       — передача следующему шагу
+%sИНТЕГРАЦИЯ С ЭКОСИСТЕМОЙ GRIME:%s
+    • Автоматическое определение языка из промпта (русский/английский, падежи, фреймворки)
+    • Автоматическое подключение общих библиотек (`languages/argparse.lua`, `languages/utils.lua`) при работе с модулями
+    • Поддержка тегов <grime_exec>, <grime_bus>, <grime_spawn>, <next_agent_prompt>
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -682,7 +1315,9 @@ local function print_help()
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[36m", "\27[0m",
+    "\27[36m", "\27[0m",
     "\27[1m", "\27[0m",
+    "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
@@ -692,6 +1327,14 @@ local function print_help()
     ))
 end
 
+local LANG_ALIASES = {
+    cpp = "cpp", ["c++"] = "cpp", cxx = "cpp", c = "cpp",
+    python = "python", py = "python", python3 = "python",
+    rust = "rust", rs = "rust",
+    java = "java", jav = "java",
+    lua = "lua", luajit = "lua",
+}
+
 function main()
     local raw_cli_args = {}
     for _, a in ipairs(ctx.args or {}) do
@@ -699,37 +1342,72 @@ function main()
     end
 
     local first_arg = raw_cli_args[1]
-    local first_flag = (type(first_arg) == "string" and first_arg:match("^%-")) and grime.fuzzy.match_flag(first_arg, { "--help", "-h" }, 0.75) or first_arg
-    if (#raw_cli_args == 0 and not ctx.pipeline_input) or first_flag == "--help" or first_flag == "-h" or first_arg == "help" then
+    if (#raw_cli_args == 0 and not ctx.pipeline_input and not ctx.input)
+        or first_arg == "-h" or first_arg == "--help" or first_arg == "-help" or first_arg == "help"
+    then
         print_help()
         return
+    end
+    for _, a in ipairs(raw_cli_args) do
+        if a == "-h" or a == "--help" or a == "-help" then
+            print_help()
+            return
+        end
     end
 
     local target_dir = nil
     local incoming_pipeline_text = nil
 
-    -- 0. Проверка режима создания приложения (--app <app_name> [--lang <lang>])
+    -- 0. Проверка режимов (-app / --app и -module / --module / -mod / --mod) и флага -lang / --lang / -l
     local is_app_mode = false
     local app_name = nil
     local app_lang = nil
     local app_dir = nil
+
+    local is_module_mode = false
+    local module_name = nil
+    local target_module_file = nil
+
     local filtered_args = {}
 
     local idx = 1
     while idx <= #raw_cli_args do
         local a = raw_cli_args[idx]
-        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy.match_flag(a, { "--app", "--lang", "-l" }, 0.75) or a
-        if matched == "--app" then
+        local eq_flag, eq_val = a:match("^(%-[%w_%-]+)=(.+)$")
+        if eq_flag then
+            if eq_flag == "-l" or eq_flag == "-lang" or eq_flag == "--lang" then
+                app_lang = LANG_ALIASES[eq_val:lower()] or eq_val:lower()
+            elseif eq_flag == "-app" or eq_flag == "--app" or eq_flag == "-a" then
+                is_app_mode = true
+                app_name = eq_val
+            elseif eq_flag == "-mod" or eq_flag == "--mod" or eq_flag == "-module" or eq_flag == "--module" then
+                is_module_mode = true
+                module_name = eq_val:gsub("%.lua$", "")
+            else
+                table.insert(filtered_args, a)
+            end
+        elseif a == "--app" or a == "-app" or a == "-a" then
             is_app_mode = true
             if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
                 idx = idx + 1
                 app_name = raw_cli_args[idx]
             end
-        elseif matched == "--lang" or matched == "-l" then
+        elseif a == "--module" or a == "-module" or a == "--mod" or a == "-mod" then
+            is_module_mode = true
             if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
                 idx = idx + 1
-                app_lang = raw_cli_args[idx]:lower()
+                module_name = raw_cli_args[idx]:gsub("%.lua$", "")
             end
+        elseif a == "--lang" or a == "-lang" or a == "-l" then
+            if idx + 1 <= #raw_cli_args and not raw_cli_args[idx + 1]:match("^%-") then
+                idx = idx + 1
+                local raw_l = raw_cli_args[idx]:lower()
+                app_lang = LANG_ALIASES[raw_l] or raw_l
+            end
+        elseif a == "-message" then
+            table.insert(filtered_args, "-m")
+        elseif a == "-model" then
+            table.insert(filtered_args, "--model")
         else
             table.insert(filtered_args, a)
         end
@@ -740,7 +1418,7 @@ function main()
 
     if is_app_mode then
         if not app_name or app_name == "" then
-            ctx.fail("Укажите имя приложения: grime aider --app <app_name> [--lang <lang>] [prompt]")
+            ctx.fail("Укажите имя приложения: grime aider -app <app_name> [-lang <lang>] [prompt]")
             return
         end
 
@@ -751,20 +1429,28 @@ function main()
         -- Сбор пользовательского промпта
         local collected_prompt = {}
         for _, arg in ipairs(remaining_args) do
-            if not arg:match("^%-") then
+            if arg ~= "-m" and arg ~= "--message" and not arg:match("^%-") then
                 table.insert(collected_prompt, arg)
             end
         end
         local user_prompt = table.concat(collected_prompt, " ")
 
-        -- Классификация стека при необходимости
-        local final_lang = app_lang or classify_stack(user_prompt)
+        -- Приоритетное извлечение языка из промпта (или имени приложения): если явно назван язык, он перекрывает авто-выбор!
+        local prompt_lang = extract_lang_from_prompt(user_prompt) or extract_lang_from_prompt(app_name)
+        local final_lang = prompt_lang or app_lang or classify_stack(user_prompt)
 
         ctx.log(string.format("Выбран стек технологий для приложения '%s': %s", app_name, final_lang))
         scaffold_app(app_dir, app_name, final_lang, user_prompt)
+        local entry_file = get_entry_file_for_lang(final_lang, app_dir)
 
         if user_prompt ~= "" then
-            local master_prompt = string.format("%s\n\n[GRIME APP REQUIREMENT]: Реализуй запрошенное консольное приложение. Убедись, что код компилируется и манифест app.lua содержит верное описание и параметры сборки/запуска.", user_prompt)
+            local master_prompt = string.format(
+                "%s\n\n[GRIME APP REQUIREMENT]:\n" ..
+                "- Выбранный стек приложения: %s (СТРОГО реализуй приложение на языке %s!).\n" ..
+                "- Редактируй существующий исходный файл `%s` (НЕ создавай дублирующие файлы в корне директории мимо `src/`!).\n" ..
+                "- Убедись, что код компилируется/выполняется и манифест `app.lua` содержит верное описание и параметры сборки/запуска.",
+                user_prompt, final_lang, final_lang, entry_file
+            )
             remaining_args = { "-m", master_prompt }
         else
             remaining_args = {}
@@ -784,10 +1470,10 @@ function main()
         end
     end
 
-    -- 2. Проверяем, передан ли путь или имя проекта первым аргументом (если не в режиме --app)
-    if not is_app_mode and #remaining_args > 0 and not target_dir then
-        local first_arg = remaining_args[1]
-        local resolved = resolve_dir_or_project(first_arg)
+    -- 2. Проверяем, передан ли путь или имя проекта первым аргументом (если не в режиме -app / -module)
+    if not is_app_mode and not is_module_mode and #remaining_args > 0 and not target_dir then
+        local first_rem = remaining_args[1]
+        local resolved = resolve_dir_or_project(first_rem)
         if resolved then
             target_dir = resolved
             table.remove(remaining_args, 1)
@@ -796,10 +1482,10 @@ function main()
 
     local working_dir = ctx.normalize_path(target_dir or ctx.target_dir)
 
-    -- 3. Обработка флага -m / --message и сбор свободных слов промпта без кавычек
+    -- 3. Обработка флага -m / --message / -message и сбор свободных слов промпта без кавычек
     local msg_flag_idx = nil
     for i, arg in ipairs(remaining_args) do
-        if arg == "-m" or arg == "--message" then
+        if arg == "-m" or arg == "--message" or arg == "-message" then
             msg_flag_idx = i
             break
         end
@@ -834,6 +1520,7 @@ function main()
         local i = 1
         local flags_with_value = {
             ["--model"] = true,
+            ["-model"] = true,
             ["--openai-api-key"] = true,
             ["--anthropic-api-key"] = true,
             ["--editor"] = true,
@@ -852,7 +1539,8 @@ function main()
         while i <= #remaining_args do
             local arg = remaining_args[i]
             if arg:match("^%-") then
-                table.insert(flags_part, arg)
+                local norm_flag = (arg == "-model") and "--model" or arg
+                table.insert(flags_part, norm_flag)
                 if flags_with_value[arg] and i + 1 <= #remaining_args and not remaining_args[i + 1]:match("^%-") then
                     i = i + 1
                     table.insert(flags_part, remaining_args[i])
@@ -896,6 +1584,29 @@ function main()
         end
     end
 
+    -- 3.1. Проверка режима создания/доработки модуля GRIME (по флагу -module или автоматически по тексту промпта)
+    if not is_app_mode then
+        local auto_mod, detected_mod_name = detect_module_request(user_message, working_dir)
+        if auto_mod then
+            is_module_mode = true
+            if not module_name and detected_mod_name then
+                module_name = detected_mod_name
+            end
+        end
+    end
+
+    local primary_mods_dir, _, _ = get_grime_modules_dirs()
+    if is_module_mode then
+        if not target_dir then
+            working_dir = primary_mods_dir
+            target_dir = primary_mods_dir
+        end
+        if module_name and module_name ~= "" then
+            target_module_file = primary_mods_dir .. "/" .. module_name .. ".lua"
+            scaffold_grime_module(target_module_file, module_name, user_message)
+        end
+    end
+
     -- 4. Объединение с контекстом от предыдущего шага конвейера
     if incoming_pipeline_text then
         local combined_message = ""
@@ -927,7 +1638,7 @@ function main()
         end
     end
 
-    -- Сбор терминального контекста для прямых интерактивных вызовов (изоляция для субагентов и конвейеров)
+    -- Сбор терминального контекста для прямых интерактивных вызовов
     local is_direct_interactive_call = (not ctx.pipeline_input) and (not ctx.has_next_step) and (os.getenv("GRIME_SUBAGENT") ~= "1")
     local terminal_context_block = nil
     local active_term_dump = nil
@@ -939,11 +1650,14 @@ function main()
         end
     end
 
-    -- Добавление системных конвенций Grime (<grime_bus>, <grime_spawn>, <next_agent_prompt>)
+    -- Добавление системных конвенций Grime и стандарта модулей Grime
     if is_headless then
         for i, a in ipairs(remaining_args) do
             if a == "-m" and remaining_args[i + 1] then
                 remaining_args[i + 1] = remaining_args[i + 1] .. GRIME_CONVENTIONS
+                if is_module_mode then
+                    remaining_args[i + 1] = remaining_args[i + 1] .. "\n" .. GRIME_MODULE_STANDARD
+                end
                 if terminal_context_block then
                     remaining_args[i + 1] = remaining_args[i + 1] .. "\n" .. terminal_context_block
                 end
@@ -1003,8 +1717,24 @@ function main()
         if not has_pretty then table.insert(aider_cmd, "--no-pretty") end
     end
 
-    -- Подключение файлов проекта по умолчанию (если явно не указаны)
-    if target_dir and ctx.exists(target_dir) then
+    -- 7. В режиме разработки модулей GRIME автоматически подключаем общие библиотеки для переиспользования (--read)
+    if is_module_mode then
+        local shared_read_files = {
+            primary_mods_dir .. "/languages/argparse.lua",
+            primary_mods_dir .. "/languages/utils.lua",
+            primary_mods_dir .. "/languages/base.lua",
+        }
+        for _, rf in ipairs(shared_read_files) do
+            if ctx.is_file(rf) then
+                table.insert(aider_cmd, "--read")
+                table.insert(aider_cmd, rf)
+            end
+        end
+        if target_module_file and ctx.is_file(target_module_file) then
+            table.insert(aider_cmd, target_module_file)
+        end
+    elseif (target_dir and ctx.exists(target_dir)) or (working_dir and ctx.is_file(working_dir .. "/app.lua")) then
+        -- Подключение файлов проекта/аппа по умолчанию (точка входа + сборочный файл + app.lua)
         local has_explicit = false
         for _, a in ipairs(remaining_args) do
             if not a:match("^%-") and ctx.exists(working_dir .. "/" .. a) then
@@ -1013,11 +1743,17 @@ function main()
             end
         end
         if not has_explicit then
-            local candidates = { "src/main.py", "src/main.cpp", "src/Main.java", "src/main.rs", "src/main.lua", "main.py", "main.lua", "app.lua" }
-            for _, c in ipairs(candidates) do
+            local entry_candidates = { "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp", "main.py", "main.lua" }
+            for _, c in ipairs(entry_candidates) do
                 if ctx.exists(working_dir .. "/" .. c) then
                     table.insert(aider_cmd, c)
                     break
+                end
+            end
+            local build_candidates = { "app.lua", "Cargo.toml", "CMakeLists.txt", "pom.xml", "pyproject.toml" }
+            for _, bc in ipairs(build_candidates) do
+                if ctx.exists(working_dir .. "/" .. bc) then
+                    table.insert(aider_cmd, bc)
                 end
             end
         end
@@ -1033,19 +1769,22 @@ function main()
         if res.stdout and res.stdout ~= "" then
             io.stdout:write(render_terminal_markdown(res.stdout))
         end
-        local cleaned_stderr = res.stderr:gsub("Warning: Input is not a terminal %(fd=0%)%.\r?\n?", "")
+        local cleaned_stderr = (res.stderr or ""):gsub("Warning: Input is not a terminal %(fd=0%)%.\r?\n?", "")
         io.stderr:write(cleaned_stderr)
 
         if res.code == 0 then
-            -- Парсинг тегов взаимодействия Grime (<grime_bus>, <grime_spawn>, <grime_exec>, <next_agent_prompt>)
             local extracted = parse_aider_tags(res.stdout, working_dir, user_message)
             if not extracted or extracted == "" then
                 extracted = res.stdout:match("^%s*(.-)%s*$")
             end
 
+            if is_module_mode and target_module_file then
+                validate_and_sync_module(target_module_file)
+            end
+
             if is_app_mode then
                 ctx.log(string.format("✓ Приложение '%s' создано в %s", app_name, app_dir))
-                ctx.log(string.format("Для запуска выполните: grime app %s", app_name))
+                ctx.log(string.format("Для запуска выполните: grime app -run %s", app_name))
             end
 
             if ctx.has_next_step and extracted and extracted ~= "" then
@@ -1079,9 +1818,12 @@ function main()
         end
 
         if ret == 0 then
+            if is_module_mode and target_module_file then
+                validate_and_sync_module(target_module_file)
+            end
             if is_app_mode then
                 ctx.log(string.format("✓ Приложение '%s' настроено в %s", app_name, app_dir))
-                ctx.log(string.format("Для запуска выполните: grime app %s", app_name))
+                ctx.log(string.format("Для запуска выполните: grime app -run %s", app_name))
             end
             if ctx.has_next_step and target_dir then
                 ctx.module_return(target_dir)
@@ -1096,7 +1838,11 @@ end
 
 local M = {
     description = description,
+    main = main,
+    extract_lang_from_prompt = extract_lang_from_prompt,
     classify_stack = classify_stack,
+    scaffold_app = scaffold_app,
+    scaffold_grime_module = scaffold_grime_module,
     run_dev = run_dev,
     validate_command_security = validate_command_security,
     execute_ai_action = execute_ai_action,
@@ -1104,4 +1850,3 @@ local M = {
     render_terminal_markdown = render_terminal_markdown,
 }
 return M
-

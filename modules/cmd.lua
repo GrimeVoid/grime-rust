@@ -36,7 +36,16 @@ local function print_help()
 end
 
 function main()
-    local args = ctx.args or {}
+    local raw_args = ctx.args or {}
+    local args = {}
+    local skipped_sep = false
+    for _, a in ipairs(raw_args) do
+        if not skipped_sep and (a == "--" or a == "//") then
+            skipped_sep = true
+        else
+            table.insert(args, a)
+        end
+    end
     local input = ctx.input or ctx.pipeline_input
 
     -- Если аргументы не переданы напрямую, но есть входные данные из конвейера:
@@ -60,7 +69,7 @@ function main()
     end
 
     local program = args[1]
-    if program == "--help" or program == "-h" or program == "help" then
+    if not skipped_sep and (program == "--help" or program == "-help" or program == "-h" or program == "help") then
         print_help()
         return
     end
@@ -84,10 +93,9 @@ function main()
         table.insert(cmd, a)
     end
 
-    local check_which = ctx.capture({ "sh", "-c", "command -v \"$1\"", "--", program })
-    if check_which.code ~= 0 then
+    local utils = require("languages.utils")
+    if not utils.has_binary(program, ctx) then
         if ctx.exists(base_dir .. "/flake.nix") then
-            local utils = require("languages.utils")
             local flat_sub = {}
             for _, t in ipairs(cmd) do table.insert(flat_sub, utils.shell_escape(t)) end
             cmd = { "nix", "develop", "--command", "sh", "-c", table.concat(flat_sub, " ") }

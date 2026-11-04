@@ -22,20 +22,20 @@ local function print_help()
 %s%sGrime List%s — Единый обзор модулей, приложений и проектов GRIME
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime list [секция] [фильтр]
+    grime list [секция|-флаг] [фильтр]
 
-%sСЕКЦИИ:%s
-    %sall%s                   Показать сводку всех модулей, приложений и проектов (по умолчанию)
-    %smodules, mod, m%s       Показать установленные декларативные модули GRIME
-    %sapps, app, a%s          Показать локальные микроприложения Grime Apps
-    %sprojects, proj, p%s     Показать проекты разработки по языкам
-    %shelp, -h, --help%s      Показать эту справку
+%sСЕКЦИИ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
+    %sall, --all%s                       Показать сводку всех модулей, приложений и проектов (по умолчанию)
+    %smodules, mod, -m, --modules%s      Показать установленные декларативные модули GRIME
+    %sapps, app, -a, --apps%s            Показать локальные микроприложения Grime Apps
+    %sprojects, proj, -p, --projects%s   Показать проекты разработки по языкам
+    %shelp, -h, --help%s                 Показать эту справку
 
 %sПРИМЕРЫ:%s
     grime list                    # Полный обзор экосистемы GRIME
-    grime list modules            # Список всех модулей оркестратора
-    grime list apps               # Список приложений Grime Apps
-    grime list projects           # Список проектов пользователя
+    grime list -modules           # Список всех модулей оркестратора
+    grime list --apps             # Список приложений Grime Apps
+    grime list -p                 # Список проектов пользователя
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
@@ -446,19 +446,21 @@ function main()
     local filter = nil
 
     for _, a in ipairs(args) do
-        if a == "help" or a == "-h" or a == "--help" then
+        local raw = tostring(a)
+        local clean = raw:lower():gsub("^%-+", "")
+        if clean == "help" or clean == "h" then
             print_help()
             return
-        elseif a == "modules" or a == "mod" or a == "m" then
+        elseif clean == "modules" or clean == "module" or clean == "mod" or clean == "m" then
             section = "modules"
-        elseif a == "apps" or a == "app" or a == "a" then
+        elseif clean == "apps" or clean == "app" or clean == "a" then
             section = "apps"
-        elseif a == "projects" or a == "proj" or a == "p" then
+        elseif clean == "projects" or clean == "project" or clean == "proj" or clean == "p" then
             section = "projects"
-        elseif a == "all" then
+        elseif clean == "all" then
             section = "all"
-        elseif not a:match("^%-") then
-            filter = a:lower()
+        elseif not raw:match("^%-") then
+            filter = raw:lower()
         end
     end
 

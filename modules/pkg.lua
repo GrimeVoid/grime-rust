@@ -124,7 +124,8 @@ end
 -- Разрешение имени менеджера по нечеткому запросу
 local function resolve_manager(query)
     if not query or query == "" then return nil end
-    local q = query:lower()
+    local q = tostring(query):lower():gsub("^%-+", "")
+    if q == "" then return nil end
 
     -- 1. Точный алиас
     if MANAGER_ALIASES[q] then
@@ -1773,7 +1774,6 @@ end
 local function handle_not_found(args, run_ctx)
     local context = run_ctx or ctx
     if not args or #args == 0 then
-        io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
         context.fail("Не указана команда для поиска (код 127)")
         return
     end
@@ -1794,7 +1794,6 @@ local function handle_not_found(args, run_ctx)
     args = clean_args
 
     if #args == 0 then
-        io.stderr:write("[Grime] Ошибка: не указана команда для поиска.\n")
         context.fail("Не указана команда для поиска (код 127)")
         return
     end
@@ -1817,7 +1816,6 @@ local function handle_not_found(args, run_ctx)
     -- 1. Аудит безопасности путей хоста: НАИВЫСШИЙ ПРИОРИТЕТ
     local allowed, reason = classify_paths(cmd, cmd_args)
     if not allowed then
-        io.stderr:write(string.format("[Grime] Отказ: %s\n", reason))
         context.fail(string.format("[Grime] Отказ: %s", reason))
         return
     end
@@ -1839,7 +1837,7 @@ local function handle_not_found(args, run_ctx)
         return
     end
 
-    -- 4. ТОЛЬКО ЕСЛИ УТИЛИТА НЕ НАЙДЕНА ВО ВСЕХ ЛОКАЛЬНЫХ СРЕДАХ И КОНТЕЙНЕРАХ:
+    -- 4. ТОЛЬКО ЕСЛИ УТИЛИТА НЕ НАЙДЕНА ВО ВСЕХ ЛОКАЛЬНЫХ СРЕД И КОНТЕЙНЕРАХ:
     local nix_pkg = is_nixpkgs_package(cmd)
 
     if nix_pkg then
@@ -1927,19 +1925,19 @@ local function print_help()
     print(string.format([[
 %s%sGrime Pkg%s — Унифицированное управление пакетами хоста, контейнеров и окружений
 
-%sИСПОЛЬЗОВАНИЕ:%s
-    grime pkg [-a, --all] [-v, --all-managers] # Сводная таблица (по умолчанию: пользовательские пакеты; -a: все пакеты)
-    grime pkg <менеджер> [-a] [фильтр]      # Список пакетов менеджера (по умолчанию: пользовательские; -a: все)
-    grime pkg <пакет> [-a]                  # Сквозной нечеткий поиск пакета (по умолчанию: пользовательские; -a: все)
-    grime pkg search <запрос> [-a]          # Явный сквозной нечеткий поиск
-    grime pkg install <менеджер> <пакеты...># Установка пакетов через выбранный менеджер
-    grime pkg update [менеджер] [пакеты...] # Обновление пакетов (по умолчанию: сквозное обновление всех)
-    grime pkg remove <менеджер> <пакеты...> # Удаление пакетов через выбранный менеджер
-    grime pkg run <утилита> [аргументы...]  # Сквозной мультипакетный запуск утилиты или приложения
-    grime pkg run <менеджер> <утилита>      # Явный запуск утилиты через конкретный менеджер
+%sИСПОЛЬЗОВАНИЕ (все команды поддерживают запись с '-' / '--' и без):%s
+    grime pkg [-l, --list] [-a, --all] [-v, --all-managers] # Сводная таблица пакетов
+    grime pkg <менеджер> [-l] [-a] [фильтр] # Список пакетов менеджера (по умолчанию: пользовательские; -a: все)
+    grime pkg <пакет> [-a]                  # Сквозной нечеткий поиск пакета
+    grime pkg -s, --search <запрос> [-a]    # Явный сквозной нечеткий поиск
+    grime pkg -i, --install <менеджер> <pkg># Установка пакетов через выбранный менеджер
+    grime pkg -u, --update [менеджер] [pkg] # Обновление пакетов (по умолчанию: сквозное обновление всех)
+    grime pkg -rm, --remove <менеджер> <pkg># Удаление пакетов через выбранный менеджер
+    grime pkg -r, --run <утилита> [args...] # Сквозной мультипакетный запуск утилиты или приложения
+    grime pkg -r, --run <менеджер> <утилита># Явный запуск утилиты через конкретный менеджер
     grime pkg run --help                    # Справка по правилам запуска
     grime pkg not-found <команда> [args]    # Умный обработчик command-not-found (системный шелл)
-    grime pkg help, -h, --help              # Показать эту справку
+    grime pkg -h, --help, help              # Показать эту справку
 
 %sФЛАГИ:%s
     -a, --all, --deps                       # Выводить или искать среди ВСЕХ пакетов и зависимостей системы
@@ -1947,7 +1945,7 @@ local function print_help()
     -v, --verbose, --all-managers           # Показывать все поддерживаемые менеджеры в сводке (включая не установленные)
                                             # (по умолчанию отображаются только установленные и активные)
 
-%sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ (и их нечеткие алиасы):%s
+%sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ (и их нечеткие алиасы, также с '-' / '--'):%s
     • host      (pacman, arch, sys)         # Хост / Системный PATH (/usr/bin, pacman)
     • yay       (aur, y)                    # Pacman + AUR хелпер (yay -Qm по умолчанию, yay -Q с -a)
     • flatpak   (flat, flt, fp)             # Flatpak: только приложения (по умолчанию) vs с runtime (-a)
@@ -1959,22 +1957,13 @@ local function print_help()
 
 %sПРИМЕРЫ:%s
     grime pkg                               # Сводная таблица активных менеджеров
-    grime pkg yay                           # Список пакетов AUR (yay -Qm)
-    grime pkg pacman                        # Список пакетов, явно установленных в pacman
-    grime pkg flat                          # Установленные Flatpak-приложения
-    grime pkg update                        # Сквозное обновление всех активных менеджеров (yay, flatpak, nix...)
-    grime pkg flatpak update                # Обновление всех приложений Flatpak
-    grime pkg flatpak --update              # Синоним обновления через флаг
-    grime pkg flatpak update obsidian       # Обновление конкретного Flatpak-приложения
-    grime pkg yay update                    # Обновление системы и AUR через yay
-    grime pkg remove flatpak obsidian       # Удаление Flatpak-пакета
-    grime pkg remove pacman htop            # Удаление системного пакета pacman
-    grime pkg run du -h                     # Системный du на хосте
-    grime pkg run btop                      # Системный btop на хосте
-    grime pkg run obsidian                  # Запуск Flatpak-приложения Obsidian
-    grime pkg run host htop                 # Явный запуск утилиты на хосте
-    grime pkg run box btop                  # Запуск утилиты внутри контейнера Distrobox
-    grime pkg run nix glow                  # Запуск утилиты из Nix-профиля / Flake (nixpkgs)
+    grime pkg -yay                          # Список пакетов AUR (yay -Qm)
+    grime pkg -pacman -list                 # Список пакетов, явно установленных в pacman
+    grime pkg -u                            # Сквозное обновление всех активных менеджеров (yay, flatpak, nix...)
+    grime pkg flatpak --update              # Обновление всех приложений Flatpak
+    grime pkg -remove flatpak obsidian      # Удаление Flatpak-пакета
+    grime pkg -run btop                     # Системный btop на хосте
+    grime pkg -run nix glow                 # Запуск утилиты из Nix-профиля / Flake (nixpkgs)
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",
@@ -1984,15 +1973,27 @@ local function print_help()
     ))
 end
 
+local function lookup_pkg_action(tok)
+    if not tok or type(tok) ~= "string" then return nil end
+    local low = tok:lower()
+    if ACTIONS[low] then return ACTIONS[low] end
+    if low:sub(1, 1) == "-" then
+        local stripped = low:gsub("^%-+", "")
+        return ACTIONS[stripped]
+    end
+    return nil
+end
+
 function main()
     local raw_args = ctx.args or {}
 
     -- Проверка явного вызова общей справки: grime pkg help, grime pkg -h, grime pkg --help, grime pkg flatpak --help
     if #raw_args > 0 then
-        local first_action = ACTIONS[raw_args[1]:lower()]
+        local first_action = lookup_pkg_action(raw_args[1])
         if first_action ~= "run" and first_action ~= "not_found" then
             for _, a in ipairs(raw_args) do
-                if a == "--help" or a == "-h" or a == "help" then
+                if a == "--" or a == "//" then break end
+                if a == "--help" or a == "-h" or a == "-help" or a == "help" then
                     print_help()
                     return
                 end
@@ -2002,7 +2003,7 @@ function main()
 
     -- Специальная изолированная обработка действия 'not-found' / 'cnf'
     if #raw_args > 0 then
-        local first_action = ACTIONS[raw_args[1]:lower()]
+        local first_action = lookup_pkg_action(raw_args[1])
         if first_action == "not_found" then
             local not_found_args = {}
             for i = 2, #raw_args do
@@ -2013,10 +2014,10 @@ function main()
         end
     end
 
-    -- Специальная изолированная обработка действия 'run'
+    -- Специальная изолированная обработка действия 'run' / '-run' / '--run' / '-r'
     -- (гарантирует, что флаги утилиты вроде -h, -a, -v не перехватываются как флаги Grime Pkg)
     if #raw_args > 0 then
-        local first_action = ACTIONS[raw_args[1]:lower()]
+        local first_action = lookup_pkg_action(raw_args[1])
         if first_action == "run" then
             if #raw_args == 1 then
                 handle_run(nil, {}, {})
@@ -2024,7 +2025,7 @@ function main()
             end
 
             local second = raw_args[2]
-            if second == "--help" or second == "-h" or second == "help" then
+            if second == "--help" or second == "-h" or second == "-help" or second == "help" then
                 print_run_help()
                 return
             end
@@ -2066,17 +2067,44 @@ function main()
         end
     end
 
+    -- Также поддерживаем случай `grime pkg <mgr> -run <cmd>` до общего парсера
+    if #raw_args >= 2 then
+        local mgr_first = resolve_manager(raw_args[1])
+        local act_second = lookup_pkg_action(raw_args[2])
+        if mgr_first and act_second == "run" then
+            local run_tokens = {}
+            local cmd_tokens = {}
+            local after_dash = false
+            for i = 3, #raw_args do
+                local tok = raw_args[i]
+                if not after_dash and (tok == "--" or tok == "//") then
+                    after_dash = true
+                elseif after_dash then
+                    table.insert(cmd_tokens, tok)
+                else
+                    table.insert(run_tokens, tok)
+                end
+            end
+            handle_run(mgr_first, run_tokens, cmd_tokens)
+            return
+        end
+    end
+
     local cls = argparse.new({
         actions = ACTIONS,
         default_action = "list",
         flags = {
-            all = { "-a", "--all", "--deps" },
-            all_managers = { "-v", "--verbose", "--all-managers" },
+            all = { "-a", "--all", "-all", "--deps", "-deps" },
+            all_managers = { "-v", "--verbose", "-verbose", "--all-managers", "-all-managers" },
+        },
+        categories = {
+            manager = MANAGER_ALIASES,
         },
     })
 
     local parsed = cls:parse(raw_args)
     local action = parsed.action or "list"
+    local cat_mgr = parsed.categories and parsed.categories.manager or nil
 
     if action == "help" then
         print_help()
@@ -2101,21 +2129,18 @@ function main()
     end
 
     if action == "update" then
-        local target_mgr = nil
+        local target_mgr = cat_mgr
         local update_args = {}
         for _, tok in ipairs(raw_tokens) do
-            local t_lower = tok:lower()
-            if t_lower ~= "-u" and t_lower ~= "-update" and t_lower ~= "--update" and
-               t_lower ~= "-upgrade" and t_lower ~= "--upgrade" and
-               t_lower ~= "-up" and t_lower ~= "--up" and
-               t_lower ~= "update" and t_lower ~= "upgrade" and t_lower ~= "up" and t_lower ~= "u" then
+            local t_lower = tok:lower():gsub("^%-+", "")
+            if t_lower ~= "u" and t_lower ~= "update" and t_lower ~= "upgrade" and t_lower ~= "up" then
                 table.insert(update_args, tok)
             end
         end
 
-        if #update_args > 0 then
+        if #update_args > 0 and not target_mgr then
             local first_tok = update_args[1]
-            if first_tok:lower() == "all" then
+            if first_tok:lower():gsub("^%-+", "") == "all" then
                 table.remove(update_args, 1)
                 target_mgr = nil
             else
@@ -2125,6 +2150,9 @@ function main()
                     table.remove(update_args, 1)
                 end
             end
+        elseif #update_args > 0 and target_mgr and update_args[1]:lower():gsub("^%-+", "") == "all" then
+            table.remove(update_args, 1)
+            target_mgr = nil
         end
 
         handle_update(target_mgr, update_args)
@@ -2132,21 +2160,16 @@ function main()
     end
 
     if action == "remove" then
-        local target_mgr = nil
+        local target_mgr = cat_mgr
         local remove_pkgs = {}
         for _, tok in ipairs(raw_tokens) do
-            local t_lower = tok:lower()
-            if t_lower ~= "-rm" and t_lower ~= "--rm" and
-               t_lower ~= "-remove" and t_lower ~= "--remove" and
-               t_lower ~= "-uninstall" and t_lower ~= "--uninstall" and
-               t_lower ~= "-del" and t_lower ~= "--del" and
-               t_lower ~= "remove" and t_lower ~= "rm" and
-               t_lower ~= "uninstall" and t_lower ~= "del" and t_lower ~= "delete" then
+            local t_lower = tok:lower():gsub("^%-+", "")
+            if t_lower ~= "rm" and t_lower ~= "remove" and t_lower ~= "uninstall" and t_lower ~= "del" and t_lower ~= "delete" then
                 table.insert(remove_pkgs, tok)
             end
         end
 
-        if #remove_pkgs > 0 then
+        if not target_mgr and #remove_pkgs > 0 then
             local resolved = resolve_manager(remove_pkgs[1])
             if resolved then
                 target_mgr = resolved
@@ -2164,24 +2187,32 @@ function main()
     end
 
     if action == "search" then
-        handle_search(raw_tokens, all_mode)
+        if cat_mgr and #raw_tokens == 0 then
+            handle_search({ cat_mgr }, all_mode)
+        else
+            handle_search(raw_tokens, all_mode)
+        end
         return
     end
 
     if action == "install" then
-        local first_tok = table.remove(raw_tokens, 1)
-        local mgr = resolve_manager(first_tok) or first_tok or "pacman"
+        local mgr = cat_mgr
+        if not mgr then
+            local first_tok = table.remove(raw_tokens, 1)
+            mgr = resolve_manager(first_tok) or first_tok or "pacman"
+        end
         handle_install(mgr, raw_tokens)
         return
     end
 
     if action == "run" then
-        local first_tok = raw_tokens[1]
-        local resolved = resolve_manager(first_tok)
-        local mgr = nil
-        if resolved then
-            mgr = resolved
-            table.remove(raw_tokens, 1)
+        local mgr = cat_mgr
+        if not mgr and #raw_tokens > 0 then
+            local resolved = resolve_manager(raw_tokens[1])
+            if resolved then
+                mgr = resolved
+                table.remove(raw_tokens, 1)
+            end
         end
         handle_run(mgr, raw_tokens, {})
         return
@@ -2193,6 +2224,11 @@ function main()
     end
 
     -- Обработка действия list / вызова без аргументов / вызова по имени менеджера или поиску пакета
+    if cat_mgr then
+        handle_detailed_list(cat_mgr, raw_tokens, all_mode)
+        return
+    end
+
     if #raw_tokens == 0 then
         local shown_mgrs = handle_summary(all_mode, show_all_managers)
         if ctx.has_next_step then
@@ -2201,14 +2237,14 @@ function main()
         return
     end
 
-    -- Проверяем первый токен: является ли он пакетным менеджером?
+    -- Проверяем первый токен (на случай нечеткого имени менеджера):
     local first_tok = raw_tokens[1]
     local resolved_mgr = resolve_manager(first_tok)
 
     if resolved_mgr then
         table.remove(raw_tokens, 1)
         if #raw_tokens > 0 then
-            local next_action = ACTIONS[raw_tokens[1]:lower()]
+            local next_action = lookup_pkg_action(raw_tokens[1])
             if next_action == "run" then
                 table.remove(raw_tokens, 1)
                 handle_run(resolved_mgr, raw_tokens, {})

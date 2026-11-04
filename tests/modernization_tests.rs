@@ -919,6 +919,62 @@ async fn test_box_host_environment_boundary_orchestration() {
     assert_eq!(res.as_deref(), Some("from_box:arch->git_status"));
 }
 
+#[tokio::test]
+async fn test_single_source_of_error_and_root_cause_preservation() {
+    let tmp = TestTempDir::new("grime_single_error");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
 
+    fs::write(
+        mod_dir.join("test_cascading_err.lua"),
+        r#"
+        function main()
+            grime.ui.error("Первопричина: проект 'NonExistent' не найден")
+            grime.ctx.fail("Вторичная каскадная ошибка")
+        end
+        "#,
+    )
+    .unwrap();
 
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["test_cascading_err".to_string()]);
+    let res = orch.run_pipeline(&parsed).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("Первопричина: проект 'NonExistent' не найден"),
+        "Должна сохраняться первопричина ошибки, получено: {}",
+        err
+    );
+    assert!(
+        !err.contains("Вторичная каскадная ошибка"),
+        "Каскадный вызов ctx.fail не должен затирать первопричину: {}",
+        err
+    );
+}
 
+#[tokio::test]
+async fn test_universal_dash_flags_standard() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let real_modules = repo_root.join("modules");
+    let orch = Orchestrator::new(Some(real_modules), None).unwrap();
+
+    // Проверка bus в едином конвейере с флагами со знаком минус (-set : --get)
+    let p_pipe = parse_pipeline_args(&[
+        "bus".to_string(),
+        "-set".to_string(),
+        "pipeline.dash_test".to_string(),
+        "ok_dash".to_string(),
+        ":".to_string(),
+        "bus".to_string(),
+        "--get".to_string(),
+        "pipeline.dash_test".to_string(),
+    ]);
+    let res_pipe = orch.run_pipeline(&p_pipe).await.expect("bus -set : bus --get");
+    assert_eq!(res_pipe.as_deref(), Some("ok_dash"));
+
+    // Проверка list с флагом -modules
+    let p_list = parse_pipeline_args(&["list".to_string(), "-modules".to_string()]);
+    let res_list = orch.run_pipeline(&p_list).await;
+    assert!(res_list.is_ok(), "grime list -modules должен отрабатывать успешно");
+}

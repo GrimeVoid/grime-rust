@@ -41,21 +41,22 @@ local function print_help()
 %s%sGrime Log%s — Централизованный сбор, хранение и фильтрация логов системы
 
 %sИСПОЛЬЗОВАНИЕ:%s
-    grime log [команда|сообщение] [аргументы...]
+    grime log [команда|-флаг|сообщение] [аргументы...]
     <данные> : grime log [уровень]
 
-%sКОМАНДЫ:%s
-    %slist [n]%s                  Показать последние N записей логов (по умолчанию 20)
-    %serrors [n]%s                Показать только ошибки и предупреждения (по умолчанию 10)
-    %sgit [n|каталог]%s           Вывести коммиты Git в журнал системы
-    %sclear%s                     Очистить историю логов на диске и в шине состояния
-    %sadd <уровень> <текст>%s     Добавить произвольную запись в лог (INFO, WARN, ERROR)
-    %shelp, -h, --help%s          Показать эту справку
+%sКОМАНДЫ И ФЛАГИ (поддерживаются с '-' / '--' и без):%s
+    %slist, -l, --list [n]%s            Показать последние N записей логов (по умолчанию 20)
+    %serrors, -e, --errors [n]%s        Показать только ошибки и предупреждения (по умолчанию 10)
+    %sgit, -g, --git [n|каталог]%s      Вывести коммиты Git в журнал системы
+    %sclear, -c, --clear%s              Очистить историю логов на диске и в шине состояния
+    %sadd, -a, --add <уровень> <msg>%s  Добавить произвольную запись в лог (INFO, WARN, ERROR)
+    %s-n, --limit <N>%s                 Лимит выводимых записей
+    %shelp, -h, --help%s                Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime log errors 5 : aider
-    echo "Сборка завершена успешно" : grime log INFO
-    grime log git 5
+    grime log -errors 5 : aider
+    echo "Сборка завершена успешно" : grime log --info
+    grime log -git 5
     grime doctor : grime log
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
@@ -66,6 +67,7 @@ local function print_help()
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
+    ANSI.YELLOW, ANSI.RESET,
     ANSI.DIM, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET
     ))
@@ -282,13 +284,54 @@ local function print_entries_table(entries, title)
     print()
 end
 
+local LOG_COMMANDS = {
+    list = "list", l = "list", ls = "list",
+    errors = "errors", err = "errors", e = "errors",
+    git = "git", g = "git",
+    clear = "clear", c = "clear", clean = "clear",
+    add = "add", a = "add",
+    help = "help", h = "help",
+}
+
+local function extract_log_limit(args, start_idx, default_limit)
+    for i = start_idx, #args do
+        local a = tostring(args[i])
+        if (a == "-n" or a == "--limit" or a == "-limit") and tonumber(args[i + 1]) then
+            return tonumber(args[i + 1])
+        elseif a:match("^%-n(%d+)$") then
+            return tonumber(a:match("^%-n(%d+)$"))
+        elseif tonumber(a) then
+            return tonumber(a)
+        end
+    end
+    return default_limit
+end
+
 --- Главный обработчик CLI
 function M.main()
     local args = ctx.args or {}
     local input = ctx.input or ctx.pipeline_input
-    local subcmd = args[1]
+    local raw_subcmd = args[1]
 
-    if subcmd == "help" or subcmd == "-h" or subcmd == "--help" then
+    for _, a in ipairs(args) do
+        local matched = (type(a) == "string" and a:match("^%-")) and grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h" }, 0.75) or a
+        if matched == "--help" or matched == "-h" or a == "help" or a == "-help" then
+            print_help()
+            return
+        end
+    end
+
+    local subcmd = raw_subcmd
+    if type(raw_subcmd) == "string" then
+        local clean = raw_subcmd:lower():gsub("^%-+", "")
+        if LOG_COMMANDS[clean] then
+            subcmd = LOG_COMMANDS[clean]
+        elseif clean == "info" or clean == "warn" or clean == "error" then
+            subcmd = clean:upper()
+        end
+    end
+
+    if subcmd == "help" then
         print_help()
         return
     end
@@ -310,7 +353,7 @@ function M.main()
     end
 
     if subcmd == "errors" then
-        local limit = tonumber(args[2]) or 10
+        local limit = extract_log_limit(args, 2, 10)
         local errs = M.get_errors(limit)
 
         print_entries_table(errs, "Недавних ошибок и сбоев не зафиксировано.")
@@ -328,9 +371,11 @@ function M.main()
     end
 
     if subcmd == "git" then
-        local target = args[2] or ctx.target_dir or "."
-        local limit = tonumber(args[2]) or tonumber(args[3]) or 10
-        if tonumber(args[2]) then target = ctx.target_dir or "." end
+        local target = ctx.target_dir or "."
+        local limit = extract_log_limit(args, 2, 10)
+        if args[2] and not tonumber(args[2]) and not tostring(args[2]):match("^%-") then
+            target = args[2]
+        end
 
         local commits, err = git.log(target, limit)
         if not commits then
@@ -370,9 +415,15 @@ function M.main()
     end
 
     if subcmd == "add" then
-        local level = (args[2] or "INFO"):upper()
+        local raw_lvl = tostring(args[2] or "INFO"):gsub("^%-+", "")
+        local level = raw_lvl:upper()
+        local start_msg = 3
+        if level ~= "INFO" and level ~= "WARN" and level ~= "ERROR" and level ~= "DEBUG" then
+            level = "INFO"
+            start_msg = 2
+        end
         local msg_tokens = {}
-        for i = 3, #args do table.insert(msg_tokens, args[i]) end
+        for i = start_msg, #args do table.insert(msg_tokens, args[i]) end
         local msg = table.concat(msg_tokens, " ")
         if #msg == 0 then msg = input or "" end
 
@@ -390,9 +441,22 @@ function M.main()
     -- Вывод обычного списка логов (grime log или grime log list [n])
     local limit = 20
     if subcmd == "list" then
-        limit = tonumber(args[2]) or 20
+        limit = extract_log_limit(args, 2, 20)
+    elseif subcmd == "INFO" or subcmd == "WARN" or subcmd == "ERROR" then
+        local msg_tokens = {}
+        for i = 2, #args do table.insert(msg_tokens, args[i]) end
+        local msg = table.concat(msg_tokens, " ")
+        if #msg == 0 then msg = input or "" end
+        if #msg > 0 then
+            local entry = M.add(subcmd, msg, "user")
+            grime.ui.success(string.format("Запись добавлена в лог [%s]: %s", subcmd, msg))
+            ctx.success(grime.json.encode(entry))
+            return
+        end
     elseif tonumber(subcmd) then
         limit = tonumber(subcmd)
+    elseif raw_subcmd and tostring(raw_subcmd):match("^%-") then
+        limit = extract_log_limit(args, 1, 20)
     elseif subcmd and subcmd ~= "" then
         -- Если передан произвольный текст как лог-сообщение
         local msg_tokens = {}

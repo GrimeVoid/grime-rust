@@ -37,14 +37,13 @@ end
 
 function main()
     local raw_args = ctx.args or {}
+    local tokens_before, command_tokens, has_sep = grime.args.split_passthrough(raw_args)
     local args = {}
-    local skipped_sep = false
-    for _, a in ipairs(raw_args) do
-        if not skipped_sep and (a == "--" or a == "//") then
-            skipped_sep = true
-        else
-            table.insert(args, a)
-        end
+    if has_sep then
+        for _, t in ipairs(tokens_before) do table.insert(args, t) end
+        for _, t in ipairs(command_tokens) do table.insert(args, t) end
+    else
+        args = tokens_before
     end
     local input = ctx.input or ctx.pipeline_input
 

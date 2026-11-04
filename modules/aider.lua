@@ -44,10 +44,11 @@ local GRIME_MODULE_STANDARD = [[
 При создании нового модуля или доработке существующего модуля в `modules/*.lua` ты ОБЯЗАН строго соблюдать архитектуру GRIME и переиспользовать общий код:
 - АРХИТЕКТУРНЫЙ ИМПЕРАТИВ: Ядро Grime на Rust отвечает только за диспетчеризацию модулей, конвейер и шину памяти. Вся логика конкретного функционала должна быть полностью реализована в Lua-модуле без необходимости менять Rust-ядро.
 
-1. ОБЯЗАТЕЛЬНОЕ ПЕРЕИСПОЛЬЗОВАНИЕ СУЩЕСТВУЮЩИХ МОДУЛЕЙ (`modules/languages/*.lua`):
+1. ОБЯЗАТЕЛЬНОЕ ПЕРЕИСПОЛЬЗОВАНИЕ НАТИВНОГО ДВИЖКА И БИБЛИОТЕК (`grime.args`, `modules/languages/*.lua`):
    - Парсинг аргументов и флагов со знаком минус:
-     `local argparse = require("languages.argparse")`
-     Используй `argparse.new({ actions = ..., flags = ..., categories = ..., detect_dir = ... })` и `cls:parse(ctx.args, ctx.target_dir)`.
+     Используй нативный движок ядра: `local parsed = ctx.parse_args({ actions = ..., flags = ..., value_flags = ..., categories = ..., detect_dir = ... })`
+     или `local before, cmd, has_sep = grime.args.split_passthrough(ctx.args)`.
+     (Модуль `languages/argparse.lua` упразднён и перенесён в нативное ядро).
    - Общие утилиты, цвета, проверка бинарников и путей:
      `local utils = require("languages.utils")`
      Переиспользуй: `utils.ANSI`, `utils.utf8_len`, `utils.pad_utf8`, `utils.has_binary(bin, ctx)`, `utils.shell_escape(s)`, `utils.normalize_path(p, cwd, ctx)`, `utils.classify_paths(cmd, args, cwd, ctx)`, `utils.get_apps_root(ctx)`, `utils.get_projects_root(ctx)`, `utils.generate_flake_nix(...)`, `utils.generate_app_manifest(...)`.
@@ -828,7 +829,7 @@ local function detect_module_request(user_prompt, working_dir)
     return false, nil
 end
 
---- Генерация стартового каркаса нового модуля GRIME по стандарту (с переиспользованием argparse и utils)
+--- Генерация стартового каркаса нового модуля GRIME по стандарту (с нативным parse_args и utils)
 local function scaffold_grime_module(mod_path, mod_name, prompt)
     if ctx.exists(mod_path) then
         return
@@ -838,9 +839,8 @@ local function scaffold_grime_module(mod_path, mod_name, prompt)
 -- Description: %s
 description = %q
 
-local argparse = require("languages.argparse")
 local utils = require("languages.utils")
-
+ 
 local ctx = grime.ctx
 local ui = grime.ui
 local ANSI = utils.ANSI
@@ -885,7 +885,7 @@ function main()
         end
     end
 
-    local cls = argparse.new({
+    local parsed = ctx.parse_args({
         actions = ACTION_SYNONYMS,
         default_action = "run",
         flags = {
@@ -894,8 +894,6 @@ function main()
             force = { "-f", "-force", "--force" },
         },
     })
-
-    local parsed = cls:parse(raw_args, ctx.target_dir)
     if parsed.flags.help or parsed.action == "help" then
         print_help()
         return
@@ -1305,7 +1303,7 @@ local function print_help()
 
 %sИНТЕГРАЦИЯ С ЭКОСИСТЕМОЙ GRIME:%s
     • Автоматическое определение языка из промпта (русский/английский, падежи, фреймворки)
-    • Автоматическое подключение общих библиотек (`languages/argparse.lua`, `languages/utils.lua`) при работе с модулями
+    • Автоматическое подключение общих библиотек (`languages/utils.lua`, нативный `grime.args`) при работе с модулями
     • Поддержка тегов <grime_exec>, <grime_bus>, <grime_spawn>, <next_agent_prompt>
 ]],
     "\27[1m", "\27[32m", "\27[0m",
@@ -1720,7 +1718,6 @@ function main()
     -- 7. В режиме разработки модулей GRIME автоматически подключаем общие библиотеки для переиспользования (--read)
     if is_module_mode then
         local shared_read_files = {
-            primary_mods_dir .. "/languages/argparse.lua",
             primary_mods_dir .. "/languages/utils.lua",
             primary_mods_dir .. "/languages/base.lua",
         }

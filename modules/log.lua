@@ -323,7 +323,7 @@ function M.main()
 
     local subcmd = raw_subcmd
     if type(raw_subcmd) == "string" then
-        local clean = raw_subcmd:lower():gsub("^%-+", "")
+        local clean = grime.args.strip_dashes(raw_subcmd)
         if LOG_COMMANDS[clean] then
             subcmd = LOG_COMMANDS[clean]
         elseif clean == "info" or clean == "warn" or clean == "error" then

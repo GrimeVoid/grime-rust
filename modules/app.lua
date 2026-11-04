@@ -1631,38 +1631,32 @@ function main()
     local path_requested = false
     local explicit_lang = nil
     local filtered = {}
-    local extra_args = {}
-    local after_sep = false
 
     local raw_args = ctx.args or {}
+    local tokens_before, extra_args, _ = grime.args.split_passthrough(raw_args)
     local idx = 1
-    while idx <= #raw_args do
-        local a = raw_args[idx]
-        if not after_sep and (a == "--" or a == "//") then
-            after_sep = true
-        elseif after_sep then
-            table.insert(extra_args, a)
+    while idx <= #tokens_before do
+        local a = tokens_before[idx]
+        local alow = type(a) == "string" and a:lower() or ""
+        local eq_flag, eq_val = alow:match("^(%-[%w_%-]+)=(.+)$")
+        if eq_flag and (eq_flag == "-l" or eq_flag == "-lang" or eq_flag == "--lang") then
+            explicit_lang = LANG_ALIASES[eq_val] or eq_val
+        elseif (alow == "--lang" or alow == "-lang" or alow == "-l") and idx + 1 <= #tokens_before and not tokens_before[idx + 1]:match("^%-") then
+            idx = idx + 1
+            local raw_l = tokens_before[idx]:lower()
+            explicit_lang = LANG_ALIASES[raw_l] or raw_l
+        elseif alow == "--detach" or alow == "-detach" or alow == "-d" then
+            is_detach = true
+        elseif alow == "--help" or alow == "-help" or alow == "-h" or alow == "help" then
+            wants_help = true
+        elseif alow == "--path" or alow == "-path" or alow == "-p" or alow == "path" then
+            path_requested = true
+        elseif alow == "--force" or alow == "-force" or alow == "-f" or alow == "-9" then
+            force = true
+        elseif ACTION_MAP[alow] then
+            -- Точное совпадение с действием (например -new, -build, -run, -diff, -ps, -rm)
+            table.insert(filtered, ACTION_MAP[alow])
         else
-            local alow = type(a) == "string" and a:lower() or ""
-            local eq_flag, eq_val = alow:match("^(%-[%w_%-]+)=(.+)$")
-            if eq_flag and (eq_flag == "-l" or eq_flag == "-lang" or eq_flag == "--lang") then
-                explicit_lang = LANG_ALIASES[eq_val] or eq_val
-            elseif (alow == "--lang" or alow == "-lang" or alow == "-l") and idx + 1 <= #raw_args and not raw_args[idx + 1]:match("^%-") then
-                idx = idx + 1
-                local raw_l = raw_args[idx]:lower()
-                explicit_lang = LANG_ALIASES[raw_l] or raw_l
-            elseif alow == "--detach" or alow == "-detach" or alow == "-d" then
-                is_detach = true
-            elseif alow == "--help" or alow == "-help" or alow == "-h" or alow == "help" then
-                wants_help = true
-            elseif alow == "--path" or alow == "-path" or alow == "-p" or alow == "path" then
-                path_requested = true
-            elseif alow == "--force" or alow == "-force" or alow == "-f" or alow == "-9" then
-                force = true
-            elseif ACTION_MAP[alow] then
-                -- Точное совпадение с действием (например -new, -build, -run, -diff, -ps, -rm)
-                table.insert(filtered, ACTION_MAP[alow])
-            else
                 -- Нечеткое сопоставление только если это неизвестный флаг со знаком минус
                 local fuzzy_matched = nil
                 if type(a) == "string" and a:match("^%-") then
@@ -1685,7 +1679,6 @@ function main()
                     table.insert(filtered, a)
                 end
             end
-        end
         idx = idx + 1
     end
 

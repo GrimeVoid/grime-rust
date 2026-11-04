@@ -374,7 +374,7 @@ function M.main()
         end
     end
 
-    local clean_cmd = tostring(raw_subcmd):lower():gsub("^%-+", "")
+    local clean_cmd = grime.args.strip_dashes(raw_subcmd)
     local subcmd = GIT_COMMANDS[clean_cmd] or clean_cmd
 
     if subcmd == "help" then

@@ -3,6 +3,7 @@
 //! Обеспечивает интеграцию среды Lua с подсистемами хоста: процессами,
 //! файловой системой, шинами состояний и событий, прерываниями и конвейером.
 
+pub mod api_args;
 pub mod api_bus;
 pub mod api_fs;
 pub mod api_fuzzy;
@@ -512,6 +513,9 @@ impl GrimeLuaEngine {
 
         // 10. Регистрация нечёткого поиска (grime.fuzzy)
         api_fuzzy::register_fuzzy_api(lua, &grime_tbl)?;
+
+        // 10.1. Регистрация парсера аргументов (grime.args)
+        api_args::register_args_api(lua, &grime_tbl)?;
 
         // 11. Инициализация контекста конвейера (grime.ctx и _G.ctx)
         context::init_context_table(lua, &grime_tbl, &self.config)?;

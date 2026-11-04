@@ -20,7 +20,7 @@ const PATH_FLAGS: &[&str] = &["-p", "-path", "--path"];
 const ARG_FLAGS: &[&str] = &["--args", "-arg"];
 const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
 const SEPARATORS: &[&str] = &[":", "|"];
-const FLAG_SEPARATORS: &[&str] = &["--", "//"];
+use crate::args_engine::is_passthrough_separator;
 
 const BUILTIN_MODULE_NAMES: &[&str] = &[
     "exec", "proj", "ls", "modules", "project", "pkg", "app", "box", "nix", "aider", "cmd",
@@ -121,7 +121,7 @@ pub fn has_preamble_flag(raw_args: &[String], targets: &[&str]) -> bool {
 
     while idx < raw_args.len() {
         let tok = &raw_args[idx];
-        if FLAG_SEPARATORS.contains(&tok.as_str()) {
+        if is_passthrough_separator(tok) {
             break;
         }
         if tok.starts_with('-') {
@@ -171,7 +171,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
     let mut idx = 0;
     while idx < raw_args.len() {
         let tok = &raw_args[idx];
-        if FLAG_SEPARATORS.contains(&tok.as_str()) {
+        if is_passthrough_separator(tok) {
             break;
         }
 
@@ -243,7 +243,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
     // Поддержка legacy-режима, когда команда начинается с флага (например `--args build`) без разделителей
     let first_norm = crate::args::normalize_flag(&tokens[0], crate::args::GLOBAL_GRIME_FLAGS);
     if tokens[0].starts_with('-')
-        && !FLAG_SEPARATORS.contains(&tokens[0].as_str())
+        && !is_passthrough_separator(&tokens[0])
         && !MOD_FLAGS.contains(&first_norm)
         && !tokens.iter().any(|t| SEPARATORS.contains(&t.as_str()))
     {
@@ -304,7 +304,7 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         while pos < tokens.len() {
             let tok = &tokens[pos];
 
-            if !after_flag_sep && FLAG_SEPARATORS.contains(&tok.as_str()) {
+            if !after_flag_sep && is_passthrough_separator(tok) {
                 after_flag_sep = true;
                 mod_args.push(tok.clone());
                 pos += 1;

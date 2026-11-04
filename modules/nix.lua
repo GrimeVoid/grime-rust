@@ -8,7 +8,6 @@
 -- Description: Оркестратор изолированных сред Nix Flakes, сборок и профилей
 description = "Оркестратор изолированных сред Nix Flakes, сборок и профилей"
 
-local argparse = require("languages.argparse")
 local scanner = require("languages.scanner")
 local utils = require("languages.utils")
 
@@ -773,7 +772,7 @@ function main()
         raw_target = "."
     end
     local target_dir = ctx.normalize_path(raw_target)
-    local cls = argparse.new({
+    local parsed = ctx.parse_args({
         actions = ACTIONS,
         default_action = "init",
         flags = {
@@ -790,8 +789,6 @@ function main()
         },
         detect_dir = true,
     })
-
-    local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "init"
 
     if action == "help" or parsed.flags.help then

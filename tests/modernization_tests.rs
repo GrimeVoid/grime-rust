@@ -307,17 +307,11 @@ async fn test_fuzzy_matching_entities_and_flags() {
     if repo_modules.join("helper.lua").exists() {
         fs::copy(repo_modules.join("helper.lua"), mod_dir.join("helper.lua")).unwrap();
     }
-    if repo_modules.join("languages/argparse.lua").exists() {
-        let _ = fs::create_dir_all(mod_dir.join("languages"));
-        fs::copy(repo_modules.join("languages/argparse.lua"), mod_dir.join("languages/argparse.lua")).unwrap();
-    }
-
     // Тестовый модуль: test_fuzzy.lua
     fs::write(
         mod_dir.join("test_fuzzy.lua"),
         r#"
         local helper = require("helper")
-        local argparse = require("languages.argparse")
         local ctx = helper.ctx
 
         function main()
@@ -358,16 +352,15 @@ async fn test_fuzzy_matching_entities_and_flags() {
             assert(helper.fuzzy_match_flag("git", flags, 0.75) == nil, "git is string")
             assert(helper.fuzzy_match_flag("MyGame", flags, 0.75) == nil, "MyGame is string")
 
-            -- 6. Проверка argparse c нечёткими флагами
-            local cls = argparse.new({
+            -- 6. Проверка нативного парсера аргументов c нечёткими флагами
+            local parsed = ctx.parse_args({
                 flags = {
                     all = { "-a", "--all", "--deps" },
                     force = { "-f", "--force" }
                 }
-            })
-            local parsed = cls:parse({ "--al", "--forc", "my_package" })
-            assert(parsed.flags.all == true, "argparse flag all matched via --al")
-            assert(parsed.flags.force == true, "argparse flag force matched via --forc")
+            }, { "--al", "--forc", "my_package" })
+            assert(parsed.flags.all == true, "flag all matched via --al")
+            assert(parsed.flags.force == true, "flag force matched via --forc")
             assert(#parsed.args == 1 and parsed.args[1] == "my_package", "my_package kept as positional arg")
 
             ctx.success("fuzzy_tests_passed")
@@ -978,3 +971,72 @@ async fn test_universal_dash_flags_standard() {
     let res_list = orch.run_pipeline(&p_list).await;
     assert!(res_list.is_ok(), "grime list -modules должен отрабатывать успешно");
 }
+
+#[tokio::test]
+async fn test_native_args_engine_in_lua() {
+    let temp_dir = TestTempDir::new("grime_native_args");
+    let mod_dir = temp_dir.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    fs::write(
+        mod_dir.join("test_args.lua"),
+        r#"
+        function main()
+            -- 1. Тест split_passthrough
+            local before, cmd, has_sep = grime.args.split_passthrough({ "build", "-f", "--", "cargo", "run" })
+            assert(#before == 2, "before should have 2 elements")
+            assert(before[1] == "build" and before[2] == "-f")
+            assert(#cmd == 2, "cmd should have 2 elements")
+            assert(cmd[1] == "cargo" and cmd[2] == "run")
+            assert(has_sep == true, "has_sep should be true")
+
+            -- 2. Тест strip_dashes и is_flag
+            assert(grime.args.strip_dashes("--Update") == "update")
+            assert(grime.args.strip_dashes("-b") == "b")
+            assert(grime.args.is_flag("-f") == true)
+            assert(grime.args.is_flag("--force") == true)
+            assert(grime.args.is_flag("build") == false)
+
+            -- 3. Тест ctx.parse_args
+            local parsed = ctx.parse_args({
+                actions = { build = "build", b = "build", list = "list" },
+                default_action = "list",
+                flags = {
+                    force = { "-f", "--force" },
+                },
+                value_flags = {
+                    lang = { "-l", "--lang" },
+                },
+                categories = {
+                    language = { rust = "rust", rs = "rust", cpp = "cpp" },
+                },
+            }, { "-b", "--lang=rust", "--rust", "--force", "my_project" })
+
+            assert(parsed.action == "build", "action should be build")
+            assert(parsed.flags.force == true, "force flag should be true")
+            assert(parsed.flags.lang == "rust", "lang should be rust")
+            assert(parsed.categories.language == "rust", "language should be rust")
+            assert(#parsed.args == 1 and parsed.args[1] == "my_project", "args should contain my_project")
+
+            -- 4. Тест обратной совместимости grime.args.new
+            local legacy_parser = grime.args.new({
+                actions = { init = "init" },
+                flags = { all = { "-a", "--all" } },
+            })
+            local res_legacy = legacy_parser:parse({ "-init", "--all", "pkg1" })
+            assert(res_legacy.action == "init")
+            assert(res_legacy.flags.all == true)
+            assert(#res_legacy.args == 1 and res_legacy.args[1] == "pkg1")
+
+            ctx.success("native_args_ok")
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let parsed = parse_pipeline_args(&["test_args".to_string()]);
+    let res = orch.run_pipeline(&parsed).await.expect("test_args pipeline run");
+    assert_eq!(res.as_deref(), Some("native_args_ok"));
+}
+

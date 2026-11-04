@@ -447,7 +447,7 @@ function main()
 
     for _, a in ipairs(args) do
         local raw = tostring(a)
-        local clean = raw:lower():gsub("^%-+", "")
+        local clean = grime.args.strip_dashes(raw)
         if clean == "help" or clean == "h" then
             print_help()
             return

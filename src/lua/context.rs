@@ -649,6 +649,18 @@ pub fn init_context_table(
         }
     }
 
+    // Парсинг аргументов через нативный движок ядра (ctx.parse_args)
+    ctx_tbl.set(
+        "parse_args",
+        lua.create_function(|lua_ctx, (spec_tbl, raw_args): (Table, Option<Value>)| {
+            let globals = lua_ctx.globals();
+            let g: Table = globals.get("grime")?;
+            let a: Table = g.get("args")?;
+            let parse_fn: mlua::Function = a.get("parse")?;
+            parse_fn.call::<Table>((spec_tbl, raw_args, Value::Nil))
+        })?,
+    )?;
+
     grime_tbl.set("ctx", ctx_tbl.clone())?;
     lua.globals().set("ctx", ctx_tbl.clone())?;
 

@@ -2,7 +2,6 @@
 -- Description: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
 description = "Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox"
 
-local argparse = require("languages.argparse")
 local utils = require("languages.utils")
 
 -- Модульные переменные file-scope
@@ -2030,20 +2029,10 @@ function main()
                 return
             end
 
-            -- Разделение на токены до '--' / '//' и после '--' / '//'
-            local run_tokens = {}
-            local cmd_tokens = {}
-            local after_dash = false
-            for i = 2, #raw_args do
-                local tok = raw_args[i]
-                if not after_dash and (tok == "--" or tok == "//") then
-                    after_dash = true
-                elseif after_dash then
-                    table.insert(cmd_tokens, tok)
-                else
-                    table.insert(run_tokens, tok)
-                end
-            end
+            -- Разделение на токены до '--' / '//' и после '--' / '//' через нативный движок
+            local raw_slice = {}
+            for i = 2, #raw_args do table.insert(raw_slice, raw_args[i]) end
+            local run_tokens, cmd_tokens = grime.args.split_passthrough(raw_slice)
 
             -- Очистка от устаревших флагов при необходимости (только до разделителя)
             local clean_run_tokens = {}
@@ -2072,25 +2061,15 @@ function main()
         local mgr_first = resolve_manager(raw_args[1])
         local act_second = lookup_pkg_action(raw_args[2])
         if mgr_first and act_second == "run" then
-            local run_tokens = {}
-            local cmd_tokens = {}
-            local after_dash = false
-            for i = 3, #raw_args do
-                local tok = raw_args[i]
-                if not after_dash and (tok == "--" or tok == "//") then
-                    after_dash = true
-                elseif after_dash then
-                    table.insert(cmd_tokens, tok)
-                else
-                    table.insert(run_tokens, tok)
-                end
-            end
+            local raw_slice = {}
+            for i = 3, #raw_args do table.insert(raw_slice, raw_args[i]) end
+            local run_tokens, cmd_tokens = grime.args.split_passthrough(raw_slice)
             handle_run(mgr_first, run_tokens, cmd_tokens)
             return
         end
     end
 
-    local cls = argparse.new({
+    local parsed = ctx.parse_args({
         actions = ACTIONS,
         default_action = "list",
         flags = {
@@ -2100,9 +2079,7 @@ function main()
         categories = {
             manager = MANAGER_ALIASES,
         },
-    })
-
-    local parsed = cls:parse(raw_args)
+    }, raw_args)
     local action = parsed.action or "list"
     local cat_mgr = parsed.categories and parsed.categories.manager or nil
 

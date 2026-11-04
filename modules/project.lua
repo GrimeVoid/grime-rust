@@ -2,7 +2,6 @@
 -- Description: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)
 description = "Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)"
 
-local argparse = require("languages.argparse")
 local ctx = grime.ctx
 
 local ACTION_SYNONYMS = {
@@ -435,7 +434,7 @@ function main()
 
     local projects_root = get_projects_root()
 
-    local cls = argparse.new({
+    local parsed = ctx.parse_args({
         actions = ACTION_SYNONYMS,
         default_action = nil,
         flags = {
@@ -450,8 +449,6 @@ function main()
         categories = { language = LANGUAGE_ALIASES },
         detect_dir = true,
     })
-
-    local parsed = cls:parse(ctx.args, ctx.target_dir)
 
     if parsed.flags.lang and type(parsed.flags.lang) == "string" then
         local l_low = parsed.flags.lang:lower():gsub("^%-+", "")

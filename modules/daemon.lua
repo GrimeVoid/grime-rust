@@ -168,8 +168,8 @@ function main()
         end
     end
 
-    local raw_action = tostring(args[1] or "status")
-    local clean_action = raw_action:lower():gsub("^%-+", "")
+    local raw_action = args[1] or "status"
+    local clean_action = grime.args.strip_dashes(raw_action)
     local action = DAEMON_ACTIONS[clean_action] or clean_action
 
     if action == "help" then

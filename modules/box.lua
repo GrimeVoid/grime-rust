@@ -2,7 +2,6 @@
 -- Description: Оркестрация контейнеров Distrobox / Podman и экспорт бинарников
 description = "Оркестрация контейнеров Distrobox / Podman и экспорт бинарников"
 
-local argparse = require("languages.argparse")
 local utils = require("languages.utils")
 local ctx = grime.ctx
 
@@ -392,7 +391,7 @@ function main()
         box_cats[string.lower(c.name)] = c.name
     end
 
-    local cls = argparse.new({
+    local parsed = ctx.parse_args({
         actions = ACTIONS,
         default_action = "list",
         categories = { box = box_cats },
@@ -400,8 +399,6 @@ function main()
             help = { "help", "-h", "--help", "-help" },
         },
     })
-
-    local parsed = cls:parse(ctx.args, target_dir)
     local action = parsed.action or "list"
 
     if action == "help" or parsed.flags.help then

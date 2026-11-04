@@ -219,63 +219,12 @@ grime log -list -n 20
 
 ---
 
-## Unified Native Argument Parsing Engine (`grime.args`)
+---
 
-Starting with version 1.1.0, all command-line flag and argument parsing has been relocated directly into the high-performance native Rust microkernel (`src/args_engine.rs`) and exposed via the Lua API `grime.args` and context method `ctx.parse_args`. The legacy `argparse.lua` module is completely deprecated and removed.
+## Developer Documentation & API
 
-### Engine Capabilities:
-1. **Unified Dash Standard (`-` and `--`):** flags like `-list`, `--list`, and `-l` parse identically with zero overhead.
-2. **Value Flags (`value_flags`):** automatic support for both `--lang=rust` and `--lang rust` formats.
-3. **Actions & Categories:** prefix-less and dashed action/category matching with synonym resolution.
-4. **Fuzzy Matching:** native Jaro-Winkler distance correction for mistyped flags (threshold 0.75, score separation $\ge 0.08$) and actions (threshold 0.82).
-5. **Passthrough Delimiters (`--` and `//`):** instantaneous separation of command tokens for child processes via `split_passthrough`.
-6. **Directory Auto-Detection (`detect_dir`):** transparent resolution of filesystem paths without polluting positional argument lists.
-
-### Declarative Specification Example (`spec`):
-```lua
-local parsed = ctx.parse_args({
-    actions = {
-        list = "list", ls = "list",
-        build = "build", b = "build",
-        run = "run", r = "run",
-    },
-    default_action = "list",
-    flags = {
-        force = { "-f", "--force" },
-        all   = { "-a", "--all" },
-    },
-    value_flags = {
-        lang  = { "-l", "--lang" },
-    },
-    categories = {
-        language = {
-            cpp = "cpp", ["c++"] = "cpp",
-            rust = "rust", rs = "rust",
-            python = "python", py = "python",
-        },
-    },
-    detect_dir = true,
-    fuzzy_threshold = 0.75,
-    allow_unknown_flags = false,
-    passthrough_actions = { "run", "exec" },
-})
-```
-
-### Result Table Structure (`parsed`):
-- `parsed.action` (`string | nil`) — canonical matched action;
-- `parsed.flags` (`table`) — boolean flags and string values for `value_flags`;
-- `parsed.categories` (`table`) — category matches (`parsed.categories.language`);
-- `parsed.target_dir` (`string | nil`) — detected existing directory;
-- `parsed.args` (`table`) — positional arguments;
-- `parsed.command_tokens` (`table`) — tokens after `//` or `--`;
-- `parsed.unknown_flags` (`table`) — unmatched flags starting with `-`;
-- `parsed.has_separator` (`boolean`) — whether a passthrough delimiter was present.
-
-### Helper Functions in `grime.args`:
-- `grime.args.split_passthrough([raw_args]) -> tokens_before, command_tokens, has_separator` (alias: `grime.args.split`)
-- `grime.args.strip_dashes(token) -> string` — strips leading dashes and converts to lowercase
-- `grime.args.is_flag(token) -> boolean` — checks if token begins with a dash
-- `grime.args.new(spec) -> { parse = function(self, raw_args, default_dir) ... end }` — wrapper for backward compatibility
+For building custom declarative modules, extensions, and working with the native Lua API of the GRIME kernel, see the dedicated specification:
+- [Full GRIME Kernel Lua API Documentation (documentation.md)](documentation.md)
 
 ---
 

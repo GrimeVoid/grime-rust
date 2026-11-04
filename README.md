@@ -220,63 +220,12 @@ grime log -list -n 20
 
 ---
 
-## Единый нативный API парсинга аргументов (`grime.args`)
+---
 
-Начиная с версии 1.1.0, весь разбор флагов и аргументов командной строки перенесён в нативное ядро Rust (`src/args_engine.rs`) и доступен через высокопроизводительное Lua API `grime.args` и метод контекста `ctx.parse_args`. Старый модуль `argparse.lua` полностью упразднён.
+## Документация разработчика и API
 
-### Возможности нативного движка:
-1. **Поддержка единого стандарта дефисов (`-` и `--`):** флаги `-list`, `--list`, `-l`, короткие и длинные формы парсятся одинаково быстро.
-2. **Флаги со значением (`value_flags`):** автоматическая поддержка обоих форматов: `--lang=rust` и `--lang rust`.
-3. **Действия (`actions`) и Категории (`categories`):** сопоставление действий и категорий со знаком минус и без минуса, поддержка синонимов.
-4. **Нечёткое сопоставление (Fuzzy Match):** автоматическое исправление опечаток во флагах (алгоритм Jaro-Winkler с порогом 0.75 и отрывом $\ge 0.08$) и действиях (порог 0.82).
-5. **Разделители сквозного проброса (`--` и `//`):** мгновенное разделение аргументов для дочерних процессов (`split_passthrough`).
-6. **Автоопределение рабочей директории (`detect_dir`):** автоматическое распознавание путей на диске без захламления списка позиционных аргументов.
-
-### Пример декларативной спецификации (`spec`):
-```lua
-local parsed = ctx.parse_args({
-    actions = {
-        list = "list", ls = "list",
-        build = "build", b = "build",
-        run = "run", r = "run",
-    },
-    default_action = "list",
-    flags = {
-        force = { "-f", "--force" },
-        all   = { "-a", "--all" },
-    },
-    value_flags = {
-        lang  = { "-l", "--lang" },
-    },
-    categories = {
-        language = {
-            cpp = "cpp", ["c++"] = "cpp",
-            rust = "rust", rs = "rust",
-            python = "python", py = "python",
-        },
-    },
-    detect_dir = true,
-    fuzzy_threshold = 0.75,
-    allow_unknown_flags = false,
-    passthrough_actions = { "run", "exec" },
-})
-```
-
-### Структура возвращаемого результата (`parsed`):
-- `parsed.action` (`string | nil`) — распознанное каноническое действие;
-- `parsed.flags` (`table`) — булевы флаги и строки для `value_flags`;
-- `parsed.categories` (`table`) — сопоставленные категории (`parsed.categories.language`);
-- `parsed.target_dir` (`string | nil`) — обнаруженная существующая директория;
-- `parsed.args` (`table`) — очищенные позиционные аргументы;
-- `parsed.command_tokens` (`table`) — токены после разделителя `//` или `--`;
-- `parsed.unknown_flags` (`table`) — нераспознанные флаги с `-`;
-- `parsed.has_separator` (`boolean`) — был ли явно встречен разделитель `//` или `--`.
-
-### Вспомогательные функции `grime.args`:
-- `grime.args.split_passthrough([raw_args]) -> tokens_before, command_tokens, has_separator` (алиас: `grime.args.split`)
-- `grime.args.strip_dashes(token) -> string` — срез ведущих дефисов и перевод в lowercase
-- `grime.args.is_flag(token) -> boolean` — проверка, начинается ли токен с дефиса
-- `grime.args.new(spec) -> { parse = function(self, raw_args, default_dir) ... end }` — таблица-обёртка для полной обратной совместимости
+Для создания собственных декларативных модулей, расширений и работы с нативным Lua API ядра GRIME подготовлена отдельная подробная спецификация:
+- [Полное руководство по Lua API ядра GRIME (documentation.md)](documentation.md)
 
 ---
 

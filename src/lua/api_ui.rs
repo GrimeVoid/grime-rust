@@ -5,6 +5,28 @@
 use colored::Colorize;
 use mlua::{Lua, Table};
 
+/// Форматирует и сохраняет сообщение об ошибке в контексте шага `grime.ctx` (или выводит в stderr).
+pub fn print_formatted_error(lua: &Lua, msg: &str) {
+    if let Ok(g) = lua.globals().get::<Table>("grime") {
+        if let Ok(c) = g.get::<Table>("ctx") {
+            let existing = c.get::<mlua::Value>("_error_message").ok();
+            let has_existing = match existing {
+                Some(mlua::Value::String(s)) => s
+                    .to_str()
+                    .map(|s_ref| !s_ref.is_empty() && s_ref != "Шаг конвейера завершился ошибкой")
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !has_existing {
+                let _ = c.set("_error_message", msg);
+            }
+            let _ = c.set("_ui_error_msg", msg);
+            return;
+        }
+    }
+    eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
+}
+
 /// Регистрирует подтаблицу `grime.ui`.
 pub fn register_ui_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
     let ui_tbl = lua.create_table()?;
@@ -21,24 +43,7 @@ pub fn register_ui_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
     ui_tbl.set(
         "error",
         lua.create_function(|lua_ctx, msg: String| {
-            if let Ok(g) = lua_ctx.globals().get::<Table>("grime") {
-                if let Ok(c) = g.get::<Table>("ctx") {
-                    let existing = c.get::<mlua::Value>("_error_message").ok();
-                    let has_existing = match existing {
-                        Some(mlua::Value::String(s)) => s
-                            .to_str()
-                            .map(|s_ref| !s_ref.is_empty() && s_ref != "Шаг конвейера завершился ошибкой")
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-                    if !has_existing {
-                        let _ = c.set("_error_message", msg.clone());
-                    }
-                    let _ = c.set("_ui_error_msg", msg);
-                    return Ok(());
-                }
-            }
-            eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
+            print_formatted_error(lua_ctx, &msg);
             Ok(())
         })?,
     )?;

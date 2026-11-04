@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 use mlua::{Lua, Value};
 use serde_json::{json, Value as JsonValue};
 
@@ -16,6 +17,7 @@ use serde_json::{json, Value as JsonValue};
 pub struct StateBus {
     data: Arc<RwLock<HashMap<String, JsonValue>>>,
     persistence_path: Option<PathBuf>,
+    last_loaded_mtime: Arc<Mutex<Option<SystemTime>>>,
 }
 
 impl Default for StateBus {
@@ -33,6 +35,7 @@ impl StateBus {
         let bus = Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             persistence_path,
+            last_loaded_mtime: Arc::new(Mutex::new(None)),
         };
         bus.init_defaults();
         bus.load_persisted();
@@ -95,21 +98,67 @@ impl StateBus {
 
     /// Загрузка сохраненного состояния с диска в память.
     pub fn load_persisted(&self) {
+        let Ok(mut map) = self.data.write() else {
+            return;
+        };
+        self.sync_from_disk_if_modified(&mut map);
+    }
+
+    /// Проверяет `mtime` файла `state.json` и при наличии внешних изменений перечитывает персистентные ключи.
+    fn sync_from_disk_if_modified(&self, map: &mut HashMap<String, JsonValue>) {
         let Some(ref path) = self.persistence_path else {
             return;
         };
-        if !path.exists() {
+        let Ok(disk_mtime) = fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+
+        let should_reload = match self.last_loaded_mtime.lock() {
+            Ok(guard) => match *guard {
+                Some(prev) => disk_mtime != prev,
+                None => true,
+            },
+            Err(_) => true,
+        };
+
+        if !should_reload {
             return;
         }
+
         if let Ok(content) = fs::read_to_string(path) {
             if let Ok(JsonValue::Object(obj)) = serde_json::from_str::<JsonValue>(&content) {
-                if let Ok(mut map) = self.data.write() {
-                    for (k, v) in obj {
-                        if Self::validate_namespace(&k).is_ok() && Self::is_persistent_key(&k) {
-                            map.insert(k, v);
-                        }
+                // Очищаем прежние персистентные ключи, оставляя транзиентные (`pipeline.*`, `system.*`, `env.*`)
+                map.retain(|k, _| !Self::is_persistent_key(k));
+                for (k, v) in obj {
+                    if Self::validate_namespace(&k).is_ok() && Self::is_persistent_key(&k) {
+                        map.insert(k, v);
                     }
                 }
+                if let Ok(mut guard) = self.last_loaded_mtime.lock() {
+                    *guard = Some(disk_mtime);
+                }
+            }
+        }
+    }
+
+    /// Быстрая проверка необходимости синхронизации перед операциями чтения.
+    fn ensure_synced_for_read(&self) {
+        let Some(ref path) = self.persistence_path else {
+            return;
+        };
+        let Ok(disk_mtime) = fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+        let needs_sync = match self.last_loaded_mtime.lock() {
+            Ok(guard) => match *guard {
+                Some(prev) => disk_mtime != prev,
+                None => true,
+            },
+            Err(_) => false,
+        };
+        if needs_sync {
+            if let Ok(mut map) = self.data.write() {
+                self.sync_from_disk_if_modified(&mut map);
             }
         }
     }
@@ -120,6 +169,11 @@ impl StateBus {
             return;
         };
         Self::write_persisted_to_file(path, map);
+        if let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) {
+            if let Ok(mut guard) = self.last_loaded_mtime.lock() {
+                *guard = Some(mtime);
+            }
+        }
     }
 
     fn write_persisted_to_file(path: &Path, map: &HashMap<String, JsonValue>) {
@@ -150,6 +204,9 @@ impl StateBus {
 
     /// Получить значение по ключу.
     pub fn get(&self, key: &str) -> Option<JsonValue> {
+        if Self::is_persistent_key(key) {
+            self.ensure_synced_for_read();
+        }
         let map = self.data.read().ok()?;
         map.get(key).cloned()
     }
@@ -158,6 +215,9 @@ impl StateBus {
     pub fn set(&self, key: &str, value: JsonValue) -> Result<(), String> {
         Self::validate_namespace(key)?;
         let mut map = self.data.write().map_err(|e| e.to_string())?;
+        if Self::is_persistent_key(key) {
+            self.sync_from_disk_if_modified(&mut map);
+        }
         map.insert(key.to_string(), value);
         if Self::is_persistent_key(key) {
             self.persist_map(&map);
@@ -167,6 +227,9 @@ impl StateBus {
 
     /// Проверить наличие ключа.
     pub fn has(&self, key: &str) -> bool {
+        if Self::is_persistent_key(key) {
+            self.ensure_synced_for_read();
+        }
         if let Ok(map) = self.data.read() {
             map.contains_key(key)
         } else {
@@ -177,6 +240,9 @@ impl StateBus {
     /// Удалить значение по ключу.
     pub fn delete(&self, key: &str) -> bool {
         if let Ok(mut map) = self.data.write() {
+            if Self::is_persistent_key(key) {
+                self.sync_from_disk_if_modified(&mut map);
+            }
             let existed = map.remove(key).is_some();
             if existed && Self::is_persistent_key(key) {
                 self.persist_map(&map);
@@ -196,6 +262,9 @@ impl StateBus {
         };
 
         if let Ok(mut map) = self.data.write() {
+            if Self::is_persistent_key(&normalized_prefix) {
+                self.sync_from_disk_if_modified(&mut map);
+            }
             let before = map.len();
             let mut removed_persistent = false;
             map.retain(|k, _| {
@@ -227,6 +296,7 @@ impl StateBus {
 
     /// Список ключей по опциональному префиксу.
     pub fn keys(&self, prefix: Option<&str>) -> Vec<String> {
+        self.ensure_synced_for_read();
         if let Ok(map) = self.data.read() {
             map.keys()
                 .filter(|k| prefix.is_none_or(|p| k.starts_with(p)))
@@ -258,6 +328,29 @@ impl Drop for PipelineSessionGuard {
 
 pub const MAX_RECURSION_DEPTH: usize = 64;
 
+/// Проверяет, является ли таблица Lua чистым последовательным массивом `1..=len` без дополнительных ключей.
+pub fn is_pure_lua_array(tbl: &mlua::Table) -> Result<bool, mlua::Error> {
+    let len = tbl.raw_len();
+    if len == 0 {
+        return Ok(false);
+    }
+    for i in 1..=len {
+        match tbl.raw_get::<Value>(i as i64) {
+            Ok(v) if v != Value::Nil => {}
+            _ => return Ok(false),
+        }
+    }
+    let mut pair_count = 0usize;
+    for pair in tbl.clone().pairs::<Value, Value>() {
+        let _ = pair?;
+        pair_count += 1;
+        if pair_count > len {
+            return Ok(false);
+        }
+    }
+    Ok(pair_count == len)
+}
+
 /// Конвертация `mlua::Value` в `serde_json::Value` с защитой от переполнения стека.
 pub fn lua_to_json(val: Value) -> Result<JsonValue, mlua::Error> {
     lua_to_json_depth(val, 0, MAX_RECURSION_DEPTH)
@@ -284,25 +377,15 @@ pub fn lua_to_json_depth(val: Value, depth: usize, max_depth: usize) -> Result<J
         }
         Value::String(s) => Ok(JsonValue::String(s.to_str()?.to_string())),
         Value::Table(tbl) => {
-            // Проверяем, является ли таблица последовательным массивом (1..len)
-            let len = tbl.raw_len();
-            if len > 0 {
+            // Таблица сериализуется как массив только если это чистый последовательный массив 1..=len без строковых/разреженных ключей
+            if is_pure_lua_array(&tbl)? {
+                let len = tbl.raw_len();
                 let mut arr = Vec::with_capacity(len);
-                let mut is_array = true;
                 for i in 1..=len {
-                    match tbl.raw_get::<Value>(i as i64) {
-                        Ok(v) if v != Value::Nil => {
-                            arr.push(lua_to_json_depth(v, depth + 1, max_depth)?);
-                        }
-                        _ => {
-                            is_array = false;
-                            break;
-                        }
-                    }
+                    let v: Value = tbl.raw_get(i as i64)?;
+                    arr.push(lua_to_json_depth(v, depth + 1, max_depth)?);
                 }
-                if is_array {
-                    return Ok(JsonValue::Array(arr));
-                }
+                return Ok(JsonValue::Array(arr));
             }
 
             // Иначе таблица - словарь (object)
@@ -535,5 +618,68 @@ mod tests {
             "Сообщение об ошибке не содержит ожидаемый текст: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_lua_to_json_mixed_and_sparse_tables() {
+        let lua = Lua::new();
+
+        // Смешанная таблица: { "item1", key = "val" }
+        let mixed: Value = lua
+            .load(r#"return { "item1", key = "val" }"#)
+            .eval()
+            .unwrap();
+        let json_mixed = lua_to_json(mixed).expect("mixed table to json");
+        assert!(json_mixed.is_object(), "Смешанная таблица должна сериализоваться как Object");
+        assert_eq!(json_mixed["1"], json!("item1"));
+        assert_eq!(json_mixed["key"], json!("val"));
+
+        // Разреженная таблица: { [1] = "a", [3] = "c" }
+        let sparse: Value = lua
+            .load(r#"return { [1] = "a", [3] = "c" }"#)
+            .eval()
+            .unwrap();
+        let json_sparse = lua_to_json(sparse).expect("sparse table to json");
+        assert!(json_sparse.is_object(), "Разреженная таблица должна сериализоваться как Object");
+        assert_eq!(json_sparse["1"], json!("a"));
+        assert_eq!(json_sparse["3"], json!("c"));
+
+        // Чистый массив: { "a", "b", "c" }
+        let pure_arr: Value = lua
+            .load(r#"return { "a", "b", "c" }"#)
+            .eval()
+            .unwrap();
+        let json_arr = lua_to_json(pure_arr).expect("pure array to json");
+        assert_eq!(json_arr, json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn test_state_bus_live_sync_between_two_instances() {
+        let tmp_state = std::env::temp_dir().join(format!(
+            "grime_live_sync_test_{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp_state);
+
+        let daemon_bus = StateBus::with_persistence_path(Some(tmp_state.clone()));
+        let cli_bus = StateBus::with_persistence_path(Some(tmp_state.clone()));
+
+        daemon_bus.set("session.daemon_key", json!("from_daemon")).unwrap();
+        // Небольшая пауза для гарантированного изменения mtime на файловой системе
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        cli_bus.set("session.cli_key", json!("from_cli")).unwrap();
+
+        // Оба инстанса должны видеть ключи друг друга без потери данных
+        assert_eq!(daemon_bus.get("session.cli_key"), Some(json!("from_cli")));
+        assert_eq!(daemon_bus.get("session.daemon_key"), Some(json!("from_daemon")));
+        assert_eq!(cli_bus.get("session.daemon_key"), Some(json!("from_daemon")));
+
+        // Если демон записывает ещё один ключ, он не должен затереть cli_key
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        daemon_bus.set("session.daemon_second", json!(2)).unwrap();
+        assert_eq!(cli_bus.get("session.cli_key"), Some(json!("from_cli")));
+        assert_eq!(cli_bus.get("session.daemon_second"), Some(json!(2)));
+
+        let _ = fs::remove_file(&tmp_state);
     }
 }

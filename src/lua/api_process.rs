@@ -6,28 +6,34 @@ use mlua::{Lua, Table, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::cancellation::PipelineCanceller;
 use crate::process::{capture_command, run_command, run_interactive, run_shell};
 
 /// Регистрирует подтаблицу `grime.process` со всеми функциями исполнения.
-pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
+pub fn register_process_api(
+    lua: &Lua,
+    grime_tbl: &Table,
+    canceller: PipelineCanceller,
+) -> Result<(), mlua::Error> {
     let proc_tbl = lua.create_table()?;
 
     // grime.process.run(cmd, cwd, env) -> exit_code
+    let c_run = canceller.clone();
     proc_tbl.set(
         "run",
-        lua.create_function(|_, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+        lua.create_function(move |_, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
             let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let code = match cmd {
                 Value::String(s) => {
                     let cmd_str = s.to_str()?;
-                    run_shell(&cmd_str, &cwd_path, env.as_ref())
+                    run_shell(&cmd_str, &cwd_path, env.as_ref(), Some(&c_run))
                 }
                 Value::Table(tbl) => {
                     let mut args = Vec::new();
                     for item in tbl.sequence_values::<String>() {
                         args.push(item?);
                     }
-                    run_command(&args, &cwd_path, env.as_ref())
+                    run_command(&args, &cwd_path, env.as_ref(), Some(&c_run))
                 }
                 _ => 1,
             };
@@ -36,22 +42,23 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
     )?;
 
     // grime.process.run_interactive(cmd, cwd, env) -> exit_code
+    let c_inter = canceller.clone();
     proc_tbl.set(
         "run_interactive",
-        lua.create_function(|_, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
+        lua.create_function(move |_, (cmd, cwd, env): (Value, Option<String>, Option<HashMap<String, String>>)| {
             let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let code = match cmd {
                 Value::String(s) => {
                     let cmd_str = s.to_str()?;
                     let parts = vec!["sh".to_string(), "-c".to_string(), cmd_str.to_string()];
-                    run_interactive(&parts, &cwd_path, env.as_ref())
+                    run_interactive(&parts, &cwd_path, env.as_ref(), Some(&c_inter))
                 }
                 Value::Table(tbl) => {
                     let mut args = Vec::new();
                     for item in tbl.sequence_values::<String>() {
                         args.push(item?);
                     }
-                    run_interactive(&args, &cwd_path, env.as_ref())
+                    run_interactive(&args, &cwd_path, env.as_ref(), Some(&c_inter))
                 }
                 _ => 1,
             };
@@ -66,23 +73,24 @@ pub fn register_process_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Er
         Option<HashMap<String, String>>,
         Option<String>,
     );
+    let c_cap = canceller;
     proc_tbl.set(
         "capture",
-        lua.create_function(|lua, (cmd, cwd, env, stdin_input): CaptureArgs| {
+        lua.create_function(move |lua, (cmd, cwd, env, stdin_input): CaptureArgs| {
             let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let stdin_ref = stdin_input.as_deref();
             let res = match cmd {
                 Value::String(s) => {
                     let cmd_str = s.to_str()?;
                     let parts = vec!["sh".to_string(), "-c".to_string(), cmd_str.to_string()];
-                    capture_command(&parts, &cwd_path, env.as_ref(), stdin_ref)
+                    capture_command(&parts, &cwd_path, env.as_ref(), stdin_ref, Some(&c_cap))
                 }
                 Value::Table(tbl) => {
                     let mut args = Vec::new();
                     for item in tbl.sequence_values::<String>() {
                         args.push(item?);
                     }
-                    capture_command(&args, &cwd_path, env.as_ref(), stdin_ref)
+                    capture_command(&args, &cwd_path, env.as_ref(), stdin_ref, Some(&c_cap))
                 }
                 _ => return Err(mlua::Error::runtime("Ожидалась строка или таблица аргументов команды")),
             };

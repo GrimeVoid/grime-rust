@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::time::timeout;
 
-use crate::daemon::{get_socket_path, ClientMessage, DaemonResponse, MAX_IPC_PAYLOAD_SIZE};
+use crate::daemon::{
+    get_socket_path, read_ipc_frame_async, write_ipc_frame_async, ClientMessage, DaemonResponse,
+    IpcFrameError, MAX_IPC_PAYLOAD_SIZE,
+};
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::{has_preamble_flag, parse_pipeline_args};
 
@@ -61,7 +62,7 @@ fn print_global_help(config: &crate::config::GrimeConfig) {
 /// Подключение к демону с ленивым авто-спавном:
 /// Если сокет отсутствует или подключение возвращает ошибку,
 /// автоматически запускает `grime --daemon-server` в фоне как открепленный процесс
-/// и ожидает готовности Unix-сокета.
+/// и ожидает готовности Unix-сокета (очисткой устаревшего сокета занимается сам стартующий демон).
 pub async fn connect_or_spawn_daemon() -> Result<UnixStream, std::io::Error> {
     let sock_path = get_socket_path();
 
@@ -70,8 +71,6 @@ pub async fn connect_or_spawn_daemon() -> Result<UnixStream, std::io::Error> {
         if let Ok(stream) = UnixStream::connect(&sock_path).await {
             return Ok(stream);
         }
-        // Сокет существует, но подключение не удалось (демон упал или завершился некорректно)
-        let _ = std::fs::remove_file(&sock_path);
     }
 
     // 2. Авто-спавн grime --daemon-server в фоне как открепленный процесс
@@ -93,18 +92,33 @@ pub async fn connect_or_spawn_daemon() -> Result<UnixStream, std::io::Error> {
         }
     }
 
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
     // 3. В цикле (до 15 попыток с паузой 25 мс, суммарно ~375 мс) дожидаемся появления и готовности сокета
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_millis(25)).await;
         if sock_path.exists() {
             if let Ok(stream) = UnixStream::connect(&sock_path).await {
+                let _ = child.try_wait();
                 return Ok(stream);
             }
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            // Если демон уже был запущен параллельным процессом или завершился с ошибкой,
+            // пробуем подключиться к сокету ещё раз, прежде чем возвращать ошибку
+            if sock_path.exists() {
+                if let Ok(stream) = UnixStream::connect(&sock_path).await {
+                    return Ok(stream);
+                }
+            }
+            return Err(std::io::Error::other(format!(
+                "Процесс демона завершился при запуске со статусом: {}",
+                status
+            )));
+        }
     }
 
+    let _ = child.try_wait();
     UnixStream::connect(&sock_path).await
 }
 
@@ -151,38 +165,31 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
             detach: true,
         };
 
-        if let Ok(bytes) = rmp_serde::to_vec_named(&msg) {
-            let len = (bytes.len() as u32).to_be_bytes();
-            if stream.write_all(&len).await.is_ok() && stream.write_all(&bytes).await.is_ok() {
-                let mut len_buf = [0u8; 4];
-                if timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf))
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-                {
-                    let resp_len = u32::from_be_bytes(len_buf) as usize;
-                    if resp_len > MAX_IPC_PAYLOAD_SIZE {
-                        eprintln!(
-                            "[Grime Security] Ошибка: размер ответа демона превышает максимально допустимый лимит ({} > {})",
-                            resp_len, MAX_IPC_PAYLOAD_SIZE
-                        );
-                        return 1;
+        if write_ipc_frame_async(&mut stream, &msg).await.is_ok() {
+            match read_ipc_frame_async::<_, DaemonResponse>(
+                &mut stream,
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    if let Some(ref res) = resp.result {
+                        println!("{}", res);
                     }
-                    let mut resp_buf = vec![0u8; resp_len];
-                    if timeout(Duration::from_secs(30), stream.read_exact(&mut resp_buf))
-                        .await
-                        .is_ok_and(|r| r.is_ok())
-                    {
-                        if let Ok(resp) = rmp_serde::from_slice::<DaemonResponse>(&resp_buf) {
-                            if let Some(ref res) = resp.result {
-                                println!("{}", res);
-                            }
-                            if let Some(ref err) = resp.error {
-                                eprintln!("[Grime] {}", err);
-                            }
-                            return resp.exit_code;
-                        }
+                    if let Some(ref err) = resp.error {
+                        eprintln!("[Grime] {}", err);
                     }
+                    return resp.exit_code;
                 }
+                Err(IpcFrameError::PayloadTooLarge(resp_len)) => {
+                    eprintln!(
+                        "[Grime Security] Ошибка: размер ответа демона превышает максимально допустимый лимит ({} > {})",
+                        resp_len, MAX_IPC_PAYLOAD_SIZE
+                    );
+                    return 1;
+                }
+                Err(_) => {}
             }
         }
 
@@ -204,7 +211,7 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
 
     let _ctrl_c = crate::cancellation::spawn_ctrl_c_watcher(orchestrator.canceller().clone());
 
-    match orchestrator.run_pipeline(&parsed).await {
+    match orchestrator.run_pipeline(&parsed) {
         Ok(Some(result)) => {
             if !result.is_empty() {
                 println!("{}", result);

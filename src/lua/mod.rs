@@ -85,20 +85,11 @@ fn lua_value_to_rmpv_depth(
             }
         }
         mlua::Value::Table(tbl) => {
-            let len = tbl.raw_len();
-            let mut is_array = len > 0;
-            if is_array {
-                for i in 1..=len {
-                    if tbl.get::<mlua::Value>(i).is_err() {
-                        is_array = false;
-                        break;
-                    }
-                }
-            }
-            if is_array {
+            if crate::state_bus::is_pure_lua_array(tbl)? {
+                let len = tbl.raw_len();
                 let mut arr = Vec::with_capacity(len);
                 for i in 1..=len {
-                    let item: mlua::Value = tbl.get(i)?;
+                    let item: mlua::Value = tbl.raw_get(i as i64)?;
                     arr.push(lua_value_to_rmpv_depth(&item, depth + 1, max_depth)?);
                 }
                 Ok(rmpv::Value::Array(arr))
@@ -196,19 +187,26 @@ fn rmpv_to_lua_value_depth(
     }
 }
 
-fn extract_os_exit_code(err: &mlua::Error) -> Option<i32> {
-    let msg = err.to_string();
-    if let Some(pos) = msg.find("__GRIME_OS_EXIT__:") {
-        let after = &msg[pos + "__GRIME_OS_EXIT__:".len()..];
-        let digits: String = after
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '-')
-            .collect();
-        if let Ok(code) = digits.parse::<i32>() {
-            return Some(code);
-        }
+/// Типизированная ошибка перехвата `os.exit(code)` в Lua без завершения процесса хоста/демона.
+#[derive(Debug, Clone)]
+pub struct LuaExitError(pub i32);
+
+impl std::fmt::Display for LuaExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lua os.exit({})", self.0)
     }
-    None
+}
+
+impl std::error::Error for LuaExitError {}
+
+fn extract_os_exit_code(err: &mlua::Error) -> Option<i32> {
+    match err {
+        mlua::Error::ExternalError(arc) => arc.downcast_ref::<LuaExitError>().map(|e| e.0),
+        mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => {
+            extract_os_exit_code(cause)
+        }
+        _ => None,
+    }
 }
 
 impl GrimeLuaEngine {
@@ -228,9 +226,12 @@ impl GrimeLuaEngine {
         event_bus: Arc<EventBus>,
         canceller: PipelineCanceller,
     ) -> Result<Self, mlua::Error> {
+        if modules_dir.is_some() {
+            crate::pipeline::invalidate_modules_cache();
+        }
         let lua = Lua::new();
         let config = Arc::new(GrimeConfig::load_or_default(custom_config));
-        let resolved_modules = modules_dir.unwrap_or_else(Self::discover_modules_dir);
+        let resolved_modules = config.resolve_modules_dir(modules_dir);
 
         let engine = Self {
             lua,
@@ -270,40 +271,6 @@ impl GrimeLuaEngine {
         &self.canceller
     }
 
-    /// Поиск директории с модулями.
-    fn discover_modules_dir() -> PathBuf {
-        let cur = PathBuf::from("modules");
-        if cur.exists() {
-            return cur;
-        }
-
-        if let Ok(exe_p) = std::env::current_exe() {
-            if let Some(parent) = exe_p.parent() {
-                let candidate = parent.join("../share/grime/modules");
-                if candidate.exists() {
-                    return candidate;
-                }
-                let cand_rel = parent.join("modules");
-                if cand_rel.exists() {
-                    return cand_rel;
-                }
-            }
-        }
-
-        if let Some(home) = dirs::home_dir() {
-            let dotfiles_modules = home.join("dotfiles/grime/modules");
-            if dotfiles_modules.exists() {
-                return dotfiles_modules;
-            }
-            let user_modules = home.join(".config/grime/modules");
-            if user_modules.exists() {
-                return user_modules;
-            }
-        }
-
-        PathBuf::from("modules")
-    }
-
     /// Инициализация runtime: регистрация модульных API, путей и прелюда.
     fn init_runtime(&self) -> Result<(), mlua::Error> {
         let lua = &self.lua;
@@ -339,7 +306,7 @@ impl GrimeLuaEngine {
                             let _ = c.set("_status", code == 0);
                         }
                     }
-                    Err(mlua::Error::RuntimeError(format!("__GRIME_OS_EXIT__:{}", code)))
+                    Err(mlua::Error::ExternalError(Arc::new(LuaExitError(code))))
                 })?,
             )?;
         }
@@ -354,7 +321,7 @@ impl GrimeLuaEngine {
         )?;
 
         // 3. Регистрация API процессов (grime.process)
-        api_process::register_process_api(lua, &grime_tbl)?;
+        api_process::register_process_api(lua, &grime_tbl, self.canceller.clone())?;
 
         // 3.1. Регистрация API высокоточного времени (grime.time)
         let time_tbl = lua.create_table()?;
@@ -979,6 +946,11 @@ mod tests {
             assert(decoded.nested.active == true)
             assert(decoded.nested.tags[1] == "fast")
             assert(decoded.nested.tags[2] == "reliable")
+
+            local mixed = { "a", key = "val" }
+            local mixed_dec = grime.msgpack.decode(grime.msgpack.encode(mixed))
+            assert(mixed_dec[1] == "a")
+            assert(mixed_dec.key == "val")
             return decoded.name
         "#;
 

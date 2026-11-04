@@ -19,11 +19,19 @@ const BOX_ONE_SHOT_ACTIONS: &[&str] = &[
 ];
 
 fn extract_box_env_switch(step: &PipelineStep, config: &GrimeConfig) -> Option<String> {
-    if step
-        .args
-        .iter()
-        .any(|a| a.starts_with('-') || BOX_ONE_SHOT_ACTIONS.contains(&a.to_lowercase().as_str()))
-    {
+    let is_enter_token = |s: &str| {
+        matches!(
+            s.trim_start_matches('-'),
+            "enter" | "shell" | "sh" | "e"
+        )
+    };
+
+    if step.args.iter().any(|a| {
+        let lower = a.to_lowercase();
+        let clean = lower.trim_start_matches('-');
+        !is_enter_token(&lower)
+            && (a.starts_with('-') || BOX_ONE_SHOT_ACTIONS.contains(&clean))
+    }) {
         return None;
     }
 
@@ -35,7 +43,7 @@ fn extract_box_env_switch(step: &PipelineStep, config: &GrimeConfig) -> Option<S
         ),
         1 => {
             let first = step.args[0].to_lowercase();
-            if matches!(first.as_str(), "enter" | "shell" | "sh") {
+            if is_enter_token(&first) {
                 Some(
                     config
                         .get_opt("distrobox_default", Some("default"))
@@ -47,13 +55,27 @@ fn extract_box_env_switch(step: &PipelineStep, config: &GrimeConfig) -> Option<S
         }
         2 => {
             let first = step.args[0].to_lowercase();
-            if matches!(first.as_str(), "enter" | "shell" | "sh") {
+            if is_enter_token(&first) && !step.args[1].starts_with('-') {
                 Some(step.args[1].clone())
             } else {
                 None
             }
         }
         _ => None,
+    }
+}
+
+fn extract_nix_env_switch(step: &PipelineStep) -> bool {
+    match step.args.len() {
+        0 => true,
+        1 => {
+            let first = step.args[0].to_lowercase();
+            matches!(
+                first.trim_start_matches('-'),
+                "enter" | "shell" | "sh"
+            )
+        }
+        _ => false,
     }
 }
 
@@ -124,7 +146,7 @@ impl Orchestrator {
         }
     }
 
-    pub async fn run_pipeline(&self, parsed: &ParsedPipeline) -> Result<Option<String>, String> {
+    pub fn run_pipeline(&self, parsed: &ParsedPipeline) -> Result<Option<String>, String> {
         let steps = &parsed.steps;
         if steps.is_empty() {
             eprintln!("{} Нет шагов для исполнения.", "[Grime]".cyan().bold());
@@ -183,7 +205,7 @@ impl Orchestrator {
             let raw_step = &steps[step_idx];
             let mod_name = canonical_module_name(&raw_step.module);
 
-            // Рубеж сред `: box <name> : ... : host :`
+            // Рубеж сред `: box <name> : ... : host :` и `: nix : ... : host :`
             let mut next_step_idx = step_idx + 1;
             let effective_step: std::borrow::Cow<'_, PipelineStep> =
                 if mod_name == "box" && step_idx + 1 < total_steps {
@@ -207,10 +229,12 @@ impl Orchestrator {
                             );
 
                             let mut synth_args = vec![
-                                "run".to_string(),
+                                "-run".to_string(),
                                 box_name,
                                 "--".to_string(),
                                 "grime".to_string(),
+                                "-p".to_string(),
+                                current_target_dir.to_string_lossy().to_string(),
                             ];
                             if parsed.force {
                                 synth_args.push("-f".to_string());
@@ -234,15 +258,65 @@ impl Orchestrator {
                     } else {
                         std::borrow::Cow::Borrowed(raw_step)
                     }
+                } else if mod_name == "nix" && step_idx + 1 < total_steps && extract_nix_env_switch(raw_step) {
+                    let host_idx = steps
+                        .iter()
+                        .enumerate()
+                        .skip(step_idx + 1)
+                        .find(|(_, candidate)| is_host_step(&candidate.module))
+                        .map(|(idx, _)| idx);
+
+                    let end_sub_idx = host_idx.unwrap_or(total_steps);
+                    let sub_steps = &steps[(step_idx + 1)..end_sub_idx];
+                    if !sub_steps.is_empty() {
+                        let sub_cli = format_subpipeline_cli(sub_steps);
+                        eprintln!(
+                            "{} Переключение среды в Nix DevShell -> {}",
+                            "[Grime Nix]".cyan().bold(),
+                            sub_cli
+                        );
+
+                        let mut synth_args = vec![
+                            "-run".to_string(),
+                            "--".to_string(),
+                            "grime".to_string(),
+                            "-p".to_string(),
+                            current_target_dir.to_string_lossy().to_string(),
+                        ];
+                        if parsed.force {
+                            synth_args.push("-f".to_string());
+                        }
+                        for (i, s) in sub_steps.iter().enumerate() {
+                            if i > 0 {
+                                synth_args.push(":".to_string());
+                            }
+                            synth_args.push(s.module.clone());
+                            synth_args.extend(s.args.clone());
+                        }
+
+                        next_step_idx = host_idx.map_or(total_steps, |h| h + 1);
+                        std::borrow::Cow::Owned(PipelineStep {
+                            module: "nix".to_string(),
+                            args: synth_args,
+                        })
+                    } else {
+                        std::borrow::Cow::Borrowed(raw_step)
+                    }
                 } else {
                     std::borrow::Cow::Borrowed(raw_step)
                 };
+
+            let effective_total_steps = if next_step_idx >= total_steps {
+                step_idx + 1
+            } else {
+                total_steps
+            };
 
             // Установка контекста шага с передачей PipelinePayload (Zero-Copy bytes::Bytes) и флага force
             if let Err(e) = self.engine.set_step_context(
                 &effective_step,
                 step_idx,
-                total_steps,
+                effective_total_steps,
                 &current_target_dir,
                 pipeline_data.as_deref(),
                 pipeline_payload.as_ref(),

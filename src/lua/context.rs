@@ -211,24 +211,7 @@ pub fn init_context_table(
     ctx_tbl.set(
         "error",
         lua.create_function(|lua_ctx, msg: String| {
-            if let Ok(g) = lua_ctx.globals().get::<Table>("grime") {
-                if let Ok(c) = g.get::<Table>("ctx") {
-                    let existing = c.get::<Value>("_error_message").ok();
-                    let has_existing = match existing {
-                        Some(Value::String(s)) => s
-                            .to_str()
-                            .map(|s_ref| !s_ref.is_empty() && s_ref != "Шаг конвейера завершился ошибкой")
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-                    if !has_existing {
-                        let _ = c.set("_error_message", msg.clone());
-                    }
-                    let _ = c.set("_ui_error_msg", msg);
-                    return Ok(());
-                }
-            }
-            eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
+            super::api_ui::print_formatted_error(lua_ctx, &msg);
             Ok(())
         })?,
     )?;
@@ -544,88 +527,49 @@ pub fn init_context_table(
         })?,
     )?;
 
+    fn resolve_named_ctx_path(
+        lua_ctx: &Lua,
+        path_key: &str,
+        cfg_fn_name: &str,
+    ) -> Result<String, mlua::Error> {
+        let globals = lua_ctx.globals();
+        let g: Table = globals.get("grime")?;
+        let c: Table = g.get("ctx")?;
+        let cfg_tbl: Table = g.get("config")?;
+        let cfg_fn: mlua::Function = cfg_tbl.get(cfg_fn_name)?;
+        let default_p: String = cfg_fn.call(())?;
+        let get_path_fn: mlua::Function = c.get("get_path")?;
+        let p: String = get_path_fn.call((path_key, Some(default_p)))?;
+        let fs_tbl: Table = g.get("fs")?;
+        let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
+        norm_fn.call::<String>(p)
+    }
+
     ctx_tbl.set(
         "projects_root",
         lua.create_function(|lua_ctx, ()| {
-            let globals = lua_ctx.globals();
-            let g: Table = globals.get("grime")?;
-            let c: Table = g.get("ctx")?;
-            let get_path_fn: mlua::Function = c.get("get_path")?;
-            let default_p = dirs::home_dir()
-                .map(|h| h.join("Projects").to_string_lossy().to_string())
-                .unwrap_or_else(|| "./projects".to_string());
-            let p: String = get_path_fn.call(("projects", Some(default_p)))?;
-            let fs_tbl: Table = g.get("fs")?;
-            let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
-            norm_fn.call::<String>(p)
+            resolve_named_ctx_path(lua_ctx, "projects", "projects_root")
         })?,
     )?;
 
     ctx_tbl.set(
         "templates_root",
         lua.create_function(|lua_ctx, ()| {
-            let globals = lua_ctx.globals();
-            let g: Table = globals.get("grime")?;
-            let c: Table = g.get("ctx")?;
-            let get_path_fn: mlua::Function = c.get("get_path")?;
-            let default_p = dirs::home_dir()
-                .map(|h| {
-                    h.join(".config")
-                        .join("grime")
-                        .join("templates")
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .unwrap_or_else(|| "./templates".to_string());
-            let p: String = get_path_fn.call(("templates", Some(default_p)))?;
-            let fs_tbl: Table = g.get("fs")?;
-            let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
-            norm_fn.call::<String>(p)
+            resolve_named_ctx_path(lua_ctx, "templates", "templates_root")
         })?,
     )?;
 
     ctx_tbl.set(
         "apps_root",
         lua.create_function(|lua_ctx, ()| {
-            let globals = lua_ctx.globals();
-            let g: Table = globals.get("grime")?;
-            let c: Table = g.get("ctx")?;
-            let get_path_fn: mlua::Function = c.get("get_path")?;
-            let default_p = dirs::home_dir()
-                .map(|h| {
-                    h.join(".config")
-                        .join("grime")
-                        .join("apps")
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .unwrap_or_else(|| "./apps".to_string());
-            let p: String = get_path_fn.call(("apps", Some(default_p)))?;
-            let fs_tbl: Table = g.get("fs")?;
-            let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
-            norm_fn.call::<String>(p)
+            resolve_named_ctx_path(lua_ctx, "apps", "apps_root")
         })?,
     )?;
 
     ctx_tbl.set(
         "config_dir",
         lua.create_function(|lua_ctx, ()| {
-            let globals = lua_ctx.globals();
-            let g: Table = globals.get("grime")?;
-            let c: Table = g.get("ctx")?;
-            let get_path_fn: mlua::Function = c.get("get_path")?;
-            let default_p = dirs::home_dir()
-                .map(|h| {
-                    h.join(".config")
-                        .join("grime")
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .unwrap_or_else(|| ".".to_string());
-            let p: String = get_path_fn.call(("config", Some(default_p)))?;
-            let fs_tbl: Table = g.get("fs")?;
-            let norm_fn: mlua::Function = fs_tbl.get("normalize")?;
-            norm_fn.call::<String>(p)
+            resolve_named_ctx_path(lua_ctx, "config", "config_dir")
         })?,
     )?;
 

@@ -4,6 +4,33 @@
 
 use mlua::{Lua, Table, Value};
 
+fn convert_separated_case(s: &str, sep: char) -> String {
+    let alt_sep = if sep == '_' { '-' } else { '_' };
+    let mut result = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || c == alt_sep || c == sep {
+            if !result.ends_with(sep) && !result.is_empty() {
+                result.push(sep);
+            }
+        } else if c.is_uppercase() {
+            if i > 0 && !result.ends_with(sep) {
+                let prev = chars[i - 1];
+                if prev.is_lowercase() || prev.is_numeric() {
+                    result.push(sep);
+                }
+            }
+            for lc in c.to_lowercase() {
+                result.push(lc);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result.trim_matches(sep).to_string()
+}
+
 /// Регистрирует подтаблицы `grime.str` и `grime.table`.
 pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
     // -------------------------------------------------------------
@@ -14,61 +41,13 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
     // grime.str.to_snake_case(s) -> string
     str_tbl.set(
         "to_snake_case",
-        lua.create_function(|_, s: String| {
-            let mut result = String::new();
-            let chars: Vec<char> = s.chars().collect();
-            for i in 0..chars.len() {
-                let c = chars[i];
-                if c.is_whitespace() || c == '-' {
-                    if !result.ends_with('_') && !result.is_empty() {
-                        result.push('_');
-                    }
-                } else if c.is_uppercase() {
-                    if i > 0 && !result.ends_with('_') {
-                        let prev = chars[i - 1];
-                        if prev.is_lowercase() || prev.is_numeric() {
-                            result.push('_');
-                        }
-                    }
-                    for lc in c.to_lowercase() {
-                        result.push(lc);
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-            Ok(result.trim_matches('_').to_string())
-        })?,
+        lua.create_function(|_, s: String| Ok(convert_separated_case(&s, '_')))?,
     )?;
 
     // grime.str.to_kebab_case(s) -> string
     str_tbl.set(
         "to_kebab_case",
-        lua.create_function(|_, s: String| {
-            let mut result = String::new();
-            let chars: Vec<char> = s.chars().collect();
-            for i in 0..chars.len() {
-                let c = chars[i];
-                if c.is_whitespace() || c == '_' {
-                    if !result.ends_with('-') && !result.is_empty() {
-                        result.push('-');
-                    }
-                } else if c.is_uppercase() {
-                    if i > 0 && !result.ends_with('-') {
-                        let prev = chars[i - 1];
-                        if prev.is_lowercase() || prev.is_numeric() {
-                            result.push('-');
-                        }
-                    }
-                    for lc in c.to_lowercase() {
-                        result.push(lc);
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-            Ok(result.trim_matches('-').to_string())
-        })?,
+        lua.create_function(|_, s: String| Ok(convert_separated_case(&s, '-')))?,
     )?;
 
     // grime.str.trim(s) -> string
@@ -261,13 +240,16 @@ pub fn register_str_table_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::
     // grime.table.slice(tbl, start, finish) -> table
     tbl_tbl.set(
         "slice",
-        lua.create_function(|lua, (tbl, start, end_idx): (Table, usize, Option<usize>)| {
+        lua.create_function(|lua, (tbl, s, end_idx): (Table, Option<usize>, Option<usize>)| {
             let res = lua.create_table()?;
             let len = tbl.raw_len();
+            let start = s.unwrap_or(1).max(1);
             let finish = end_idx.unwrap_or(len).min(len);
-            for (out_idx, i) in (start..=finish).enumerate() {
-                let val: Value = tbl.get(i)?;
-                res.set(out_idx + 1, val)?;
+            if start <= finish {
+                for (out_idx, i) in (start..=finish).enumerate() {
+                    let val: Value = tbl.get(i)?;
+                    res.set(out_idx + 1, val)?;
+                }
             }
             Ok(res)
         })?,

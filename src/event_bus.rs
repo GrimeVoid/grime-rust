@@ -109,23 +109,7 @@ pub fn register_event_bus_api(lua: &Lua, event_bus: Arc<EventBus>) -> Result<(),
             bus_clone.emit(&event_name, json_payload.clone());
 
             // Диспетчеризируем слушателям в текущей Lua VM
-            let globals = lua.globals();
-            if let Ok(listeners) = globals.get::<mlua::Table>("_grime_event_listeners") {
-                let lua_arg = crate::state_bus::json_to_lua(lua, &json_payload)?;
-                let call_list = |tbl: mlua::Table| -> Result<(), mlua::Error> {
-                    for func in tbl.sequence_values::<Function>().flatten() {
-                        let _ = func.call::<()>(lua_arg.clone());
-                    }
-                    Ok(())
-                };
-
-                if let Ok(exact) = listeners.get::<mlua::Table>(event_name.as_str()) {
-                    let _ = call_list(exact);
-                }
-                if let Ok(wildcard) = listeners.get::<mlua::Table>("*") {
-                    let _ = call_list(wildcard);
-                }
-            }
+            dispatch_event_to_lua(lua, &event_name, &json_payload)?;
 
             Ok(true)
         })?,

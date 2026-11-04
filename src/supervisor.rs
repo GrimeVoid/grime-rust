@@ -331,7 +331,7 @@ impl TaskSupervisor {
             });
 
             let exec_res = tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current().block_on(orchestrator.run_pipeline(&parsed))
+                orchestrator.run_pipeline(&parsed)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Паника в задаче оркестратора: {}", e)));

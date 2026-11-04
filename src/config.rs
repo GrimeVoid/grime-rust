@@ -233,9 +233,42 @@ impl GrimeConfig {
     pub fn modules_dir(&self) -> PathBuf {
         self.get_path("modules")
             .unwrap_or_else(|| {
-                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                let home = crate::fs_ops::get_cached_home_dir()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("/tmp"));
                 crate::fs_ops::normalize_path(&home.join(".config").join("grime").join("modules"))
             })
+    }
+
+    /// Единый упорядоченный список директорий-кандидатов для поиска Lua-модулей.
+    pub fn candidate_module_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        dirs.push(PathBuf::from("modules"));
+        dirs.push(self.modules_dir());
+        if let Ok(exe_p) = std::env::current_exe() {
+            if let Some(parent) = exe_p.parent() {
+                dirs.push(parent.join("../share/grime/modules"));
+                dirs.push(parent.join("modules"));
+            }
+        }
+        if let Some(home) = crate::fs_ops::get_cached_home_dir() {
+            dirs.push(home.join("dotfiles").join("grime").join("modules"));
+            dirs.push(home.join(".config").join("grime").join("modules"));
+        }
+        dirs
+    }
+
+    /// Разрешает эффективную директорию модулей с учётом явного переопределения и существующих путей.
+    pub fn resolve_modules_dir(&self, override_dir: Option<PathBuf>) -> PathBuf {
+        if let Some(dir) = override_dir {
+            return dir;
+        }
+        for cand in self.candidate_module_dirs() {
+            if cand.exists() {
+                return cand;
+            }
+        }
+        self.modules_dir()
     }
 
     pub fn projects_root(&self) -> PathBuf {

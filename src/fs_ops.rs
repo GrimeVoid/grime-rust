@@ -190,6 +190,13 @@ pub fn delete_safe(path: &Path, missing_ok: bool) -> Result<bool, String> {
 }
 
 pub fn copy_recursive(src: &Path, dst: &Path) -> Result<PathBuf, String> {
+    if is_system_or_root_path(dst) {
+        return Err(format!(
+            "Попытка копирования в защищенный системный путь: '{}'!",
+            dst.display()
+        ));
+    }
+
     let src_meta = fs::symlink_metadata(src)
         .map_err(|_| format!("Исходный путь не найден: {}", src.display()))?;
 

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::fs_ops::{
     copy_recursive, delete_safe, expand_and_normalize, expand_tilde, get_latest_mtime, is_newer,
-    move_safe, normalize_path,
+    is_system_or_root_path, move_safe, normalize_path,
 };
 
 /// Регистрирует подтаблицу `grime.fs` со всеми файловыми функциями.
@@ -160,6 +160,12 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
         "write",
         lua.create_function(|_, (path, content): (String, String)| {
             let p = expand_tilde(&path);
+            if is_system_or_root_path(p.as_ref()) {
+                return Err(mlua::Error::runtime(format!(
+                    "Попытка записи в защищенный системный путь: '{}'!",
+                    p.as_ref().display()
+                )));
+            }
             if let Some(parent) = p.as_ref().parent() {
                 let _ = fs::create_dir_all(parent);
             }

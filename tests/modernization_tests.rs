@@ -106,7 +106,7 @@ async fn test_stage1_shared_state_bus_and_raii() {
     assert!(!orch.state_bus().has("pipeline.counter"));
 
     // Запуск конвейера
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Пайплайн завершился с ошибкой: {:?}", res);
     let output = res.unwrap().unwrap();
     assert_eq!(output, "consumer_finished:generated_data");
@@ -155,7 +155,7 @@ async fn test_stage2_cancellation_and_cleanup() {
     });
 
     let start = std::time::Instant::now();
-    let res = orch_clone.run_pipeline(&parsed).await;
+    let res = orch_clone.run_pipeline(&parsed);
     let elapsed = start.elapsed();
 
     // Пайплайн должен быть прерван и не зависнуть в бесконечном цикле
@@ -203,7 +203,7 @@ async fn test_stage4_event_bus_lifecycle() {
     let mut rx = orch.event_bus().subscribe();
 
     let parsed = parse_pipeline_args(&["test_producer".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok());
 
     // Собираем события из EventBus
@@ -290,7 +290,7 @@ custom_key = /tmp/special_dir
 
     let orch = Orchestrator::new(Some(mod_dir), Some(&conf_path)).unwrap();
     let parsed = parse_pipeline_args(&["test_paths".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн с путями упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "paths_ok");
@@ -371,7 +371,7 @@ async fn test_fuzzy_matching_entities_and_flags() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["test_fuzzy".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн с fuzzy тестами упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "fuzzy_tests_passed");
@@ -418,7 +418,7 @@ async fn test_no_helper_lua_native_execution() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["native_test".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн без helper.lua упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "native_ok");
@@ -488,7 +488,7 @@ async fn test_long_pipeline_multistep_chain() {
     ]);
 
     assert_eq!(parsed.steps.len(), 4);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Длинный конвейер завершился ошибкой: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "alpha:beta:gamma:delta");
 }
@@ -512,7 +512,7 @@ async fn test_command_list_and_aliases() {
     let local_mods = PathBuf::from("modules");
     if local_mods.join("list.lua").exists() {
         let orch = Orchestrator::new(Some(local_mods), None).unwrap();
-        let res = orch.run_pipeline(&p_list).await;
+        let res = orch.run_pipeline(&p_list);
         assert!(res.is_ok(), "Выполнение grime list завершилось ошибкой: {:?}", res);
         let ret = res.unwrap().unwrap();
         let count: usize = ret.parse().unwrap_or(0);
@@ -558,7 +558,7 @@ async fn test_pipeline_table_to_json_serialization() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["producer_tbl".to_string(), ":".to_string(), "consumer_tbl".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Пайплайн упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "verified:apple");
 }
@@ -595,14 +595,14 @@ async fn test_pipeline_stop_on_error_and_return_false() {
 
     // 1. Без force: конвейер останавливается на fail_step, never_step не выполняется
     let parsed_no_force = parse_pipeline_args(&["fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
-    let res = orch.run_pipeline(&parsed_no_force).await;
+    let res = orch.run_pipeline(&parsed_no_force);
     assert!(res.is_err(), "Конвейер должен был вернуть ошибку без --force");
     assert!(!orch.state_bus().has("modules.never.ran"), "never_step не должен был запускаться!");
 
     // 2. С force: конвейер продолжает выполнение
     let parsed_force = parse_pipeline_args(&["--force".to_string(), "fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
     assert!(parsed_force.force);
-    let res_force = orch.run_pipeline(&parsed_force).await;
+    let res_force = orch.run_pipeline(&parsed_force);
     assert!(res_force.is_ok(), "Конвейер с --force должен был продолжить работу");
     assert!(orch.state_bus().has("modules.never.ran"), "never_step должен был запуститься с --force!");
     orch.state_bus().delete("modules.never.ran");
@@ -641,7 +641,7 @@ async fn test_pipeline_input_special_characters_and_multiline() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["producer_multiline".to_string(), ":".to_string(), "consumer_multiline".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Многострочный пайплайн упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "multiline_verified");
 }
@@ -664,7 +664,7 @@ async fn test_project_overwrite_protection() {
             "-cpp".to_string(),
             proj_dir.to_string_lossy().to_string(),
         ]);
-        let res = orch.run_pipeline(&parsed_no_force).await;
+        let res = orch.run_pipeline(&parsed_no_force);
         assert!(res.is_err(), "Инициализация поверх непустой директории без --force должна завершиться ошибкой!");
         let err_msg = res.unwrap_err();
         assert!(err_msg.contains("уже существует и не пуста"));
@@ -682,7 +682,7 @@ async fn test_project_overwrite_protection() {
             proj_dir.to_string_lossy().to_string(),
         ]);
         assert!(parsed_force.force);
-        let res_force = orch.run_pipeline(&parsed_force).await;
+        let res_force = orch.run_pipeline(&parsed_force);
         assert!(res_force.is_ok(), "Инициализация с --force должна была выполниться: {:?}", res_force);
     }
 }
@@ -717,7 +717,7 @@ async fn test_module_returning_table_with_functions_not_leaked_as_json() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["ui_module".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Выполнение ui_module упало: {:?}", res);
     let output = res.unwrap();
     assert!(
@@ -790,7 +790,7 @@ async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
         "step_three".to_string(),
     ]);
 
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Пайплайн stage3 упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "stage3_ok");
 
@@ -830,7 +830,7 @@ async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
         ":".to_string(),
         "step_check_explicit".to_string(),
     ]);
-    let res_explicit = orch.run_pipeline(&parsed_explicit).await;
+    let res_explicit = orch.run_pipeline(&parsed_explicit);
     assert!(res_explicit.is_ok(), "Пайплайн с явным set_target_dir упал: {:?}", res_explicit);
     assert_eq!(res_explicit.unwrap().unwrap(), "explicit_verified");
 }
@@ -841,16 +841,17 @@ async fn test_box_host_environment_boundary_orchestration() {
     let mod_dir = temp.path().join("modules");
     fs::create_dir_all(&mod_dir).unwrap();
 
-    // Мок модуля box.lua, фиксирующий вызов `box run <name> -- grime ...`
+    // Мок модуля box.lua, фиксирующий вызов `box -run <name> -- grime -p <target_dir> ...`
     fs::write(
         mod_dir.join("box.lua"),
         r#"
         function main()
             local args = grime.ctx.args or {}
-            assert(args[1] == "run", "Expected action run, got: " .. tostring(args[1]))
+            assert(args[1] == "-run" or args[1] == "run", "Expected action -run, got: " .. tostring(args[1]))
             assert(args[2] == "arch", "Expected box name arch, got: " .. tostring(args[2]))
             assert(args[3] == "--", "Expected '--'")
             assert(args[4] == "grime", "Expected 'grime'")
+            assert(args[5] == "-p", "Expected '-p' target_dir forwarding")
             local joined = table.concat(args, "|")
             assert(joined:find("pkg|install|%-n|fzf|:|cmd|echo|hello world"), "Subpipeline mismatch: " .. joined)
             grime.ctx.success("from_box:" .. args[2])
@@ -908,7 +909,7 @@ async fn test_box_host_environment_boundary_orchestration() {
     .collect();
 
     let parsed = parse_pipeline_args(&raw_args);
-    let res = orch.run_pipeline(&parsed).await.expect("run_pipeline box->host");
+    let res = orch.run_pipeline(&parsed).expect("run_pipeline box->host");
     assert_eq!(res.as_deref(), Some("from_box:arch->git_status"));
 }
 
@@ -931,7 +932,7 @@ async fn test_single_source_of_error_and_root_cause_preservation() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["test_cascading_err".to_string()]);
-    let res = orch.run_pipeline(&parsed).await;
+    let res = orch.run_pipeline(&parsed);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(
@@ -963,12 +964,12 @@ async fn test_universal_dash_flags_standard() {
         "--get".to_string(),
         "pipeline.dash_test".to_string(),
     ]);
-    let res_pipe = orch.run_pipeline(&p_pipe).await.expect("bus -set : bus --get");
+    let res_pipe = orch.run_pipeline(&p_pipe).expect("bus -set : bus --get");
     assert_eq!(res_pipe.as_deref(), Some("ok_dash"));
 
     // Проверка list с флагом -modules
     let p_list = parse_pipeline_args(&["list".to_string(), "-modules".to_string()]);
-    let res_list = orch.run_pipeline(&p_list).await;
+    let res_list = orch.run_pipeline(&p_list);
     assert!(res_list.is_ok(), "grime list -modules должен отрабатывать успешно");
 }
 
@@ -1036,7 +1037,7 @@ async fn test_native_args_engine_in_lua() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["test_args".to_string()]);
-    let res = orch.run_pipeline(&parsed).await.expect("test_args pipeline run");
+    let res = orch.run_pipeline(&parsed).expect("test_args pipeline run");
     assert_eq!(res.as_deref(), Some("native_args_ok"));
 }
 
@@ -1100,8 +1101,74 @@ async fn test_stage8_strict_dash_and_path_flag() {
 
     let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
     let parsed = parse_pipeline_args(&["test_strict".to_string()]);
-    let res = orch.run_pipeline(&parsed).await.expect("test_strict pipeline run");
+    let res = orch.run_pipeline(&parsed).expect("test_strict pipeline run");
     assert_eq!(res.as_deref(), Some("strict_dash_ok"));
 }
+
+#[tokio::test]
+async fn test_nix_host_environment_boundary_orchestration() {
+    let temp = TestTempDir::new("grime_nix_host_boundary");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+
+    // Мок модуля nix.lua, фиксирующий вызов `nix -run -- grime -p <target_dir> ...`
+    fs::write(
+        mod_dir.join("nix.lua"),
+        r#"
+        function main()
+            local args = grime.ctx.args or {}
+            assert(args[1] == "-run", "Expected action -run, got: " .. tostring(args[1]))
+            assert(args[2] == "--", "Expected '--'")
+            assert(args[3] == "grime", "Expected 'grime'")
+            assert(args[4] == "-p", "Expected '-p' target_dir forwarding")
+            assert(grime.ctx.has_next_step == true, "nix step must see has_next_step == true before host step")
+            local joined = table.concat(args, "|")
+            assert(joined:find("project|%-build|:|cmd|cargo|test"), "Subpipeline mismatch: " .. joined)
+            grime.ctx.success("from_nix_devshell")
+        end
+        "#,
+    )
+    .unwrap();
+
+    // Мок модуля git.lua (должен выполниться уже на хосте после `: host :` как последний шаг)
+    fs::write(
+        mod_dir.join("git.lua"),
+        r#"
+        function main()
+            local inp = grime.ctx.input or ""
+            local args = grime.ctx.args or {}
+            assert(grime.ctx.is_last_step == true, "git step after : host : must be last step")
+            assert(grime.ctx.has_next_step == false, "git step after : host : must have has_next_step == false")
+            grime.ctx.success(inp .. "->host_git_" .. (args[1] or ""))
+        end
+        "#,
+    )
+    .unwrap();
+
+    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
+    let raw_args: Vec<String> = vec![
+        "nix",
+        ":",
+        "project",
+        "-build",
+        ":",
+        "cmd",
+        "cargo",
+        "test",
+        ":",
+        "host",
+        ":",
+        "git",
+        "-status",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let parsed = parse_pipeline_args(&raw_args);
+    let res = orch.run_pipeline(&parsed).expect("run_pipeline nix->host");
+    assert_eq!(res.as_deref(), Some("from_nix_devshell->host_git_-status"));
+}
+
 
 

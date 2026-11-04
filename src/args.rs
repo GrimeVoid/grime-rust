@@ -196,12 +196,11 @@ pub fn fuzzy_match_flag<'a>(
     let mut second_best_score = 0.0;
 
     for &cand in known_flags {
+        let cand_raw = cand.trim_start_matches('-');
+        if cand_raw.is_empty() {
+            continue;
+        }
         let cand_is_double = cand.starts_with("--");
-        let cand_raw = if cand_is_double {
-            &cand[2..]
-        } else {
-            &cand[1..]
-        };
 
         let len_cand = if cand_raw.is_ascii() { cand_raw.len() } else { cand_raw.chars().count() };
         if len_cand <= 1 {
@@ -415,6 +414,11 @@ mod tests {
         assert_eq!(fuzzy_match_flag("cowsay", flags, 0.75), None);
         assert_eq!(fuzzy_match_flag("MyProject", flags, 0.75), None);
         assert_eq!(fuzzy_match_flag("--", flags, 0.75), None);
+
+        // Пустые, дефисные и UTF-8 кандидаты без дефиса не должны вызывать панику
+        let weird_flags = &["", "-", "--", "флаг", "тест", "--помощь"];
+        assert_eq!(fuzzy_match_flag("--halp", weird_flags, 0.75), None);
+        assert_eq!(fuzzy_match_flag("--помощ", weird_flags, 0.75), Some("--помощь"));
     }
 
     #[test]

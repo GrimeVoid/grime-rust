@@ -82,9 +82,10 @@ impl PipelinePayload {
     /// Zero-copy срез данных: не создает новых аллокаций в куче,
     /// просто увеличивает счетчик ссылок (atomic ref count).
     pub fn slice(&self, start: usize, len: usize) -> Option<Self> {
-        if start + len <= self.data.len() {
+        let end = start.checked_add(len)?;
+        if end <= self.data.len() {
             Some(Self {
-                data: self.data.slice(start..start + len),
+                data: self.data.slice(start..end),
             })
         } else {
             None
@@ -198,6 +199,11 @@ mod tests {
 
         // Убеждаемся, что указатель в срезе ссылается на тот же буфер
         assert_eq!(slice.as_slice(), b"Zero Copy");
+
+        // Защита от переполнения usize при больших значениях
+        assert!(original.slice(usize::MAX, 1).is_none());
+        assert!(original.slice(1, usize::MAX).is_none());
+        assert!(original.slice(usize::MAX, usize::MAX).is_none());
     }
 
     #[test]

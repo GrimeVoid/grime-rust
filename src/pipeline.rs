@@ -30,21 +30,7 @@ const BUILTIN_MODULE_NAMES: &[&str] = &[
 /// Динамическое сканирование директорий модулей Grime на диске
 pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<String> {
     let mut modules = Vec::new();
-    let mut search_dirs = Vec::new();
-    search_dirs.push(PathBuf::from("modules"));
-    search_dirs.push(config.modules_dir());
-    if let Some(home) = crate::fs_ops::get_cached_home_dir() {
-        search_dirs.push(home.join(".config").join("grime").join("modules"));
-        search_dirs.push(home.join("dotfiles").join("grime").join("modules"));
-    }
-    if let Ok(exe_p) = std::env::current_exe() {
-        if let Some(parent) = exe_p.parent() {
-            search_dirs.push(parent.join("../share/grime/modules"));
-            search_dirs.push(parent.join("modules"));
-        }
-    }
-
-    for dir in search_dirs {
+    for dir in config.candidate_module_dirs() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -63,13 +49,27 @@ pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<St
     modules
 }
 
-static MODULES_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+static MODULES_CACHE: std::sync::RwLock<Option<Vec<String>>> = std::sync::RwLock::new(None);
 
-pub fn cached_available_modules() -> &'static [String] {
-    MODULES_CACHE.get_or_init(|| {
-        let config = crate::config::GrimeConfig::load_or_default(None);
-        discover_available_modules(&config)
-    })
+/// Сбрасывает кэш доступных модулей (вызывается при Hot-Reload в демоне или смене директории модулей).
+pub fn invalidate_modules_cache() {
+    if let Ok(mut guard) = MODULES_CACHE.write() {
+        *guard = None;
+    }
+}
+
+pub fn cached_available_modules() -> Vec<String> {
+    if let Ok(guard) = MODULES_CACHE.read() {
+        if let Some(ref list) = *guard {
+            return list.clone();
+        }
+    }
+    let config = crate::config::GrimeConfig::load_or_default(None);
+    let discovered = discover_available_modules(&config);
+    if let Ok(mut guard) = MODULES_CACHE.write() {
+        *guard = Some(discovered.clone());
+    }
+    discovered
 }
 
 /// Проверяет, является ли токен известным именем (или алиасом) модуля Grime

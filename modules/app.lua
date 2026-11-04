@@ -1722,7 +1722,6 @@ function main()
         end
 
         if ctx.set_target_dir then ctx.set_target_dir(app_dir) end
-        print(app_dir)
         ctx.module_return(app_dir)
         return 0
     end

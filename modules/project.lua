@@ -488,7 +488,6 @@ function main()
     if action == "path" then
         if ctx.exists(project_dir) then
             if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
-            print(project_dir)
             ctx.module_return(project_dir)
             return
         else

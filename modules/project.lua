@@ -447,7 +447,7 @@ function main()
             lang = { "--lang", "-lang" },
         },
         categories = { language = LANGUAGE_ALIASES },
-        detect_dir = true,
+        detect_dir = false,
     })
 
     if parsed.flags.lang and type(parsed.flags.lang) == "string" then

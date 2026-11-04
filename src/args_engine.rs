@@ -120,7 +120,7 @@ pub fn strip_dashes(token: &str) -> &str {
 pub fn parse_tokens(
     spec: &ArgSpec,
     raw_args: &[String],
-    default_target_dir: Option<&str>,
+    _default_target_dir: Option<&str>,
 ) -> ParsedArgs {
     let (tokens_before, command_tokens, has_separator) = split_passthrough(raw_args);
 
@@ -373,9 +373,8 @@ pub fn parse_tokens(
         i += 1;
     }
 
-    if res_target_dir.is_none() && spec.detect_dir {
-        res_target_dir = default_target_dir.map(String::from);
-    }
+    // res_target_dir заполняется ТОЛЬКО если в аргументах был обнаружен явный путь.
+    // Если пути в аргументах не было, target_dir остается None, чтобы модуль мог отличить явный ввод от контекста.
 
     ParsedArgs {
         action: res_action,

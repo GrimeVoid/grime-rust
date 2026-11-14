@@ -287,7 +287,7 @@ if [[ "$SETUP_HOOK" == "true" ]]; then
         mkdir -p "$HOME/.config/fish/functions"
         cat << 'EOF' > "$HOME/.config/fish/functions/fish_command_not_found.fish"
 function fish_command_not_found
-    grime pkg not-found --no-confirm -- $argv
+    grime pkg -not-found --no-confirm -- $argv
 end
 EOF
         log_success "Настроен хук Fish: ~/.config/fish/functions/fish_command_not_found.fish"
@@ -295,14 +295,14 @@ EOF
 
     # 2. Bash shell
     if [[ -f "$HOME/.bashrc" ]]; then
-        if grep -q "grime pkg not-found" "$HOME/.bashrc"; then
+        if grep -q "grime pkg -\?not-found" "$HOME/.bashrc"; then
             log_info "Хук GRIME уже присутствует в ~/.bashrc."
         else
             cat << 'EOF' >> "$HOME/.bashrc"
 
 # GRIME ephemeral command-not-found hook
 command_not_found_handle() {
-    grime pkg not-found --no-confirm -- "$@"
+    grime pkg -not-found --no-confirm -- "$@"
 }
 EOF
             log_success "Добавлен хук в ~/.bashrc"
@@ -311,14 +311,14 @@ EOF
 
     # 3. Zsh shell
     if [[ -f "$HOME/.zshrc" ]]; then
-        if grep -q "grime pkg not-found" "$HOME/.zshrc"; then
+        if grep -q "grime pkg -\?not-found" "$HOME/.zshrc"; then
             log_info "Хук GRIME уже присутствует в ~/.zshrc."
         else
             cat << 'EOF' >> "$HOME/.zshrc"
 
 # GRIME ephemeral command-not-found hook
 command_not_found_handler() {
-    grime pkg not-found --no-confirm -- "$@"
+    grime pkg -not-found --no-confirm -- "$@"
 }
 EOF
             log_success "Добавлен хук в ~/.zshrc"

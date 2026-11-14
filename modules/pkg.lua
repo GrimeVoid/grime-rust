@@ -1933,7 +1933,7 @@ local function print_help()
     grime pkg -r, --run <утилита> [args...] # Сквозной мультипакетный запуск утилиты или приложения
     grime pkg -r, --run <менеджер> <утилита># Явный запуск утилиты через конкретный менеджер
     grime pkg run --help                    # Справка по правилам запуска
-    grime pkg not-found <команда> [args]    # Умный обработчик command-not-found (системный шелл)
+    grime pkg -not-found <команда> [args]   # Умный обработчик command-not-found (системный шелл)
     grime pkg -h, --help, help              # Показать эту справку
 
 %sФЛАГИ:%s

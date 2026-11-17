@@ -1910,11 +1910,10 @@ local function handle_not_found(args, run_ctx)
         best_match = grime.fuzzy.match_best(cmd, candidates)
     end
 
-    io.stdout:write(string.format("[Grime] Команда '%s' не найдена в системе и контейнерах.\n", cmd))
     if best_match and best_match ~= "" and best_match ~= cmd then
         io.stdout:write(string.format("💡 Возможно, вы имели в виду: %s?\n", best_match))
     end
-    context.fail(string.format("Команда '%s' не найдена (код 127)", cmd))
+    context.fail(string.format("Команда '%s' не найдена в системе и контейнерах.", cmd))
 end
 
 -- 7. Справка

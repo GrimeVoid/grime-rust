@@ -17,13 +17,55 @@ local ACTIONS = {
     ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
+--- Определение имени текущего контейнера (если grime запущен внутри Distrobox/Podman)
+local function get_current_container()
+    local cid = os.getenv("CONTAINER_ID")
+    if cid then
+        cid = cid:match("^%s*(.-)%s*$")
+        if cid ~= "" then
+            return cid
+        end
+    end
+    local f = io.open("/run/.containerenv", "r")
+    if f then
+        local content = f:read("*a")
+        f:close()
+        if content then
+            for line in content:gmatch("[^\r\n]+") do
+                local name = line:match('^%s*name%s*=%s*"([^"]+)"')
+                    or line:match("^%s*name%s*=%s*'([^']+)'")
+                    or line:match("^%s*name%s*=%s*(%S+)")
+                if name and name ~= "" then
+                    return name
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--- Формирование команды для хостовых утилит (distrobox/podman) с fallback на distrobox-host-exec
+local function host_cmd(tool, args)
+    local cmd = {}
+    if not utils.has_binary(tool, ctx) and get_current_container() ~= nil and utils.has_binary("distrobox-host-exec", ctx) then
+        table.insert(cmd, "distrobox-host-exec")
+    end
+    table.insert(cmd, tool)
+    if args then
+        for _, a in ipairs(args) do
+            table.insert(cmd, a)
+        end
+    end
+    return cmd
+end
+
 --- Получение списка контейнеров Distrobox без захардкоженного ядра Rust
 local function get_containers()
     if not (grime and grime.process) then
         return {}
     end
 
-    local res = grime.process.capture({ "distrobox", "list", "--no-color" })
+    local res = grime.process.capture(host_cmd("distrobox", { "list", "--no-color" }))
     if res.code ~= 0 or not res.stdout or res.stdout == "" then
         return {}
     end
@@ -85,23 +127,26 @@ end
 
 --- Управление жизненным циклом: запуск контейнера при необходимости и фиксация активности в bus
 local function ensure_box_running(box_name)
-    local containers = get_containers()
-    local is_running = false
-    for _, c in ipairs(containers) do
-        if c.name == box_name then
-            local st = string.lower(c.status or "")
-            if st:find("up") or st:find("running") then
-                is_running = true
-                break
+    local current_box = get_current_container()
+    if current_box ~= box_name then
+        local containers = get_containers()
+        local is_running = false
+        for _, c in ipairs(containers) do
+            if c.name == box_name then
+                local st = string.lower(c.status or "")
+                if st:find("up") or st:find("running") then
+                    is_running = true
+                    break
+                end
             end
         end
-    end
 
-    if not is_running then
-        ctx.log(string.format("Запуск окружения Distrobox/Podman '%s'...", box_name))
-        local res = grime.process.capture({ "podman", "start", box_name })
-        if res.code ~= 0 then
-            grime.process.run({ "distrobox", "enter", box_name, "--", "true" })
+        if not is_running then
+            ctx.log(string.format("Запуск окружения Distrobox/Podman '%s'...", box_name))
+            local res = grime.process.capture(host_cmd("podman", { "start", box_name }))
+            if res.code ~= 0 then
+                grime.process.run(host_cmd("distrobox", { "enter", box_name, "--", "true" }))
+            end
         end
     end
 
@@ -113,11 +158,13 @@ local function ensure_box_running(box_name)
         grime.bus.set("box.last_active", now)
         grime.bus.set("box.current", box_name)
     end
+    return true
 end
 
 --- Контроль времени простоя (Idle Keep-Alive) силами модуля
 local function check_idle_keepalive(box_name)
     if not (grime and grime.bus) then return end
+    if get_current_container() == box_name then return end
 
     local last_active = grime.bus.get("box." .. box_name .. ".last_active")
     if not last_active then return end
@@ -134,7 +181,7 @@ local function check_idle_keepalive(box_name)
     local elapsed = now - last_active
     if elapsed > idle_limit then
         ctx.log(string.format("Контейнер '%s' простаивает более %d сек (%d сек). Гашение контейнера...", box_name, idle_limit, elapsed))
-        grime.process.run({ "distrobox", "stop", box_name, "-Y" })
+        grime.process.run(host_cmd("distrobox", { "stop", box_name, "-Y" }))
         grime.bus.set("box." .. box_name .. ".status", "stopped")
     end
 end
@@ -170,8 +217,17 @@ end
 
 local function handle_enter(box_name, target_dir)
     ensure_box_running(box_name)
+    if get_current_container() == box_name then
+        ctx.log(string.format("Вы уже находитесь внутри контейнера '%s' (директория: %s).", box_name, target_dir))
+        if grime and grime.bus then
+            grime.bus.set("box." .. box_name .. ".last_active", os.time())
+        end
+        ctx.module_return(target_dir)
+        return
+    end
+
     ctx.log(string.format("Вход в контейнер '%s' (директория: %s)...", box_name, target_dir))
-    local cmd = { "distrobox", "enter", box_name }
+    local cmd = host_cmd("distrobox", { "enter", box_name })
     local ret = ctx.run_process(cmd, target_dir)
     if grime and grime.bus then
         grime.bus.set("box." .. box_name .. ".last_active", os.time())
@@ -202,8 +258,14 @@ local function handle_run(box_name, target_dir, command_tokens)
 
     ctx.log(string.format("Запуск в [%s]: %s (директория: %s)", box_name, cmd_str, target_dir))
     local escaped_dir = utils.shell_escape(target_dir)
-    local inner = string.format("export PATH=\"$PATH:$HOME/.local/bin\"; cd %s && %s", escaped_dir, cmd_str)
-    local cmd = { "distrobox", "enter", box_name, "--", "bash", "-c", inner }
+    local cmd
+    if get_current_container() == box_name then
+        local local_inner = string.format("cd %s && %s", escaped_dir, cmd_str)
+        cmd = { "sh", "-c", local_inner }
+    else
+        local inner = string.format("export PATH=\"$PATH:$HOME/.local/bin\"; cd %s && %s", escaped_dir, cmd_str)
+        cmd = host_cmd("distrobox", { "enter", box_name, "--", "bash", "-c", inner })
+    end
 
     local ret = ctx.run_process(cmd, target_dir)
     if grime and grime.bus then
@@ -261,9 +323,18 @@ local function handle_export(box_name, target_dir, tokens)
     end
 
     local flag = (exp_type == "app") and "--app" or "--bin"
-    local cmd = { "distrobox", "enter", box_name, "--", "distrobox-export", flag, target_item }
-    for _, ef in ipairs(extra_flags) do
-        table.insert(cmd, ef)
+    local cmd
+    if get_current_container() == box_name then
+        cmd = { "distrobox-export", flag, target_item }
+        for _, ef in ipairs(extra_flags) do
+            table.insert(cmd, ef)
+        end
+    else
+        local args = { "enter", box_name, "--", "distrobox-export", flag, target_item }
+        for _, ef in ipairs(extra_flags) do
+            table.insert(args, ef)
+        end
+        cmd = host_cmd("distrobox", args)
     end
     ctx.log(string.format("Экспорт %s '%s' из [%s]...", exp_type or "bin", target_item, box_name))
 
@@ -278,21 +349,22 @@ local function handle_export(box_name, target_dir, tokens)
 end
 
 local function handle_create(box_name, target_dir, tokens)
-    local cmd = { "distrobox", "create" }
+    local args = { "create" }
     local start_idx = 1
     if box_name then
-        table.insert(cmd, "--name")
-        table.insert(cmd, box_name)
+        table.insert(args, "--name")
+        table.insert(args, box_name)
         if tokens and tokens[1] == box_name then
             start_idx = 2
         end
     end
     if tokens then
         for i = start_idx, #tokens do
-            table.insert(cmd, tokens[i])
+            table.insert(args, tokens[i])
         end
     end
 
+    local cmd = host_cmd("distrobox", args)
     ctx.log("Создание контейнера Distrobox: " .. table.concat(cmd, " ") .. "...")
     local ret = ctx.run_process(cmd, target_dir)
     ctx.module_return(target_dir)
@@ -303,7 +375,7 @@ end
 
 local function handle_stop(box_name, target_dir)
     ctx.log("Остановка контейнера '" .. box_name .. "'...")
-    local cmd = { "distrobox", "stop", box_name, "-Y" }
+    local cmd = host_cmd("distrobox", { "stop", box_name, "-Y" })
     local ret = ctx.run_process(cmd, target_dir)
     if grime and grime.bus then
         grime.bus.set("box." .. box_name .. ".status", "stopped")
@@ -317,7 +389,7 @@ end
 
 local function handle_rm(box_name, target_dir)
     ctx.log("Удаление контейнера '" .. box_name .. "'...")
-    local cmd = { "distrobox", "rm", box_name, "-f" }
+    local cmd = host_cmd("distrobox", { "rm", box_name, "-f" })
     local ret = ctx.run_process(cmd, target_dir)
     if grime and grime.bus then
         grime.bus.set("box." .. box_name .. ".status", "deleted")
@@ -477,16 +549,23 @@ local M = {
     ensure_running = ensure_box_running,
     exec = function(box_name, cmd, cwd, env)
         ensure_box_running(box_name)
-        local cmd_list = { "distrobox", "enter", box_name, "--" }
-        if type(cmd) == "table" then
-            for _, c in ipairs(cmd) do table.insert(cmd_list, c) end
-            return ctx.run_process(cmd_list, cwd, env)
-        else
-            table.insert(cmd_list, "sh")
-            table.insert(cmd_list, "-c")
-            table.insert(cmd_list, cmd)
-            return ctx.run_process(cmd_list, cwd, env)
+        if get_current_container() == box_name then
+            if type(cmd) == "table" then
+                return ctx.run_process(cmd, cwd, env)
+            else
+                return ctx.run_process({ "sh", "-c", cmd }, cwd, env)
+            end
         end
+
+        local args = { "enter", box_name, "--" }
+        if type(cmd) == "table" then
+            for _, c in ipairs(cmd) do table.insert(args, c) end
+        else
+            table.insert(args, "sh")
+            table.insert(args, "-c")
+            table.insert(args, cmd)
+        end
+        return ctx.run_process(host_cmd("distrobox", args), cwd, env)
     end,
 }
 return M

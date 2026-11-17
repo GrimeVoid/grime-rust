@@ -14,49 +14,77 @@ use crate::state_bus::StateBus;
 
 const BOX_ONE_SHOT_ACTIONS: &[&str] = &[
     "list", "ls", "status", "ps", "stop", "create", "new", "init", "rm", "delete", "remove",
-    "del", "export", "exp", "keepalive", "idle", "help", "-h", "--help", "run", "runner", "exec",
-    "wrap", "do",
+    "del", "export", "exp", "keepalive", "idle", "help", "-h", "--help", "runner", "wrap", "do",
 ];
 
+fn detect_current_container() -> Option<String> {
+    if let Ok(id) = std::env::var("CONTAINER_ID") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/run/.containerenv") {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("name=") {
+                let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_box_env_switch(step: &PipelineStep, config: &GrimeConfig) -> Option<String> {
-    let is_enter_token = |s: &str| {
+    if step
+        .args
+        .iter()
+        .any(|a| crate::args_engine::is_passthrough_separator(a))
+    {
+        return None;
+    }
+
+    let is_switch_action = |s: &str| {
         matches!(
-            s.trim_start_matches('-'),
-            "enter" | "shell" | "sh" | "e"
+            s.to_lowercase().trim_start_matches('-'),
+            "enter" | "shell" | "sh" | "e" | "run" | "r" | "exec"
         )
     };
 
     if step.args.iter().any(|a| {
         let lower = a.to_lowercase();
         let clean = lower.trim_start_matches('-');
-        !is_enter_token(&lower)
+        !is_switch_action(&lower)
             && (a.starts_with('-') || BOX_ONE_SHOT_ACTIONS.contains(&clean))
     }) {
         return None;
     }
 
+    let default_box = || {
+        config
+            .get_opt("distrobox_default", Some("default"))
+            .unwrap_or_else(|| "default".to_string())
+    };
+
     match step.args.len() {
-        0 => Some(
-            config
-                .get_opt("distrobox_default", Some("default"))
-                .unwrap_or_else(|| "default".to_string()),
-        ),
+        0 => Some(default_box()),
         1 => {
-            let first = step.args[0].to_lowercase();
-            if is_enter_token(&first) {
-                Some(
-                    config
-                        .get_opt("distrobox_default", Some("default"))
-                        .unwrap_or_else(|| "default".to_string()),
-                )
+            if is_switch_action(&step.args[0]) {
+                Some(default_box())
             } else {
                 Some(step.args[0].clone())
             }
         }
         2 => {
-            let first = step.args[0].to_lowercase();
-            if is_enter_token(&first) && !step.args[1].starts_with('-') {
+            let a0_is_act = is_switch_action(&step.args[0]);
+            let a1_is_act = is_switch_action(&step.args[1]);
+            if a0_is_act && !a1_is_act && !step.args[1].starts_with('-') {
                 Some(step.args[1].clone())
+            } else if a1_is_act && !a0_is_act && !step.args[0].starts_with('-') {
+                Some(step.args[0].clone())
             } else {
                 None
             }
@@ -210,6 +238,15 @@ impl Orchestrator {
             let effective_step: std::borrow::Cow<'_, PipelineStep> =
                 if mod_name == "box" && step_idx + 1 < total_steps {
                     if let Some(box_name) = extract_box_env_switch(raw_step, &self.config) {
+                        if detect_current_container().as_deref() == Some(box_name.as_str()) {
+                            eprintln!(
+                                "{} Уже внутри контейнера '{}' — выполняем шаги напрямую",
+                                "[Grime Box]".cyan().bold(),
+                                box_name
+                            );
+                            step_idx += 1;
+                            continue;
+                        }
                         let host_idx = steps
                             .iter()
                             .enumerate()
@@ -461,5 +498,65 @@ impl Orchestrator {
         );
 
         Ok(pipeline_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_step(args: &[&str]) -> PipelineStep {
+        PipelineStep {
+            module: "box".to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_extract_box_env_switch_run_and_enter() {
+        let cfg = GrimeConfig::load_or_default(None);
+
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["-run", "fedora-box"]), &cfg),
+            Some("fedora-box".to_string())
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["fedora-box", "-run"]), &cfg),
+            Some("fedora-box".to_string())
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["-enter", "fedora-box"]), &cfg),
+            Some("fedora-box".to_string())
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["fedora-box", "-enter"]), &cfg),
+            Some("fedora-box".to_string())
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["fedora-box"]), &cfg),
+            Some("fedora-box".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_box_env_switch_rejects_one_shot_and_passthrough() {
+        let cfg = GrimeConfig::load_or_default(None);
+
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["-run", "fedora-box", "--", "ls"]), &cfg),
+            None
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["-run", "fedora-box", "//", "ls"]), &cfg),
+            None
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["list"]), &cfg),
+            None
+        );
+        assert_eq!(
+            extract_box_env_switch(&make_step(&["-stop", "fedora-box"]), &cfg),
+            None
+        );
     }
 }

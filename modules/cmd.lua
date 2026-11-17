@@ -125,7 +125,9 @@ function main()
         local ret = ctx.run_interactive(cmd, base_dir)
 
         if ret == 0 then
-            ctx.success(base_dir)
+            if ctx.has_next_step then
+                ctx.success(base_dir)
+            end
         else
             ctx.fail("Программа '" .. program .. "' завершилась с кодом " .. tostring(ret))
         end

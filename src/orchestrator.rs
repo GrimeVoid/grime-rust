@@ -239,11 +239,6 @@ impl Orchestrator {
                 if mod_name == "box" && step_idx + 1 < total_steps {
                     if let Some(box_name) = extract_box_env_switch(raw_step, &self.config) {
                         if detect_current_container().as_deref() == Some(box_name.as_str()) {
-                            eprintln!(
-                                "{} Уже внутри контейнера '{}' — выполняем шаги напрямую",
-                                "[Grime Box]".cyan().bold(),
-                                box_name
-                            );
                             step_idx += 1;
                             continue;
                         }
@@ -257,14 +252,6 @@ impl Orchestrator {
                         let end_sub_idx = host_idx.unwrap_or(total_steps);
                         let sub_steps = &steps[(step_idx + 1)..end_sub_idx];
                         if !sub_steps.is_empty() {
-                            let sub_cli = format_subpipeline_cli(sub_steps);
-                            eprintln!(
-                                "{} Переключение среды в контейнер '{}' -> {}",
-                                "[Grime Box]".cyan().bold(),
-                                box_name,
-                                sub_cli
-                            );
-
                             let mut synth_args = vec![
                                 "-run".to_string(),
                                 box_name,

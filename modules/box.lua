@@ -222,7 +222,9 @@ local function handle_enter(box_name, target_dir)
         if grime and grime.bus then
             grime.bus.set("box." .. box_name .. ".last_active", os.time())
         end
-        ctx.module_return(target_dir)
+        if ctx.has_next_step then
+            ctx.module_return(target_dir)
+        end
         return
     end
 
@@ -232,7 +234,9 @@ local function handle_enter(box_name, target_dir)
     if grime and grime.bus then
         grime.bus.set("box." .. box_name .. ".last_active", os.time())
     end
-    ctx.module_return(target_dir)
+    if ctx.has_next_step then
+        ctx.module_return(target_dir)
+    end
     if ret ~= 0 then
         ctx.fail(string.format("Сессия в '%s' завершилась с кодом %d", box_name, ret))
     end
@@ -256,7 +260,11 @@ local function handle_run(box_name, target_dir, command_tokens)
         cmd_str = inp
     end
 
-    ctx.log(string.format("Запуск в [%s]: %s (директория: %s)", box_name, cmd_str, target_dir))
+    local is_internal_grime = command_tokens and command_tokens[1] and
+        (command_tokens[1] == "grime" or command_tokens[1]:match("/grime$") ~= nil)
+    if not is_internal_grime then
+        ctx.log(string.format("Запуск в [%s]: %s (директория: %s)", box_name, cmd_str, target_dir))
+    end
     local escaped_dir = utils.shell_escape(target_dir)
     local cmd
     if get_current_container() == box_name then
@@ -271,7 +279,9 @@ local function handle_run(box_name, target_dir, command_tokens)
     if grime and grime.bus then
         grime.bus.set("box." .. box_name .. ".last_active", os.time())
     end
-    ctx.module_return(target_dir)
+    if ctx.has_next_step then
+        ctx.module_return(target_dir)
+    end
     if ret ~= 0 then
         ctx.fail(string.format("Команда в контейнере '%s' завершилась с кодом %d", box_name, ret))
     end

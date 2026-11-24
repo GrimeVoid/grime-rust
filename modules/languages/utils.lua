@@ -330,13 +330,21 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
 end
 
 --- Универсальный генератор манифеста app.lua для всех поддерживаемых языков
-function utils.generate_app_manifest(name, lang, desc)
+function utils.generate_app_manifest(name, lang, desc, opts)
     name = name or "app"
     lang = (lang or "cpp"):lower()
     local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. name)
     local snake_name = (grime and grime.str and grime.str.to_snake_case)
         and grime.str.to_snake_case(name)
         or name:lower():gsub("[%s%-]", "_")
+
+    opts = opts or {}
+    local spec_deps = opts.special_dependencies or {}
+    if type(spec_deps) == "string" then
+        local t = {}
+        for s in spec_deps:gmatch("[%w%_%-%.]+") do table.insert(t, s) end
+        spec_deps = t
+    end
 
     local profiles = {
         cpp = {
@@ -363,9 +371,19 @@ function utils.generate_app_manifest(name, lang, desc)
             run = "java -jar build/" .. name .. ".jar",
         },
         lua = {
-            artifact = "src/main.lua",
-            build = "luajit -bl src/main.lua >/dev/null",
-            run = "luajit src/main.lua",
+            artifact = "main.lua",
+            build = "luajit -bl main.lua >/dev/null",
+            run = "luajit main.lua",
+        },
+        bash = {
+            artifact = "main.sh",
+            build = "bash -n main.sh",
+            run = "bash main.sh",
+        },
+        fish = {
+            artifact = "main.fish",
+            build = "fish -n main.fish",
+            run = "fish main.fish",
         },
     }
 
@@ -374,6 +392,10 @@ function utils.generate_app_manifest(name, lang, desc)
         run = "luajit src/main.lua",
     }
 
+    local build_cmd = (opts.build and opts.build ~= "" and opts.build ~= "auto") and opts.build or p.build
+    local run_cmd = (opts.run and opts.run ~= "" and opts.run ~= "auto") and opts.run or p.run
+    local test_cmd = (opts.test and opts.test ~= "" and opts.test ~= "auto") and opts.test or nil
+
     local lines = {
         "return {",
         string.format("    name = %q,", name),
@@ -381,12 +403,24 @@ function utils.generate_app_manifest(name, lang, desc)
         string.format("    type = %q,", lang),
         string.format("    artifact = %q,", p.artifact),
     }
-    if p.build then
-        table.insert(lines, string.format("    build = %q,", p.build))
+    if build_cmd then
+        table.insert(lines, string.format("    build = %q,", build_cmd))
     end
-    table.insert(lines, string.format("    run = %q,", p.run))
-    table.insert(lines, "    special_dependencies = {},")
-    table.insert(lines, "    detached = false,")
+    table.insert(lines, string.format("    run = %q,", run_cmd))
+    if test_cmd then
+        table.insert(lines, string.format("    test = %q,", test_cmd))
+    end
+
+    if #spec_deps > 0 then
+        local formatted = {}
+        for _, dep in ipairs(spec_deps) do
+            table.insert(formatted, string.format("%q", dep))
+        end
+        table.insert(lines, string.format("    special_dependencies = { %s },", table.concat(formatted, ", ")))
+    else
+        table.insert(lines, "    special_dependencies = {},")
+    end
+    table.insert(lines, string.format("    detached = %s,", opts.detached and "true" or "false"))
     table.insert(lines, "}")
     return table.concat(lines, "\n") .. "\n"
 end
@@ -445,6 +479,160 @@ function utils.get_projects_root(ctx)
         root = utils.normalize_path(root)
     end
     return root
+end
+
+utils.LANG_ALIASES = {
+    cpp = "cpp", ["c++"] = "cpp", cxx = "cpp", c = "cpp",
+    python = "python", py = "python", python3 = "python",
+    rust = "rust", rs = "rust",
+    java = "java", jav = "java",
+    lua = "lua", luajit = "lua",
+    bash = "bash", sh = "bash", shell = "bash",
+    fish = "fish",
+}
+
+local SHEBANG_LANG_MAP = {
+    python = "python", python3 = "python", python2 = "python",
+    luajit = "lua", lua = "lua", ["lua5.1"] = "lua", ["lua5.4"] = "lua",
+    bash = "bash", sh = "bash", dash = "bash", zsh = "bash", ash = "bash",
+    fish = "fish",
+    node = "nodejs", nodejs = "nodejs", deno = "nodejs", bun = "nodejs",
+}
+
+--- Разбор shebang (#!) и мета-комментариев первых 15 строк файла
+function utils.parse_script_header(filepath)
+    if not filepath or filepath == "" then return nil, false end
+    local f = io.open(filepath, "rb")
+    if not f then return nil, false end
+    local chunk = f:read(4096)
+    f:close()
+    if not chunk or chunk == "" then
+        return { shebang = nil, interp = nil, lang = nil, meta = {}, is_binary = false }, false
+    end
+
+    if chunk:sub(1, 4) == "\127ELF" or chunk:sub(1, 512):find("\0", 1, true) then
+        return nil, true
+    end
+
+    local lines = {}
+    for line in chunk:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+        if #lines >= 15 then break end
+    end
+
+    local res = {
+        shebang = nil,
+        interp = nil,
+        lang = nil,
+        meta = {},
+        is_binary = false,
+    }
+
+    if lines[1] and lines[1]:match("^#!") then
+        local raw_sb = lines[1]:sub(3):match("^%s*(.-)%s*$")
+        res.shebang = raw_sb
+        local tokens = {}
+        for tok in raw_sb:gmatch("%S+") do
+            table.insert(tokens, tok)
+        end
+        if #tokens > 0 then
+            local first_base = tokens[1]:match("([^/]+)$") or tokens[1]
+            local interp = first_base
+            if first_base == "env" then
+                interp = nil
+                for i = 2, #tokens do
+                    local t = tokens[i]
+                    if not t:match("^%-") and not t:match("^[%w_]+=") then
+                        interp = t:match("([^/]+)$") or t
+                        break
+                    end
+                end
+            end
+            if interp and interp ~= "" then
+                res.interp = interp
+                local ilow = interp:lower()
+                res.lang = SHEBANG_LANG_MAP[ilow]
+                if not res.lang then
+                    if ilow:match("^python") then
+                        res.lang = "python"
+                    elseif ilow:match("^lua") then
+                        res.lang = "lua"
+                    end
+                end
+            end
+        end
+    end
+
+    for i = 1, #lines do
+        local ln = lines[i]
+        local body = ln:match("^%s*#%s*(.+)$") or ln:match("^%s*%-%-%s*(.+)$") or ln:match("^%s*//%s*(.+)$")
+        if body and not ln:match("^#!") then
+            local key, val = body:match("^([%w_%-]+)%s*:%s*(.+)$")
+            if key and val then
+                key = key:lower()
+                val = val:match("^%s*(.-)%s*$")
+                if key == "description" or key == "desc" then
+                    res.meta.description = val
+                elseif key == "nix" or key == "deps" or key == "dependencies" or key == "special_dependencies" then
+                    local deps = res.meta.special_dependencies or {}
+                    for dep in val:gsub(",", " "):gmatch("%S+") do
+                        table.insert(deps, dep)
+                    end
+                    res.meta.special_dependencies = deps
+                elseif key == "detach" or key == "detached" then
+                    local vlow = val:lower()
+                    res.meta.detached = (vlow == "true" or vlow == "1" or vlow == "yes")
+                elseif key == "build" then
+                    res.meta.build = val
+                elseif key == "run" then
+                    res.meta.run = val
+                elseif key == "test" then
+                    res.meta.test = val
+                end
+            end
+        end
+    end
+
+    return res, false
+end
+
+--- Формирование лёгкой команды проверки синтаксиса для скриптового языка
+function utils.build_syntax_check_cmd(lang, interp, rel_path)
+    local l = (lang or ""):lower()
+    local i = (interp or ""):lower()
+    local escaped = utils.shell_escape(rel_path)
+    if l == "fish" or i == "fish" then
+        return "fish -n " .. escaped
+    elseif l == "bash" or i == "bash" or i == "sh" or i == "dash" or i == "zsh" then
+        return "bash -n " .. escaped
+    elseif l == "python" or i:match("^python") then
+        return "python3 -m py_compile " .. escaped
+    elseif l == "lua" or i == "luajit" or i:match("^lua") then
+        return "luajit -bl " .. escaped .. " >/dev/null"
+    end
+    return nil
+end
+
+--- Чтение мета-файла внешней привязки (.grime_app.json или .grime_link.json)
+function utils.read_app_link_meta(app_dir)
+    if not app_dir or app_dir == "" then return nil end
+    for _, fname in ipairs({ ".grime_app.json", ".grime_link.json" }) do
+        local p = app_dir .. "/" .. fname
+        if utils.file_exists(p) then
+            local f = io.open(p, "r")
+            if f then
+                local content = f:read("*a")
+                f:close()
+                if content and content ~= "" and grime and grime.json and grime.json.decode then
+                    local ok, decoded = pcall(grime.json.decode, content)
+                    if ok and type(decoded) == "table" then
+                        return decoded
+                    end
+                end
+            end
+        end
+    end
+    return nil
 end
 
 return utils

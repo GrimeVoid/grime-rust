@@ -385,22 +385,27 @@ local function get_apps_packages(_all_mode)
                 local has_manifest = ctx.exists(app_dir .. "/app.lua")
                 local desc = ""
                 local ver = has_flake and "flake" or "local"
-                if has_manifest then
-                    local ok, app_mod = pcall(require, "app")
-                    if ok and app_mod and app_mod.load_manifest then
-                        local m = app_mod.load_manifest(app_dir, item)
-                        if m then
-                            desc = m.description or ""
-                            if m.version then ver = m.version end
+                local loaded_m = nil
+                local ok, app_mod = pcall(require, "app")
+                if ok and app_mod and app_mod.load_manifest then
+                    loaded_m = app_mod.load_manifest(app_dir, item)
+                    if loaded_m then
+                        desc = loaded_m.description or ""
+                        if loaded_m.version then
+                            ver = loaded_m.version
+                        elseif not has_flake and loaded_m.type and loaded_m.type ~= "generic" then
+                            ver = loaded_m.type
                         end
                     end
                 end
-                table.insert(list, {
-                    name = item,
-                    version = ver,
-                    details = desc,
-                    path = app_dir
-                })
+                if has_manifest or has_flake or loaded_m then
+                    table.insert(list, {
+                        name = item,
+                        version = ver,
+                        details = desc,
+                        path = app_dir
+                    })
+                end
             end
         end
     end
@@ -1275,6 +1280,20 @@ local function find_distrobox_binary(cmd, box_name)
         if found and #found > 0 then
             return target_box, found
         end
+    else
+        local err_str = res.stderr or ""
+        if res.code == 125
+            or err_str:find("unable to start container", 1, true)
+            or err_str:find("OCI permission denied", 1, true)
+            or err_str:find("Error:", 1, true)
+        then
+            ctx.log(string.format(
+                "[Grime Pkg] ⚠ Контейнер '%s' не смог запуститься (код %s). Проверьте состояние podman/distrobox.%s",
+                target_box,
+                tostring(res.code or "?"),
+                err_str ~= "" and (" Детали: " .. err_str:gsub("%s+$", "")) or ""
+            ))
+        end
     end
     return nil, nil
 end
@@ -1491,22 +1510,22 @@ local function find_locally_installed(cmd)
         return { type = "flatpak", id = flatpak_id, name = flatpak_name }
     end
 
-    -- 4. Nix Profile (~/.nix-profile/bin/<cmd>)
-    local nix_bin = find_nix_profile_binary(cmd)
-    if nix_bin then
-        return { type = "nix_profile", binary = nix_bin }
-    end
-
-    -- 5. Пользовательские бинарники (Cargo ~/.cargo/bin, Local ~/.local/bin, Go ~/go/bin)
+    -- 4. Пользовательские бинарники (Cargo ~/.cargo/bin, Local ~/.local/bin, Go ~/go/bin)
     local user_bin, bin_type = find_cargo_or_pipx_binary(cmd)
     if user_bin then
         return { type = bin_type, binary = user_bin }
     end
 
-    -- 6. Контейнеры Distrobox (активный/дефолтный fedora-box)
+    -- 5. Контейнеры Distrobox (активный/дефолтный fedora-box)
     local box_name, box_bin = find_distrobox_binary(cmd)
     if box_name and box_bin then
         return { type = "distrobox", box = box_name, binary = box_bin }
+    end
+
+    -- 6. Nix Profile (~/.nix-profile/bin/<cmd>) — строго в конце локального списка
+    local nix_bin = find_nix_profile_binary(cmd)
+    if nix_bin then
+        return { type = "nix_profile", binary = nix_bin }
     end
 
     return nil
@@ -1571,9 +1590,10 @@ local function print_run_help()
     1. Локальные Grime Apps (~/.config/grime/apps/<имя>)
     2. Системный PATH на хосте (Pacman/Host: /usr/bin, /usr/local/bin)
     3. Flatpak-приложения (поиск по имени или app_id)
-    4. Nix Profile (~/.nix-profile/bin/<имя>)
-    5. Cargo / Pipx (~/.cargo/bin, ~/.local/bin)
-    6. Изолированный Nix Flake (с умным маппингом пакетов, авто-GPU и sudo)
+    4. Cargo / Pipx / Local (~/.cargo/bin, ~/.local/bin, ~/go/bin)
+    5. Контейнеры Distrobox (активный/дефолтный fedora-box)
+    6. Nix Profile (~/.nix-profile/bin/<имя>)
+    7. Изолированный Nix Flake (с умным маппингом пакетов, авто-GPU и sudo)
 
 
 %sПОДДЕРЖИВАЕМЫЕ МЕНЕДЖЕРЫ ДЛЯ ЯВНОГО ЗАПУСКА:%s

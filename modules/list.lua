@@ -172,6 +172,41 @@ local function get_app_info(app_dir)
                 end
             end
         end
+    else
+        -- Zero-Manifest App: проверяем мета-файл привязки или синтезируем через app.load_manifest / scanner
+        local link_meta = utils.read_app_link_meta(app_dir)
+        if link_meta then
+            if type(link_meta.lang) == "string" and link_meta.lang ~= "" then
+                lang = link_meta.lang
+            end
+            if type(link_meta.description) == "string" and link_meta.description ~= "" then
+                desc = link_meta.description
+            end
+        end
+
+        local app_name = app_dir:match("([^/]+)$") or "app"
+        local ok_app, app_mod = pcall(require, "app")
+        if ok_app and type(app_mod) == "table" and app_mod.load_manifest then
+            local m = app_mod.load_manifest(app_dir, app_name)
+            if m then
+                if lang == "custom" and m.type and m.type ~= "" and m.type ~= "generic" then
+                    lang = tostring(m.type)
+                end
+                if desc == "" and m.description and m.description ~= "" then
+                    desc = tostring(m.description)
+                end
+            end
+        end
+
+        if lang == "custom" then
+            local ok_scan, scanner = pcall(require, "languages.scanner")
+            if ok_scan and scanner and scanner.scan_project then
+                local scan = scanner.scan_project(app_dir, ctx)
+                if scan and scan.languages and #scan.languages > 0 then
+                    lang = scan.languages[1]
+                end
+            end
+        end
     end
 
     -- Проверка grime.json / meta.json
@@ -386,7 +421,7 @@ local function collect_projects(filter)
     local ok, items = pcall(fs.list, projects_root)
     if not ok or type(items) ~= "table" then return {} end
 
-    local lang_buckets = { cpp = true, ["C++"] = true, rust = true, python = true, java = true, lua = true }
+    local lang_buckets = { cpp = true, ["C++"] = true, rust = true, python = true, java = true, lua = true, bash = true, fish = true }
     local list = {}
 
     for _, item in ipairs(items) do

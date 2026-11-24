@@ -187,6 +187,15 @@ local function extract_lang_from_prompt(user_prompt)
             "язык[еа]?%s+c%+%+", "язык[еа]?%s+cpp", "язык[еа]?%s+си%+%+",
             "стек[еа]?%s+c%+%+", "стек[еа]?%s+cpp",
         }},
+        { lang = "fish", patterns = {
+            "на%s+fish", "на%s+фиш", "in%s+fish", "using%s+fish", "with%s+fish",
+            "язык[еа]?%s+fish", "стек[еа]?%s+fish", "скрипт%s+fish", "fish%s+скрипт",
+        }},
+        { lang = "bash", patterns = {
+            "на%s+bash", "на%s+баш", "на%s+sh%f[%A]", "на%s+shell", "на%s+шелл",
+            "in%s+bash", "in%s+sh%f[%A]", "using%s+bash", "with%s+bash",
+            "язык[еа]?%s+bash", "стек[еа]?%s+bash", "bash%s+скрипт", "shell%s+скрипт",
+        }},
     }
 
     for _, group in ipairs(explicit_targets) do
@@ -284,6 +293,25 @@ local function extract_lang_from_prompt(user_prompt)
         return "cpp"
     end
 
+    -- Fish
+    if has_word_token(cleaned, "fish")
+        or has_word_token(cleaned, "фиш")
+        or cleaned:find("%.fish%f[%A]")
+    then
+        return "fish"
+    end
+
+    -- Bash / Shell
+    if has_word_token(cleaned, "bash")
+        or has_word_token(cleaned, "баш")
+        or has_word_token(cleaned, "shell")
+        or has_word_token(cleaned, "шелл")
+        or cleaned:find("%.sh%f[%A]")
+        or cleaned:find("%.bash%f[%A]")
+    then
+        return "bash"
+    end
+
     return nil
 end
 
@@ -322,19 +350,225 @@ local function heuristic_stack_from_prompt(user_prompt)
     return "python"
 end
 
---- Парсинг ответа LLM при классификации стека
-local function parse_llm_stack_response(stdout)
+--- Предметная эвристика определения дополнительных Nix-пакетов (Nixpkgs) по тексту задачи
+local function heuristic_nix_packages(user_prompt, lang)
+    if type(user_prompt) ~= "string" or user_prompt == "" then
+        return {}
+    end
+    local low = utf8_lower(user_prompt)
+    local target_lang = (lang or ""):lower()
+    local packages = {}
+    local seen = {}
+
+    local function add_pkg(p)
+        if p and p ~= "" and not seen[p] then
+            seen[p] = true
+            table.insert(packages, p)
+        end
+    end
+
+    -- 1. Графика, 2D/3D и игровой движок
+    if low:find("raylib", 1, true) or low:find("рейлиб", 1, true) then
+        add_pkg("raylib")
+        if target_lang == "cpp" or target_lang == "" then
+            add_pkg("pkg-config")
+            add_pkg("cmake")
+        end
+    end
+    if low:find("sdl2", 1, true) or low:find("sdl", 1, true) then
+        add_pkg("SDL2")
+        if target_lang == "cpp" or target_lang == "" then
+            add_pkg("pkg-config")
+            add_pkg("cmake")
+        end
+    end
+    if low:find("sfml", 1, true) then
+        add_pkg("sfml")
+        if target_lang == "cpp" or target_lang == "" then
+            add_pkg("pkg-config")
+            add_pkg("cmake")
+        end
+    end
+
+    -- 2. Сеть, HTTP, API, TLS и безопасность
+    if low:find("curl", 1, true) or low:find("libcurl", 1, true) then
+        add_pkg("curl")
+        if target_lang == "cpp" or target_lang == "rust" or target_lang == "" then
+            add_pkg("pkg-config")
+        end
+    end
+    if low:find("openssl", 1, true) or low:find("ssl", 1, true) or low:find("tls", 1, true) or low:find("крипто", 1, true) then
+        add_pkg("openssl")
+        if target_lang == "cpp" or target_lang == "rust" or target_lang == "" then
+            add_pkg("pkg-config")
+        end
+    end
+
+    -- 3. TUI и терминальные интерфейсы
+    if low:find("ncurses", 1, true) or low:find("curses", 1, true) or low:find("tui", 1, true) then
+        add_pkg("ncurses")
+        if target_lang == "cpp" or target_lang == "" then
+            add_pkg("pkg-config")
+        end
+    end
+
+    -- 4. Базы данных
+    if low:find("sqlite", 1, true) or low:find("sqlite3", 1, true) then
+        add_pkg("sqlite")
+        if target_lang == "cpp" or target_lang == "rust" or target_lang == "" then
+            add_pkg("pkg-config")
+        end
+    end
+
+    -- 5. C++ специализированные библиотеки
+    if target_lang == "cpp" or target_lang == "" then
+        if low:find("boost", 1, true) then
+            add_pkg("boost")
+        end
+        if low:find("fmt", 1, true) then
+            add_pkg("fmt")
+        end
+        if low:find("spdlog", 1, true) then
+            add_pkg("spdlog")
+        end
+        if low:find("nlohmann", 1, true) or (low:find("json", 1, true) and target_lang == "cpp") then
+            add_pkg("nlohmann_json")
+        end
+    end
+
+    -- 6. Python специализированные пакеты (Nixpkgs python3Packages)
+    if target_lang == "python" or target_lang == "" then
+        if low:find("fastapi", 1, true) then
+            add_pkg("python3Packages.fastapi")
+            add_pkg("python3Packages.uvicorn")
+        end
+        if low:find("requests", 1, true) then
+            add_pkg("python3Packages.requests")
+        end
+        if low:find("flask", 1, true) then
+            add_pkg("python3Packages.flask")
+        end
+        if low:find("rich", 1, true) then
+            add_pkg("python3Packages.rich")
+        end
+        if low:find("pytest", 1, true) or low:find("тест", 1, true) then
+            add_pkg("python3Packages.pytest")
+        end
+        if low:find("numpy", 1, true) then
+            add_pkg("python3Packages.numpy")
+        end
+        if low:find("pillow", 1, true) or low:find("pil", 1, true) then
+            add_pkg("python3Packages.pillow")
+        end
+        if low:find("pygame", 1, true) then
+            add_pkg("python3Packages.pygame")
+        end
+        if low:find("beautifulsoup", 1, true) or low:find("bs4", 1, true) then
+            add_pkg("python3Packages.beautifulsoup4")
+        end
+    end
+
+    -- 7. Мультимедиа
+    if low:find("ffmpeg", 1, true) then
+        add_pkg("ffmpeg")
+        add_pkg("pkg-config")
+    end
+
+    return packages
+end
+
+--- Парсинг ответа Aider-Архитектора в формате <grime_architecture>...</grime_architecture>
+local function parse_architect_response(stdout)
     if type(stdout) ~= "string" or stdout == "" then
         return nil
     end
+
     local allowed = {
         python = "python", py = "python", python3 = "python",
         java = "java",
         rust = "rust", rs = "rust",
         lua = "lua", luajit = "lua",
         cpp = "cpp", ["c++"] = "cpp", cxx = "cpp",
+        bash = "bash", sh = "bash", shell = "bash",
+        fish = "fish",
     }
 
+    local block = stdout:match("<grime_architecture>(.-)</grime_architecture>")
+    if not block then
+        block = stdout:match("<grime_architecture>(.*)")
+    end
+
+    if block then
+        local res = {
+            lang = nil,
+            special_dependencies = {},
+            build = nil,
+            run = nil,
+            test = nil,
+            summary = nil,
+        }
+
+        local raw_lang = block:match("LANG:%s*([^\r\n]+)")
+        if raw_lang then
+            local clean_l = raw_lang:gsub("[`*'\".,!?;:()<>%[%]%{%}]+", " "):match("%S+")
+            if clean_l and allowed[clean_l:lower()] then
+                res.lang = allowed[clean_l:lower()]
+            end
+        end
+
+        local raw_pkgs = block:match("NIX_PACKAGES:%s*([^\r\n]+)")
+        if raw_pkgs then
+            local clean_p = raw_pkgs:gsub("[`*'\"()<>]", " ")
+            local pkgs = {}
+            local seen = {}
+            for tok in clean_p:gmatch("[%w%_%-%.]+") do
+                local low_tok = tok:lower()
+                if low_tok ~= "none" and low_tok ~= "нет" and low_tok ~= "nil" and low_tok ~= "auto" and low_tok ~= "null" and not seen[tok] then
+                    seen[tok] = true
+                    table.insert(pkgs, tok)
+                end
+            end
+            res.special_dependencies = pkgs
+        end
+
+        local raw_b = block:match("BUILD:%s*([^\r\n]+)")
+        if raw_b then
+            local tb = raw_b:match("^%s*(.-)%s*$")
+            if tb ~= "" and tb:lower() ~= "auto" and tb:lower() ~= "none" and tb:lower() ~= "default" then
+                res.build = tb
+            end
+        end
+
+        local raw_r = block:match("RUN:%s*([^\r\n]+)")
+        if raw_r then
+            local tr = raw_r:match("^%s*(.-)%s*$")
+            if tr ~= "" and tr:lower() ~= "auto" and tr:lower() ~= "none" and tr:lower() ~= "default" then
+                res.run = tr
+            end
+        end
+
+        local raw_t = block:match("TEST:%s*([^\r\n]+)")
+        if raw_t then
+            local tt = raw_t:match("^%s*(.-)%s*$")
+            if tt ~= "" and tt:lower() ~= "auto" and tt:lower() ~= "none" and tt:lower() ~= "default" then
+                res.test = tt
+            end
+        end
+
+        local raw_s = block:match("SUMMARY:%s*([^\r\n]+)")
+        if raw_s then
+            local ts = raw_s:match("^%s*(.-)%s*$")
+            if ts ~= "" and ts:lower() ~= "none" then
+                res.summary = ts
+            end
+        end
+
+        if res.lang or #res.special_dependencies > 0 then
+            return res
+        end
+    end
+
+    -- Fallback: парсинг старого однословного ответа
     local lines = {}
     for line in stdout:gmatch("[^\r\n]+") do
         local trimmed = line:match("^%s*(.-)%s*$")
@@ -351,16 +585,15 @@ local function parse_llm_stack_response(stdout)
         end
     end
 
-    -- Ищем с конца вывода точное слово-ответ модели
     for i = #lines, 1, -1 do
         local ln = lines[i]:gsub("[`*'\".,!?;:()<>%[%]%{%}]+", " ")
         local first_tok = ln:match("^%s*(%S+)%s*$")
         if first_tok and allowed[first_tok] then
-            return allowed[first_tok]
+            return { lang = allowed[first_tok], special_dependencies = {} }
         end
         for tok in ln:gmatch("%S+") do
             if allowed[tok] then
-                return allowed[tok]
+                return { lang = allowed[tok], special_dependencies = {} }
             end
         end
     end
@@ -368,50 +601,127 @@ local function parse_llm_stack_response(stdout)
     return nil
 end
 
---- Определение оптимального стека: сначала 100% приоритет языка из промпта, затем LLM/эвристика
-local function classify_stack(user_prompt)
-    if not user_prompt or user_prompt == "" then
-        return "python"
-    end
+--- Комплексное планирование стека микроприложения Архитектором (язык, зависимости Nixpkgs, команды сборки)
+local function plan_app_stack(user_prompt, preferred_lang, app_name)
+    local explicit = preferred_lang
+        or (user_prompt and user_prompt ~= "" and extract_lang_from_prompt(user_prompt))
+        or (app_name and extract_lang_from_prompt(app_name))
 
-    -- 1. Безусловный приоритет: если пользователь явно указал язык в промпте — выбираем его!
-    local explicit = extract_lang_from_prompt(user_prompt)
-    if explicit then
-        return explicit
-    end
+    local target_lang = explicit
 
-    -- 2. Запрос к Aider-Архитектору (в изолированной директории /tmp без сканирования чужого репозитория)
+    local plan = {
+        lang = target_lang,
+        special_dependencies = {},
+        build = nil,
+        run = nil,
+        test = nil,
+        summary = nil,
+    }
+
+    -- Предметная эвристика как надежная база для пакетов
+    local heur_pkgs = heuristic_nix_packages(user_prompt or "", target_lang or "python")
+
+    -- 2. Запрос к Aider-Архитектору (в изолированной директории /tmp)
     local config_aider = ctx.get_config and ctx.get_config("aider", "auto") or "auto"
     local aider_bin = (config_aider ~= "" and config_aider ~= "auto") and config_aider or "aider"
-    if utils.has_binary(aider_bin, ctx) then
-        local classify_prompt = string.format([[Выбери наиболее подходящий язык программирования для реализации следующей задачи:
+
+    if utils.has_binary(aider_bin, ctx) and user_prompt and user_prompt ~= "" then
+        local lang_instruction = explicit
+            and string.format("ЯЗЫК УЖЕ ВЫБРАН ПОЛЬЗОВАТЕЛЕМ: %s (ОБЯЗАТЕЛЬНО укажи LANG: %s).\nТвоя задача — точно определить библиотеки Nixpkgs (NIX_PACKAGES) и команды сборки/запуска для данного языка.", explicit, explicit)
+            or "Определи наиболее оптимальный базовый язык (python, cpp, rust, java, lua, bash, fish) и необходимые библиотеки Nixpkgs."
+
+        local architect_prompt = string.format([[Ты — ведущий системный архитектор экосистемы GRIME.
+Спроектируй стек технологий и зависимости Nix (Nixpkgs) для создания микроприложения по задаче:
 "%s"
 
-Доступные стеки:
-- python : скрипты, парсеры, обработка текста/JSON/CSV, CLI-утилиты, автоматизация, веб/API, вычисления, быстрые утилиты.
-- java   : приложения со структурированной ООП-моделью, бизнес-логика, учетные системы, кроссплатформенные сервисы.
-- rust   : системные утилиты, сетевые демоны, высоконагруженные сервисы, работа с бинарными данными и ОС.
-- lua    : легкие плагины, конфигурационные скрипты, расширения экосистемы Grime.
-- cpp    : 3D-графика, игры, низкоуровневые алгоритмы реального времени, работа с памятью/железом.
+%s
 
-Ответь СТРОГО ОДНИМ СЛОВОМ из списка (python, java, rust, lua, cpp) без пояснений и знаков препинания.]], user_prompt)
-        ctx.log("Aider-Архитектор определяет оптимальный стек технологий...")
+Доступные базовые языки:
+- python : скрипты, CLI-утилиты, веб/API (fastapi, requests), анализ данных.
+- cpp    : графика, игры (raylib, sdl2, sfml), CLI/TUI (ncurses), высокопроизводительные сервисы (curl, openssl, sqlite, boost).
+- rust   : системные CLI/утилиты, демоны, многопоточность, сетевые протоколы.
+- java   : структурированная бизнес-логика, учетные сервисы.
+- lua    : легковесные скрипты и расширения Grime.
+- bash   : системные shell-скрипты и оркестрация CLI-утилит.
+- fish   : скрипты и автоматизация для оболочки Fish.
+
+ТРЕБОВАНИЯ:
+1. Выбери базовый язык (LANG).
+2. ОБЯЗАТЕЛЬНО определи точный набор библиотек и пакетов Nix (Nixpkgs), которые необходимо подключить в окружение для компиляции, сборки и запуска (например: raylib, curl, openssl, ncurses, sqlite, boost, pkg-config, cmake, python3Packages.requests, python3Packages.fastapi и т.д.).
+3. Если сторонние пакеты Nixpkgs не требуются, укажи 'none'.
+
+ФОРМАТ ВЫВОДА (СТРОГО внутри тега, без лишнего текста вокруг):
+<grime_architecture>
+LANG: <python|cpp|rust|java|lua|bash|fish>
+NIX_PACKAGES: <пакет1, пакет2, ... или none>
+BUILD: <auto или команда сборки>
+RUN: <auto или команда запуска>
+TEST: <auto или команда тестов>
+SUMMARY: <краткое описание архитектурного решения и библиотек>
+</grime_architecture>]], user_prompt, lang_instruction)
+
+        ctx.log("Aider-Архитектор проектирует стек технологий и Nix-зависимости...")
         local cres = ctx.capture({
-            "timeout", "15",
+            "timeout", "20",
             aider_bin,
             "--no-git", "--map-tokens", "0", "--exit", "--yes-always", "--no-fancy-input", "--no-pretty",
-            "-m", classify_prompt,
+            "-m", architect_prompt,
         }, "/tmp")
+
         if cres and cres.code == 0 and cres.stdout and cres.stdout ~= "" then
-            local parsed_lang = parse_llm_stack_response(cres.stdout)
-            if parsed_lang then
-                return parsed_lang
+            local parsed_plan = parse_architect_response(cres.stdout)
+            if parsed_plan then
+                if not plan.lang and parsed_plan.lang then
+                    plan.lang = parsed_plan.lang
+                end
+                for _, p in ipairs(parsed_plan.special_dependencies or {}) do
+                    table.insert(plan.special_dependencies, p)
+                end
+                plan.build = parsed_plan.build
+                plan.run = parsed_plan.run
+                plan.test = parsed_plan.test
+                plan.summary = parsed_plan.summary
             end
         end
     end
 
-    -- 3. Предметная эвристика, если LLM не вызвана или не ответила
-    return heuristic_stack_from_prompt(user_prompt)
+    -- Если язык не определен, применяем эвристику языка
+    if not plan.lang or plan.lang == "" then
+        plan.lang = explicit or heuristic_stack_from_prompt(user_prompt)
+    end
+
+    -- Дедупликация и объединение пакетов
+    local seen_pkgs = {}
+    local final_pkgs = {}
+    for _, p in ipairs(plan.special_dependencies) do
+        if not seen_pkgs[p] then
+            seen_pkgs[p] = true
+            table.insert(final_pkgs, p)
+        end
+    end
+    for _, p in ipairs(heur_pkgs) do
+        if not seen_pkgs[p] then
+            seen_pkgs[p] = true
+            table.insert(final_pkgs, p)
+        end
+    end
+    plan.special_dependencies = final_pkgs
+
+    if not plan.summary or plan.summary == "" then
+        if #plan.special_dependencies > 0 then
+            plan.summary = string.format("Стек %s с библиотеками Nix: %s", plan.lang, table.concat(plan.special_dependencies, ", "))
+        else
+            plan.summary = string.format("Стандартный стек %s", plan.lang)
+        end
+    end
+
+    return plan
+end
+
+--- Определение оптимального стека (возвращает lang и объект плана)
+local function classify_stack(user_prompt, preferred_lang)
+    local plan = plan_app_stack(user_prompt, preferred_lang)
+    return plan.lang, plan
 end
 
 --- Получение текущего дампа терминального контекста из StateBus или state.json
@@ -571,48 +881,66 @@ local function replace_placeholders_in_dir(dir, replacements)
     end
 end
 
---- Генерация актуального манифеста app.lua с учётом специфики сборки языков (включая быстрый автономный Java JAR)
-local function build_app_manifest_content(app_name, lang, desc)
+--- Генерация актуального манифеста app.lua с учётом специфики сборки языков и Nix-зависимостей
+local function build_app_manifest_content(app_name, lang, desc, stack_plan)
     lang = (lang or "python"):lower()
+    stack_plan = stack_plan or {}
     if lang == "java" then
         local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. app_name)
+        local spec_deps = stack_plan.special_dependencies or {}
+        local spec_str = "{}"
+        if #spec_deps > 0 then
+            local formatted = {}
+            for _, dep in ipairs(spec_deps) do
+                table.insert(formatted, string.format("%q", dep))
+            end
+            spec_str = "{ " .. table.concat(formatted, ", ") .. " }"
+        end
+        local build_cmd = (stack_plan.build and stack_plan.build ~= "" and stack_plan.build ~= "auto") and stack_plan.build or string.format(
+            "mkdir -p build/classes && javac -encoding UTF-8 -d build/classes $(find src -name '*.java') && jar --create --file build/%s.jar --main-class Main -C build/classes .",
+            app_name
+        )
+        local run_cmd = (stack_plan.run and stack_plan.run ~= "" and stack_plan.run ~= "auto") and stack_plan.run or ("java -jar build/" .. app_name .. ".jar")
         local lines = {
             "return {",
             string.format("    name = %q,", app_name),
             string.format("    description = %q,", clean_desc),
             '    type = "java",',
             string.format("    artifact = %q,", "build/" .. app_name .. ".jar"),
-            string.format(
-                "    build = %q,",
-                string.format(
-                    "mkdir -p build/classes && javac -encoding UTF-8 -d build/classes $(find src -name '*.java') && jar --create --file build/%s.jar --main-class Main -C build/classes .",
-                    app_name
-                )
-            ),
-            string.format("    run = %q,", "java -jar build/" .. app_name .. ".jar"),
-            "    special_dependencies = {},",
-            "    detached = false,",
-            "}",
+            string.format("    build = %q,", build_cmd),
+            string.format("    run = %q,", run_cmd),
         }
+        if stack_plan.test and stack_plan.test ~= "" and stack_plan.test ~= "auto" then
+            table.insert(lines, string.format("    test = %q,", stack_plan.test))
+        end
+        table.insert(lines, string.format("    special_dependencies = %s,", spec_str))
+        table.insert(lines, string.format("    detached = %s,", stack_plan.detached and "true" or "false"))
+        table.insert(lines, "}")
         return table.concat(lines, "\n") .. "\n"
     end
-    return utils.generate_app_manifest(app_name, lang, desc)
+    return utils.generate_app_manifest(app_name, lang, desc, stack_plan)
 end
 
 --- Определение основного файла исходного кода по языку
 local function get_entry_file_for_lang(lang, app_dir)
     local map = {
-        python = "src/main.py",
+        python = "main.py",
         java   = "src/Main.java",
         rust   = "src/main.rs",
-        lua    = "src/main.lua",
+        lua    = "main.lua",
+        bash   = "main.sh",
+        fish   = "main.fish",
         cpp    = "src/main.cpp",
     }
-    local cand = map[(lang or "python"):lower()] or "src/main.py"
+    local cand = map[(lang or "python"):lower()] or "main.py"
     if app_dir and ctx.exists(app_dir .. "/" .. cand) then
         return cand
     end
-    local fallbacks = { "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp" }
+    local fallbacks = {
+        "main.py", "main.lua", "main.sh", "main.fish",
+        "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp",
+        "src/main.sh", "src/main.fish", "main.rs", "main.cpp", "Main.java",
+    }
     for _, f in ipairs(fallbacks) do
         if app_dir and ctx.exists(app_dir .. "/" .. f) then
             return f
@@ -621,26 +949,82 @@ local function get_entry_file_for_lang(lang, app_dir)
     return cand
 end
 
---- Запуск субагента Aider для реализации приложения
-local function run_dev(app_dir, prompt, app_name, lang)
-    local grime_bin = os.getenv("GRIME_BIN") or "grime"
-    local stack_lang = lang or (prompt and extract_lang_from_prompt(prompt)) or (app_name and extract_lang_from_prompt(app_name)) or "python"
-    local entry_file = get_entry_file_for_lang(stack_lang, app_dir)
-    if prompt and prompt ~= "" then
-        local dev_prompt = string.format(
-            "%s\n\n[GRIME APP REQUIREMENT]:\n" ..
-            "- Целевой язык и стек приложения: %s (СТРОГО используй язык %s!).\n" ..
-            "- Редактируй существующий исходный файл `%s` в директории `%s` (НЕ создавай дублирующие файлы в корне проекта мимо `src/`!).\n" ..
-            "- Убедись, что код компилируется/выполняется без ошибок, а манифест `app.lua` содержит актуальные поля `type = %q`, `artifact`, `build` и `run`.",
-            prompt, stack_lang, stack_lang, entry_file, app_dir, stack_lang
+--- Формирование блока требований для промпта Aider с учетом режима (Zero-Manifest или legacy app.lua)
+local function build_app_dev_prompt(prompt, stack_lang, deps_desc, summary_desc, entry_file, app_dir, has_manifest)
+    local manifest_block
+    if has_manifest then
+        manifest_block = string.format(
+            "2. СИНХРОНИЗАЦИЯ FLAKE.NIX И APP.LUA (ОБЯЗАТЕЛЬНО):\n" ..
+            "   - В манифесте `app.lua` поле `type = %q`, а в массиве `special_dependencies = { ... }` ОБЯЗАТЕЛЬНО должны быть перечислены все используемые библиотеки Nixpkgs.\n" ..
+            "   - Проверь и при необходимости актуализируй поля `build`, `run`, `test` в `app.lua`.\n" ..
+            "   - В `flake.nix` убедись, что все внешние библиотеки присутствуют в `buildInputs = with pkgs; [ ... ]`, а инструменты сборки — в `nativeBuildInputs = with pkgs; [ ... ]`.\n\n",
+            stack_lang
         )
+    else
+        manifest_block =
+            "2. ZERO-MANIFEST СТАНДАРТ И FLAKE.NIX (БЕЗ app.lua):\n" ..
+            "   - Это приложение использует Zero-Manifest формат GRIME: НЕ создавай файл `app.lua`!\n" ..
+            "   - Для скриптов сохраняй корректный shebang (`#!/usr/bin/env ...`) в первой строке и мета-комментарии `# description: ...` / `# nix: ...` при добавлении новых пакетов.\n" ..
+            "   - В `flake.nix` убедись, что все внешние библиотеки присутствуют в `buildInputs = with pkgs; [ ... ]`, а инструменты сборки — в `nativeBuildInputs = with pkgs; [ ... ]`.\n\n"
+    end
+
+    return string.format(
+        "%s\n\n[АРХИТЕКТУРНЫЙ ПЛАН И ТРЕБОВАНИЯ GRIME]:\n" ..
+        "1. СТЕК И NIX-ЗАВИСИМОСТИ:\n" ..
+        "   - Основной язык: %s (СТРОГО используй язык %s!).\n" ..
+        "   - %s\n" ..
+        "   - Архитектурное решение: %s\n\n" ..
+        "%s" ..
+        "3. РЕАЛИЗАЦИЯ И СБОРКА:\n" ..
+        "   - Редактируй существующий исходный файл `%s` в директории `%s` (НЕ создавай дублирующих/лишних файлов!).\n" ..
+        "   - Для C++: подключи библиотеки в `CMakeLists.txt` (find_package / pkg_check_modules и target_link_libraries).\n" ..
+        "   - Для Rust: подключи зависимости в `Cargo.toml`.\n" ..
+        "   - Убедись, что код компилируется и выполняется без ошибок в Nix-окружении (`nix develop`).",
+        prompt, stack_lang, stack_lang, deps_desc, summary_desc, manifest_block, entry_file, app_dir
+    )
+end
+
+--- Запуск субагента Aider для реализации приложения
+local function run_dev(app_dir, prompt, app_name, lang, stack_plan)
+    local grime_bin = os.getenv("GRIME_BIN") or "grime"
+    local stack_lang = lang or (stack_plan and stack_plan.lang) or (prompt and extract_lang_from_prompt(prompt)) or (app_name and extract_lang_from_prompt(app_name)) or "python"
+    local entry_file = get_entry_file_for_lang(stack_lang, app_dir)
+
+    if not stack_plan and prompt and prompt ~= "" then
+        stack_plan = plan_app_stack(prompt, stack_lang, app_name)
+    end
+    stack_plan = stack_plan or { lang = stack_lang, special_dependencies = {} }
+
+    local special_deps = stack_plan.special_dependencies or {}
+    local deps_desc = (#special_deps > 0)
+        and ("Подключенные Nix-пакеты (Nixpkgs): " .. table.concat(special_deps, ", "))
+        or "Сторонние Nix-пакеты: не требуются (используется базовый тулчейн)."
+
+    local summary_desc = stack_plan.summary or string.format("Реализация микроприложения '%s' на %s", app_name or "app", stack_lang)
+    local has_manifest = ctx.exists(app_dir .. "/app.lua")
+
+    if prompt and prompt ~= "" then
+        local dev_prompt = build_app_dev_prompt(prompt, stack_lang, deps_desc, summary_desc, entry_file, app_dir, has_manifest)
         ctx.log(string.format("Запуск субагента Aider для реализации '%s' (стек: %s, файл: %s)...", app_name or "app", stack_lang, entry_file))
+        if #special_deps > 0 then
+            ctx.log(string.format("Переданы Nix-пакеты субагенту: %s", table.concat(special_deps, ", ")))
+        end
+
         local cmd = { "timeout", "180", grime_bin, "aider" }
         if ctx.exists(app_dir .. "/" .. entry_file) then
             table.insert(cmd, entry_file)
         end
-        if ctx.exists(app_dir .. "/app.lua") then
+        if has_manifest then
             table.insert(cmd, "app.lua")
+        end
+        if ctx.exists(app_dir .. "/flake.nix") then
+            table.insert(cmd, "flake.nix")
+        end
+        local extra_build_files = { "CMakeLists.txt", "Cargo.toml", "pom.xml" }
+        for _, bf in ipairs(extra_build_files) do
+            if ctx.exists(app_dir .. "/" .. bf) then
+                table.insert(cmd, bf)
+            end
         end
         table.insert(cmd, "-m")
         table.insert(cmd, dev_prompt)
@@ -648,6 +1032,19 @@ local function run_dev(app_dir, prompt, app_name, lang)
         if code ~= 0 then
             ctx.warn(string.format("Aider завершился с кодом %d (продолжаем с базовым шаблоном)", code))
         end
+
+        pcall(function()
+            local to_add = {}
+            if ctx.exists(app_dir .. "/flake.nix") then table.insert(to_add, "flake.nix") end
+            if ctx.exists(app_dir .. "/" .. entry_file) then table.insert(to_add, entry_file) end
+            if ctx.exists(app_dir .. "/app.lua") then table.insert(to_add, "app.lua") end
+            if #to_add > 0 then
+                local gcmd = { "git", "add", "-N" }
+                for _, f in ipairs(to_add) do table.insert(gcmd, f) end
+                ctx.capture(gcmd, app_dir)
+            end
+        end)
+
         return code
     else
         ctx.log("Запуск интерактивной сессии Aider для проектирования приложения...")
@@ -655,8 +1052,11 @@ local function run_dev(app_dir, prompt, app_name, lang)
         if ctx.exists(app_dir .. "/" .. entry_file) then
             table.insert(cmd, entry_file)
         end
-        if ctx.exists(app_dir .. "/app.lua") then
+        if has_manifest then
             table.insert(cmd, "app.lua")
+        end
+        if ctx.exists(app_dir .. "/flake.nix") then
+            table.insert(cmd, "flake.nix")
         end
         return ctx.run_process(cmd, app_dir)
     end
@@ -671,86 +1071,150 @@ local function get_apps_root()
     return root
 end
 
---- Скаффолдинг структуры приложения
-local function scaffold_app(app_dir, app_name, lang, prompt)
-    lang = (lang or "python"):lower()
+local SCRIPT_SCAFFOLD_PROFILES = {
+    python = {
+        filename = "main.py",
+        shebang = "#!/usr/bin/env python3",
+        comment = "#",
+        body = [[def main():
+    print("Hello from Python app!")
+
+
+if __name__ == "__main__":
+    main()
+]],
+    },
+    lua = {
+        filename = "main.lua",
+        shebang = "#!/usr/bin/env luajit",
+        comment = "--",
+        body = [[local function main()
+    print("Hello from LuaJIT app!")
+end
+
+main()
+]],
+    },
+    bash = {
+        filename = "main.sh",
+        shebang = "#!/usr/bin/env bash",
+        comment = "#",
+        body = [[set -euo pipefail
+
+main() {
+    echo "Hello from Bash app!"
+}
+
+main "$@"
+]],
+    },
+    fish = {
+        filename = "main.fish",
+        shebang = "#!/usr/bin/env fish",
+        comment = "#",
+        body = [[function main
+    echo "Hello from Fish app!"
+end
+
+main $argv
+]],
+    },
+}
+
+--- Скаффолдинг структуры приложения с учетом стека и Nix-зависимостей (Zero-Manifest стандарт без app.lua)
+local function scaffold_app(app_dir, app_name, lang, prompt, stack_plan)
+    lang = utils.LANG_ALIASES[(lang or "python"):lower()] or (lang or "python"):lower()
     if not ctx.exists(app_dir) then
         ctx.mkdir_p(app_dir)
     end
 
-    local templates_root = (ctx.paths and ctx.paths.templates)
-        or (ctx.get_path and ctx.get_path("templates"))
-        or (ctx.templates_root and ctx.templates_root())
-    if not templates_root or templates_root == "" then
-        local home = os.getenv("HOME") or ""
-        templates_root = (home ~= "" and (home .. "/.config/grime/templates")) or "./templates"
-    end
-    templates_root = ctx.normalize_path(templates_root)
-    local tpl_dir = templates_root .. "/" .. lang
-    if not ctx.exists(tpl_dir) then
-        local home = os.getenv("HOME") or ""
-        local dotfiles_tpl = home .. "/dotfiles/grime/templates/" .. lang
-        if home ~= "" and ctx.exists(dotfiles_tpl) then
-            tpl_dir = dotfiles_tpl
+    local raw_desc = (prompt and prompt ~= "") and prompt or ("Grime application " .. app_name)
+    local clean_desc = raw_desc:gsub("[\r\n]+", " ")
+    local spec_deps = (stack_plan and stack_plan.special_dependencies) or {}
+
+    local script_prof = SCRIPT_SCAFFOLD_PROFILES[lang]
+    if script_prof then
+        -- Для скриптовых языков создаём только один главный файл в корне аппа (без шаблонов, src/, tests/ и app.lua)
+        local entry_path = app_dir .. "/" .. script_prof.filename
+        if not ctx.exists(entry_path) then
+            local lines = {
+                script_prof.shebang,
+                string.format("%s description: %s", script_prof.comment, clean_desc),
+            }
+            if #spec_deps > 0 then
+                table.insert(lines, string.format("%s nix: %s", script_prof.comment, table.concat(spec_deps, ", ")))
+            end
+            if stack_plan and stack_plan.detached then
+                table.insert(lines, string.format("%s detach: true", script_prof.comment))
+            end
+            table.insert(lines, "")
+            table.insert(lines, script_prof.body)
+            local f = io.open(entry_path, "w")
+            if f then
+                f:write(table.concat(lines, "\n"))
+                f:close()
+            end
         end
-    end
-
-    if ctx.exists(tpl_dir) then
-        ctx.copy(tpl_dir, app_dir)
-        ctx.log(string.format("Каркас приложения скопирован из шаблона '%s'", lang))
+        ctx.capture({ "chmod", "+x", entry_path })
     else
+        -- Для компилируемых языков (rust, cpp, java) создаём только минимально необходимые для сборки файлы (без app.lua)
         ctx.mkdir_p(app_dir .. "/src")
-    end
+        if lang == "cpp" then
+            local cmake_file = app_dir .. "/CMakeLists.txt"
+            if not ctx.exists(cmake_file) then
+                local content = string.format([[cmake_minimum_required(VERSION 3.15)
+project(%s)
 
-    -- Для Java: удаляем устаревший шаблонный pom.xml с несуществующим com.example.App,
-    -- чтобы сборка шла быстро и надежно через javac + jar
-    if lang == "java" and ctx.exists(app_dir .. "/pom.xml") then
-        local pf = io.open(app_dir .. "/pom.xml", "r")
-        if pf then
-            local pcontent = pf:read("*a") or ""
-            pf:close()
-            if pcontent:find("com%.example%.App") and not ctx.exists(app_dir .. "/src/main/java") then
-                ctx.delete(app_dir .. "/pom.xml", true)
+set(CMAKE_CXX_STANDARD 20)
+
+add_executable(%s src/main.cpp)
+]], app_name, app_name)
+                local f = io.open(cmake_file, "w")
+                if f then f:write(content); f:close() end
+            end
+            local main_file = app_dir .. "/src/main.cpp"
+            if not ctx.exists(main_file) then
+                local content = string.format([[// description: %s
+#include <iostream>
+
+int main() {
+    std::cout << "Hello from %s!" << std::endl;
+    return 0;
+}
+]], clean_desc, app_name)
+                local f = io.open(main_file, "w")
+                if f then f:write(content); f:close() end
+            end
+        elseif lang == "rust" then
+            local ok_adp, adp = pcall(require, "languages.rust")
+            if ok_adp and adp and adp.create_default_files then
+                adp:create_default_files(app_dir, ctx, clean_desc)
+            end
+        elseif lang == "java" then
+            local ok_adp, adp = pcall(require, "languages.java")
+            if ok_adp and adp and adp.create_default_files then
+                adp:create_default_files(app_dir, ctx, clean_desc)
+            end
+        else
+            local ok_adp, adp = pcall(require, "languages." .. lang)
+            if ok_adp and adp and adp.create_default_files then
+                adp:create_default_files(app_dir, ctx, clean_desc)
             end
         end
     end
 
-    -- Гарантируем наличие базового исходного файла точки входа для каждого языка
-    ctx.mkdir_p(app_dir .. "/src")
-    local ok_adp, adp = pcall(require, "languages." .. lang)
-    if ok_adp and adp and adp.create_default_files then
-        adp:create_default_files(app_dir, ctx, prompt)
-    end
-
-    local raw_desc = (prompt and prompt ~= "") and prompt or ("Grime application " .. app_name)
-    local escaped_desc = raw_desc:gsub("\n", " "):gsub('"', '\\"')
-
-    local snake_name = grime.str.to_snake_case(app_name)
-    local kebab_name = app_name:lower():gsub("[%s_]", "-")
-    local replacements = {
-        ["{{PROJECT_NAME}}"] = app_name,
-        ["{{PROJECT_NAME_LOWER}}"] = app_name:lower(),
-        ["{{PROJECT_NAME_UPPER}}"] = app_name:upper(),
-        ["{{PROJECT_NAME_SNAKE}}"] = snake_name,
-        ["{{PROJECT_NAME_KEBAB}}"] = kebab_name,
-        ["{{PROJECT_DESCRIPTION}}"] = escaped_desc,
-    }
-    replace_placeholders_in_dir(app_dir, replacements)
-
-    -- Всегда записываем актуальный манифест app.lua по современному стандарту
-    local manifest_path = app_dir .. "/app.lua"
-    local m_content = build_app_manifest_content(app_name, lang, raw_desc)
-    local f = io.open(manifest_path, "w")
-    if f then
-        f:write(m_content)
-        f:close()
-    end
-
-    -- Автогенерация flake.nix
+    -- Автогенерация flake.nix с объединением базового тулчейна и специальных библиотек Nixpkgs
     local flake_path = app_dir .. "/flake.nix"
     if not ctx.is_file(flake_path) then
         local scan = scanner.scan_project(app_dir, ctx)
-        local native_pkgs, lib_pkgs = utils.split_packages(scan.toolchain or {}, scanner)
+        local all_pkgs = {}
+        for _, p in ipairs(scan.toolchain or {}) do
+            table.insert(all_pkgs, p)
+        end
+        for _, p in ipairs(spec_deps) do
+            table.insert(all_pkgs, p)
+        end
+        local native_pkgs, lib_pkgs = utils.split_packages(all_pkgs, scanner)
         local flake_content = utils.generate_flake_nix(app_name, native_pkgs, lib_pkgs)
         local ff = io.open(flake_path, "w")
         if ff then
@@ -1325,12 +1789,14 @@ local function print_help()
     ))
 end
 
-local LANG_ALIASES = {
+local LANG_ALIASES = utils.LANG_ALIASES or {
     cpp = "cpp", ["c++"] = "cpp", cxx = "cpp", c = "cpp",
     python = "python", py = "python", python3 = "python",
     rust = "rust", rs = "rust",
     java = "java", jav = "java",
     lua = "lua", luajit = "lua",
+    bash = "bash", sh = "bash", shell = "bash",
+    fish = "fish",
 }
 
 function main()
@@ -1433,21 +1899,29 @@ function main()
         end
         local user_prompt = table.concat(collected_prompt, " ")
 
-        -- Приоритетное извлечение языка из промпта (или имени приложения): если явно назван язык, он перекрывает авто-выбор!
+        -- Приоритетное извлечение языка и планирование стека Архитектором
         local prompt_lang = extract_lang_from_prompt(user_prompt) or extract_lang_from_prompt(app_name)
-        local final_lang = prompt_lang or app_lang or classify_stack(user_prompt)
+        local explicit = prompt_lang or app_lang
+        local stack_plan = plan_app_stack(user_prompt, explicit, app_name)
+        local final_lang = stack_plan.lang or explicit or "python"
 
         ctx.log(string.format("Выбран стек технологий для приложения '%s': %s", app_name, final_lang))
-        scaffold_app(app_dir, app_name, final_lang, user_prompt)
+        if #stack_plan.special_dependencies > 0 then
+            ctx.log(string.format("Архитектор подключил зависимости Nix: %s", table.concat(stack_plan.special_dependencies, ", ")))
+        end
+
+        scaffold_app(app_dir, app_name, final_lang, user_prompt, stack_plan)
         local entry_file = get_entry_file_for_lang(final_lang, app_dir)
 
         if user_prompt ~= "" then
-            local master_prompt = string.format(
-                "%s\n\n[GRIME APP REQUIREMENT]:\n" ..
-                "- Выбранный стек приложения: %s (СТРОГО реализуй приложение на языке %s!).\n" ..
-                "- Редактируй существующий исходный файл `%s` (НЕ создавай дублирующие файлы в корне директории мимо `src/`!).\n" ..
-                "- Убедись, что код компилируется/выполняется и манифест `app.lua` содержит верное описание и параметры сборки/запуска.",
-                user_prompt, final_lang, final_lang, entry_file
+            local special_deps = stack_plan.special_dependencies or {}
+            local deps_desc = (#special_deps > 0)
+                and ("Подключенные Nix-пакеты (Nixpkgs): " .. table.concat(special_deps, ", "))
+                or "Сторонние Nix-пакеты: не требуются (базовый тулчейн)."
+
+            local has_manifest = ctx.exists(app_dir .. "/app.lua")
+            local master_prompt = build_app_dev_prompt(
+                user_prompt, final_lang, deps_desc, stack_plan.summary or "", entry_file, app_dir, has_manifest
             )
             remaining_args = { "-m", master_prompt }
         else
@@ -1730,8 +2204,15 @@ function main()
         if target_module_file and ctx.is_file(target_module_file) then
             table.insert(aider_cmd, target_module_file)
         end
-    elseif (target_dir and ctx.exists(target_dir)) or (working_dir and ctx.is_file(working_dir .. "/app.lua")) then
-        -- Подключение файлов проекта/аппа по умолчанию (точка входа + сборочный файл + app.lua)
+    elseif (target_dir and ctx.exists(target_dir)) or (working_dir and (
+        ctx.is_file(working_dir .. "/app.lua")
+        or ctx.is_file(working_dir .. "/flake.nix")
+        or ctx.is_file(working_dir .. "/main.py")
+        or ctx.is_file(working_dir .. "/main.lua")
+        or ctx.is_file(working_dir .. "/main.sh")
+        or ctx.is_file(working_dir .. "/main.fish")
+    )) then
+        -- Подключение файлов проекта/аппа по умолчанию (точка входа + сборочный файл + flake.nix / app.lua при наличии)
         local has_explicit = false
         for _, a in ipairs(remaining_args) do
             if not a:match("^%-") and ctx.exists(working_dir .. "/" .. a) then
@@ -1740,14 +2221,21 @@ function main()
             end
         end
         if not has_explicit then
-            local entry_candidates = { "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp", "main.py", "main.lua" }
+            local entry_candidates = {
+                "main.py", "main.lua", "main.sh", "main.fish",
+                "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp",
+                "src/main.sh", "src/main.fish", "main.rs", "main.cpp", "Main.java",
+            }
             for _, c in ipairs(entry_candidates) do
                 if ctx.exists(working_dir .. "/" .. c) then
                     table.insert(aider_cmd, c)
                     break
                 end
             end
-            local build_candidates = { "app.lua", "Cargo.toml", "CMakeLists.txt", "pom.xml", "pyproject.toml" }
+            local build_candidates = { "flake.nix", "Cargo.toml", "CMakeLists.txt", "pom.xml", "pyproject.toml" }
+            if ctx.is_file(working_dir .. "/app.lua") then
+                table.insert(aider_cmd, "app.lua")
+            end
             for _, bc in ipairs(build_candidates) do
                 if ctx.exists(working_dir .. "/" .. bc) then
                     table.insert(aider_cmd, bc)
@@ -1838,6 +2326,8 @@ local M = {
     main = main,
     extract_lang_from_prompt = extract_lang_from_prompt,
     classify_stack = classify_stack,
+    plan_app_stack = plan_app_stack,
+    heuristic_nix_packages = heuristic_nix_packages,
     scaffold_app = scaffold_app,
     scaffold_grime_module = scaffold_grime_module,
     run_dev = run_dev,

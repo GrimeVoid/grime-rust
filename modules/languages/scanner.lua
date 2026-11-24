@@ -14,6 +14,8 @@ local ADAPTERS = {
     rust = require("languages.rust"),
     java = require("languages.java"),
     lua = require("languages.lua"),
+    bash = require("languages.bash"),
+    fish = require("languages.fish"),
 }
 
 local LANG_PACKAGES = {
@@ -22,6 +24,8 @@ local LANG_PACKAGES = {
     python = { "python3" },
     java = { "jdk" },
     lua = { "luajit" },
+    bash = { "bashInteractive" },
+    fish = { "fish" },
     go = { "go" },
     nodejs = { "nodejs" },
 }
@@ -53,11 +57,14 @@ local TOOLCHAIN_SET = {
     ["go"] = true,
     ["nodejs"] = true,
     ["bashInteractive"] = true,
+    ["bash"] = true,
+    ["fish"] = true,
     ["coreutils"] = true,
 }
 
 Scanner.LANG_PACKAGES = LANG_PACKAGES
 Scanner.TOOLCHAIN_SET = TOOLCHAIN_SET
+Scanner.LANG_ALIASES = utils.LANG_ALIASES
 
 local function run_capture(argv, c)
     local ctx_obj = c or (grime and grime.ctx)
@@ -181,11 +188,22 @@ function Scanner.scan_project(root, c)
         [".py"] = "python",
         [".java"] = "java",
         [".lua"] = "lua",
+        [".sh"] = "bash", [".bash"] = "bash",
+        [".fish"] = "fish",
         [".go"] = "go",
         [".js"] = "nodejs", [".ts"] = "nodejs",
     }
 
-    -- Сканирование файлов
+    local special_dependencies = {}
+    local seen_spec_deps = {}
+    local function add_spec_dep(dep)
+        if type(dep) == "string" and #dep > 0 and not seen_spec_deps[dep] then
+            seen_spec_deps[dep] = true
+            table.insert(special_dependencies, dep)
+        end
+    end
+
+    -- Сканирование файлов (расширения, манифесты, shebang и мета-комментарии)
     for _, f in ipairs(files) do
         local fname = f:match("([^/\\]+)$") or f
         if manifest_map[fname] then
@@ -198,11 +216,36 @@ function Scanner.scan_project(root, c)
         if ext and ext_map[ext] and fname ~= "app.lua" then
             register_lang(ext_map[ext])
         end
+
+        -- Проверка shebang и метаданных # nix: для скриптов (в т.ч. без расширения)
+        if fname ~= "app.lua" and fname ~= "flake.nix" and fname ~= "flake.lock" then
+            local hdr, is_bin = utils.parse_script_header(root .. "/" .. f)
+            if hdr and not is_bin then
+                if hdr.lang then
+                    register_lang(hdr.lang)
+                end
+                if hdr.meta and hdr.meta.special_dependencies then
+                    for _, dep in ipairs(hdr.meta.special_dependencies) do
+                        add_spec_dep(dep)
+                    end
+                end
+            end
+        end
+    end
+
+    -- Проверка мета-файла внешней привязки (.grime_app.json / .grime_link.json)
+    local link_meta = utils.read_app_link_meta(root)
+    if link_meta then
+        register_lang(link_meta.lang)
+        if type(link_meta.special_dependencies) == "table" then
+            for _, dep in ipairs(link_meta.special_dependencies) do
+                add_spec_dep(dep)
+            end
+        end
     end
 
     -- Безопасная загрузка таблицы манифеста app.lua (если есть)
     local app_lua = root .. "/app.lua"
-    local special_dependencies = {}
     if utils.file_exists(app_lua) then
         local chunk = loadfile(app_lua, "t", {})
         if chunk then
@@ -220,13 +263,11 @@ function Scanner.scan_project(root, c)
 
                 if type(m.special_dependencies) == "table" then
                     for _, dep in ipairs(m.special_dependencies) do
-                        if type(dep) == "string" and #dep > 0 then
-                            table.insert(special_dependencies, dep)
-                        end
+                        add_spec_dep(dep)
                     end
                 elseif type(m.special_dependencies) == "string" then
                     for dep in m.special_dependencies:gmatch("%S+") do
-                        table.insert(special_dependencies, dep)
+                        add_spec_dep(dep)
                     end
                 end
             end

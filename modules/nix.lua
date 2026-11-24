@@ -116,6 +116,9 @@ local function resolve_project_dependencies(target_dir, user_packages)
     for _, p in ipairs(scan.toolchain or {}) do
         table.insert(all_packages, p)
     end
+    for _, p in ipairs(scan.special_dependencies or {}) do
+        table.insert(all_packages, p)
+    end
     for _, p in ipairs(load_app_special_dependencies(target_dir)) do
         table.insert(all_packages, p)
     end
@@ -130,7 +133,7 @@ end
 local function get_ephemeral_flake_dir(target_dir, user_packages)
     local scan = scanner.scan_project(target_dir, ctx)
     local app_raw = ctx.exists(target_dir .. "/app.lua") and (fs.read(target_dir .. "/app.lua") or "") or ""
-    local sig = target_dir .. "|" .. table.concat(scan.toolchain or {}, ",") .. "|" .. app_raw
+    local sig = target_dir .. "|" .. table.concat(scan.toolchain or {}, ",") .. "|" .. table.concat(scan.special_dependencies or {}, ",") .. "|" .. app_raw
     local h = 5381
     for i = 1, #sig do
         h = ((h * 33) + sig:byte(i)) % 4294967296

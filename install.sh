@@ -54,7 +54,7 @@ expand_path() {
 # Справочная информация
 show_help() {
     cat << EOF
-${BOLD}GRIME Installer${NC} — Автоматическая установка платформы GRIME (Rust Engine + LuaJIT)
+${BOLD}GRIME Installer${NC} — Автоматическая установка платформы GRIME (Rust Engine + Lua 5.4)
 
 ${BOLD}ИСПОЛЬЗОВАНИЕ:${NC}
     ./install.sh [ОПЦИИ]

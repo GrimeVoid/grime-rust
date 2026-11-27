@@ -1,11 +1,28 @@
-# Конфигурация путей Grime (шаблон)
-# Скопируйте этот файл в gproj.conf и укажите ваши локальные пути:
+# Конфигурация GRIME (шаблон)
+# Скопируйте этот файл в ~/.config/grime/gproj.conf (или укажите путь через GRIME_CONFIG)
+# и поправьте значения под себя. Строки с '#' и ';' — комментарии.
+#
+# Значения-пути раскрываются (~, $VAR) и нормализуются; относительные пути
+# отсчитываются от каталога этого файла. Остальные значения остаются как есть.
 
+# Каталог конфигурации и каталог модулей (необязательно: по умолчанию
+# это каталог файла конфигурации и <config>/modules)
 config=$HOME/.config/grime
+# modules=$HOME/.config/grime/modules
+
+# Именованные пути: умолчания объявляют сами модули (--@grime path.<имя>),
+# ключи ниже их переопределяют
 projects=$HOME/Projects
 templates=$HOME/.config/grime/templates
 apps=$HOME/.config/grime/apps
+
+# Контейнер Distrobox по умолчанию и простой контейнера (секунды) до автоостановки
+distrobox_default=fedora-box
+# box_idle_timeout=300
+
+# ИИ-агенты: auto — первый доступный (claude, затем aider); claude/aider — путь к бинарю или auto
 ai_agent=auto
 claude=auto
 aider=auto
-distrobox_default=fedora-box
+# Агент для `grime doctor -fix` (по умолчанию ai_agent, иначе claude)
+# doctor_agent=claude

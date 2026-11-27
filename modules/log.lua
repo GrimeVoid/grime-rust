@@ -5,6 +5,7 @@
 
 local ctx = grime.ctx
 local git = require("git")
+local utils = require("languages.utils")
 
 local ANSI = {
     BOLD = "\27[1m",
@@ -47,7 +48,7 @@ local function print_help()
     %slist, -l, --list [n]%s            Показать последние N записей логов (по умолчанию 20)
     %serrors, -e, --errors [n]%s        Показать только ошибки и предупреждения (по умолчанию 10)
     %sgit, -g, --git [n|каталог]%s      Вывести коммиты Git в журнал системы
-    %sclear, -c, --clear%s              Очистить историю логов на диске и в шине состояния
+    %sclear, -c, --clear [-y]%s         Очистить историю логов на диске и в шине состояния (без TTY нужен --yes)
     %sadd, -a, --add <уровень> <msg>%s  Добавить произвольную запись в лог (INFO, WARN, ERROR)
     %s-n, --limit <N>%s                 Лимит выводимых записей
     %shelp, -h, --help%s                Показать эту справку
@@ -355,6 +356,10 @@ function M.main()
     end
 
     if subcmd == "clear" then
+        local yes = utils.extract_yes_flag(args)
+        if not utils.confirm_destructive("Очистить всю историю логов (файл и шина состояния)?", yes, ctx) then
+            return
+        end
         M.clear()
         grime.ui.success("История логов успешно очищена на диске и в шине состояния.")
         ctx.success("cleared")

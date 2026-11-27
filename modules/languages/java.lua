@@ -151,6 +151,7 @@ function JavaAdapter:get_run_command(root, extra_args)
             local content = f:read("*all") or ""
             f:close()
             main_class = content:match("<mainClass>%s*([^<%s]+)%s*</mainClass>")
+                or content:match("<exec%.mainClass>%s*([^<%s]+)%s*</exec%.mainClass>")
         end
         if not main_class and utils.file_exists(root .. "/target/classes/Main.class") then
             main_class = "Main"

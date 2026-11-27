@@ -1,5 +1,6 @@
 --@grime description: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua, Bash, Fish)
 --@grime alias: proj
+--@grime requires: module:nix
 --@grime default: true
 --@grime path.projects: ~/Projects
 --@grime path.templates: ~/.config/grime/templates
@@ -205,24 +206,6 @@ local function find_project(query, opts)
         end
     end
     return nil
-end
-
---- В неинтерактивном режиме без --yes — отказ.
-local function confirm_destructive(prompt, assume_yes)
-    if assume_yes then return true end
-    if not os.execute("test -t 0") then
-        ctx.fail("Требуется подтверждение: в неинтерактивном режиме добавьте --yes (-y)")
-        return false
-    end
-    io.stdout:write(prompt .. " [y/N]: ")
-    io.stdout:flush()
-    local ans = io.read()
-    local low = ans and ans:match("^%s*(.-)%s*$"):lower() or ""
-    if low == "y" or low == "yes" or low == "д" or low == "да" then
-        return true
-    end
-    ctx.fail("Действие отменено пользователем")
-    return false
 end
 
 --- Точный поиск проекта строго по имени внутри projects_root: <язык-каталог>/<имя>.
@@ -454,7 +437,7 @@ local function handle_destructive(projects_root, parsed, return_path_requested)
 
     local target = found[1]
     local verb = (parsed.action == "delete") and "Удалить" or "Сбросить к чистому шаблону"
-    if not confirm_destructive(string.format("%s проект '%s' (%s)?", verb, name, target.path), parsed.flags.yes) then
+    if not utils.confirm_destructive(string.format("%s проект '%s' (%s)?", verb, name, target.path), parsed.flags.yes, ctx) then
         return
     end
 
@@ -515,6 +498,31 @@ local function build_project(adapter, project_dir, parsed)
     end
 
     return adapter:build(project_dir, ctx) and true or false, false
+end
+
+--- Нужно ли запускать проект через nix develop: сборка шла через nix, задан --nix, либо на хосте нет
+--- нужного рантайма/компилятора, а nix доступен. Внутри nix-оболочки запуск идёт как обычно.
+local function should_run_via_nix(adapter, project_dir, parsed, built_via_nix)
+    if os.getenv("IN_NIX_SHELL") then return false end
+    if not utils.has_binary("nix", ctx) then return false end
+    if built_via_nix or (parsed.flags and parsed.flags.nix) then return true end
+    if adapter.check_dependencies then
+        local ok = adapter:check_dependencies(ctx, project_dir)
+        return not ok
+    end
+    return false
+end
+
+--- Токены запуска проекта в nix develop (чистая функция): nil, ошибка — если команды запуска нет.
+local function nix_run_tokens(adapter, project_dir, extra_args)
+    local run_cmd = adapter:get_run_command(project_dir, extra_args)
+    if not run_cmd then
+        return nil, "точка входа для запуска не найдена в " .. project_dir
+    end
+    local esc = {}
+    for _, t in ipairs(run_cmd) do esc[#esc + 1] = utils.shell_escape(t) end
+    local inner = "cd " .. utils.shell_escape(project_dir) .. " && exec " .. table.concat(esc, " ")
+    return require("nix").develop_command(project_dir, { "bash", "-c", inner })
 end
 
 local function handle_list(projects_root, parsed, return_path_requested)
@@ -796,7 +804,18 @@ local function main()
                 project_dir, tostring(target), via_nix and " (сборка через Nix кладёт результат вне проекта)" or ""))
             return
         end
-        local ret = adapter:run(project_dir, extra_args, ctx)
+        local ret
+        if should_run_via_nix(adapter, project_dir, parsed, via_nix) then
+            local tokens, nerr = nix_run_tokens(adapter, project_dir, extra_args)
+            if not tokens then
+                ctx.fail("Не удалось подготовить запуск через Nix: " .. tostring(nerr))
+                return
+            end
+            ctx.log("⚡ [Grime Nix] На хосте нет нужного рантайма/флаг --nix: запуск в изолированном Nix-окружении...")
+            ret = ctx.run_process(tokens, project_dir)
+        else
+            ret = adapter:run(project_dir, extra_args, ctx)
+        end
         if ret and ret ~= 0 then
             ctx.fail(string.format("Выполнение проекта завершилось с ошибкой (код %d).", ret))
             return
@@ -815,4 +834,6 @@ return {
     find_project = find_project,
     collect_projects = collect_projects,
     build_project = build_project,
+    nix_run_tokens = nix_run_tokens,
+    should_run_via_nix = should_run_via_nix,
 }

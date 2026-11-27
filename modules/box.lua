@@ -506,7 +506,7 @@ local function print_help()
     %sstop, -s, --stop%s          Остановить работающий контейнер
                               grime box --stop <имя>
     %srm, -d, --rm, --delete%s    Удалить контейнер Distrobox
-                              grime box --rm <имя>
+                              grime box --rm <имя> [-y|--yes]   (без TTY обязателен --yes)
     %sexport, --export%s          Экспорт бинарника или desktop-файла из контейнера на хост
                               grime box --export [имя] --app <приложение> | --bin <путь>
     %shelp, -h, --help%s          Показать эту справку
@@ -559,6 +559,7 @@ local function main()
         categories = { box = box_cats },
         flags = {
             help = { "-h", "--help", "-help" },
+            yes = { "-y", "--yes", "-yes" },
         },
     })
     local action = parsed.action or "list"
@@ -611,6 +612,9 @@ local function main()
     elseif action == "stop" then
         handle_stop(box_name, target_dir)
     elseif action == "rm" then
+        if not utils.confirm_destructive(string.format("Удалить контейнер Distrobox '%s' вместе с его данными?", box_name), parsed.flags.yes, ctx) then
+            return
+        end
         handle_rm(box_name, target_dir)
     elseif action == "keepalive" then
         check_idle_keepalive(box_name)

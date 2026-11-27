@@ -2,6 +2,7 @@
 
 
 local ctx = grime.ctx
+local utils = require("languages.utils")
 
 local function print_help()
     print(string.format([[
@@ -11,7 +12,7 @@ local function print_help()
     grime bus <get|-get|-g|--get> <ключ>
     grime bus <set|-set|-s|--set> <ключ> <значение>
     grime bus <has|-has|--has> <ключ>
-    grime bus <rm|-rm|-d|--rm|--delete> <ключ>
+    grime bus <rm|-rm|-d|--rm|--delete> <ключ> [-y|--yes]   (без TTY обязателен --yes)
     grime bus <list|-list|-l|--list|--keys> [префикс]
     grime bus <emit|-emit|-e|--emit> <событие> [json_данные]
     grime bus <help|-help|-h|--help>
@@ -52,7 +53,7 @@ local BUS_ACTIONS = {
 }
 
 local function main()
-    local args = ctx.args or {}
+    local assume_yes, args = utils.extract_yes_flag(ctx.args or {})
     if #args == 0 then
         print_help()
         return
@@ -150,6 +151,9 @@ local function main()
         local key = normalize_bus_key(raw_key)
         if not key or #key == 0 then
             ctx.fail("Укажите ключ для удаления: grime bus rm <key>")
+            return
+        end
+        if not utils.confirm_destructive(string.format("Удалить ключ '%s' из шины состояния?", key), assume_yes, ctx) then
             return
         end
         if grime.bus.delete then

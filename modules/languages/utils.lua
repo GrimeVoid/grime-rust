@@ -273,6 +273,42 @@ function utils.split_packages(packages, scanner_mod)
     return native, libs
 end
 
+--- Разрешены ли проприетарные (unfree) пакеты Nix. По умолчанию да;
+--- отключается ключом конфига nix_allow_unfree = false|0|no|off (регистр не важен).
+function utils.nix_allow_unfree()
+    local v = nil
+    if grime and grime.config and grime.config.get then
+        v = grime.config.get("nix_allow_unfree")
+    end
+    if v == nil then return true end
+    if v == false then return false end
+    local s = tostring(v):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    return not (s == "false" or s == "0" or s == "no" or s == "off")
+end
+
+--- Окружение для nix-команд с flake-ссылками (nixpkgs#X): {NIXPKGS_ALLOW_UNFREE="1"} или nil.
+function utils.nix_unfree_env()
+    if utils.nix_allow_unfree() then return { NIXPKGS_ALLOW_UNFREE = "1" } end
+    return nil
+end
+
+--- Флаги nix-команд, нужные для чтения NIXPKGS_ALLOW_UNFREE: {"--impure"} или {}.
+function utils.nix_unfree_flags()
+    if utils.nix_allow_unfree() then return { "--impure" } end
+    return {}
+end
+
+--- Команда установки в профиль: `nix profile add [--impure] nixpkgs#X ...` и env для запуска.
+--- Короткие имена получают префикс nixpkgs#, ссылки с [:#/] остаются как есть.
+function utils.nix_profile_add_cmd(packages)
+    local cmd = { "nix", "profile", "add" }
+    for _, f in ipairs(utils.nix_unfree_flags()) do cmd[#cmd + 1] = f end
+    for _, p in ipairs(packages or {}) do
+        cmd[#cmd + 1] = p:find("[:#/]") and p or ("nixpkgs#" .. p)
+    end
+    return cmd, utils.nix_unfree_env()
+end
+
 --- Единый чистый генератор шаблона flake.nix (Flakes-only стандарт)
 function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
     name = name or "app"
@@ -322,6 +358,13 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
           ];]], table.concat(lib_lines, "\n"))
     end
 
+    local for_all
+    if utils.nix_allow_unfree() then
+        for_all = "forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; config.allowUnfree = true; }));"
+    else
+        for_all = "forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});"
+    end
+
     return string.format([[{
   description = %q;
 
@@ -332,7 +375,7 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
   outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      %s
     in
     {
       devShells = forAllSystems (pkgs: {
@@ -348,7 +391,7 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
       });
     };
 }
-]], desc, table.concat(native_lines, "\n"), build_inputs_block, table.concat(hook_lines, "\n            "))
+]], desc, for_all, table.concat(native_lines, "\n"), build_inputs_block, table.concat(hook_lines, "\n            "))
 end
 
 --- Формирование обертки запуска с авто-детектом nixGL (GPU/OpenGL/Vulkan) и sudo
@@ -687,6 +730,41 @@ function utils.is_git_repo(dir, ctx)
         local res = c.capture({ "git", "-C", dir, "rev-parse", "--is-inside-work-tree" })
         return res.code == 0 and res.stdout ~= nil and res.stdout:match("true") ~= nil
     end
+    return false
+end
+
+--- Определение интерактивного терминала на stdin (подменяется в тестах).
+function utils.stdin_is_tty()
+    local r = os.execute("test -t 0")
+    return r == true or r == 0
+end
+
+--- Выделяет флаг подтверждения (-y/--yes/-yes) из списка аргументов: возвращает yes, остальные_аргументы.
+function utils.extract_yes_flag(args)
+    local yes, rest = false, {}
+    for _, a in ipairs(args or {}) do
+        if a == "-y" or a == "--yes" or a == "-yes" then yes = true else rest[#rest + 1] = a end
+    end
+    return yes, rest
+end
+
+--- Подтверждение необратимого действия. true — если assume_yes или пользователь ответил y/yes/д/да.
+--- В неинтерактивном режиме без assume_yes — ctx.fail и false.
+function utils.confirm_destructive(prompt, assume_yes, ctx)
+    local c = ctx or (grime and grime.ctx)
+    if assume_yes then return true end
+    if not utils.stdin_is_tty() then
+        if c and c.fail then c.fail("Требуется подтверждение: в неинтерактивном режиме добавьте --yes (-y)") end
+        return false
+    end
+    io.stdout:write(prompt .. " [y/N]: ")
+    io.stdout:flush()
+    local ans = io.read()
+    local low = ans and ans:match("^%s*(.-)%s*$"):lower() or ""
+    if low == "y" or low == "yes" or low == "д" or low == "да" then
+        return true
+    end
+    if c and c.fail then c.fail("Действие отменено пользователем") end
     return false
 end
 

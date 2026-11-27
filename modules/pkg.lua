@@ -846,6 +846,8 @@ local function handle_install(manager, packages)
     end
 
     local cmd = {}
+    local nix_env = nil
+    local cmd_has_packages = false
     if manager == "yay" then
         cmd = { "yay", "-S" }
     elseif manager == "pacman" then
@@ -857,12 +859,11 @@ local function handle_install(manager, packages)
     elseif manager == "flatpak" then
         cmd = { "flatpak", "install", "-y" }
     elseif manager == "nix" then
-        cmd = { "nix", "profile", "install" }
-        for i, p in ipairs(packages) do
-            if not p:find("[:#/]") then
-                packages[i] = "nixpkgs#" .. p
-            end
-        end
+        -- `nix profile add` (install устарел); пакеты и флаги unfree собирает utils
+        local nix_cmd
+        nix_cmd, nix_env = utils.nix_profile_add_cmd(packages)
+        cmd = nix_cmd
+        cmd_has_packages = true
     elseif manager == "cargo" then
         cmd = { "cargo", "install" }
     elseif manager == "pipx" then
@@ -879,8 +880,10 @@ local function handle_install(manager, packages)
         return
     end
 
-    for _, p in ipairs(packages) do
-        table.insert(cmd, p)
+    if not cmd_has_packages then
+        for _, p in ipairs(packages) do
+            table.insert(cmd, p)
+        end
     end
 
     ctx.log("Установка через " .. manager .. ": " .. table.concat(packages, " ") .. "...")
@@ -888,7 +891,7 @@ local function handle_install(manager, packages)
     if manager == "yay" or manager == "pacman" then
         ret = ctx.run_interactive(cmd)
     else
-        ret = ctx.run_process(cmd)
+        ret = ctx.run_process(cmd, nil, nix_env)
     end
     if ret == 0 then
         ctx.log("Установка успешно завершена.")
@@ -1504,7 +1507,10 @@ local function is_nixpkgs_package(pkg_name)
         return NIX_PACKAGE_MAPPINGS[pkg_name]
     end
     if not has_binary("nix") then return nil end
-    local res = ctx.capture({ "nix", "eval", "--raw", "nixpkgs#" .. pkg_name .. ".name" })
+    local eval_cmd = { "nix", "eval" }
+    for _, f in ipairs(utils.nix_unfree_flags()) do eval_cmd[#eval_cmd + 1] = f end
+    for _, a in ipairs({ "--raw", "nixpkgs#" .. pkg_name .. ".name" }) do eval_cmd[#eval_cmd + 1] = a end
+    local res = ctx.capture(eval_cmd, nil, utils.nix_unfree_env())
     if res.code == 0 and res.stdout and #res.stdout > 0 then
         return pkg_name
     end
@@ -1527,10 +1533,12 @@ local function run_nix_shell(target_name, run_args, explicit_sudo)
     end
     local use_sudo = explicit_sudo or auto_sudo or is_root_user()
     local shell_cmd = build_nix_shell_command(target_name, run_args, use_sudo)
-    local cmd = { "nix", "shell", "nixpkgs#" .. nix_pkg, "--command", "bash", "-c", shell_cmd }
+    local cmd = { "nix", "shell", "nixpkgs#" .. nix_pkg }
+    for _, f in ipairs(utils.nix_unfree_flags()) do cmd[#cmd + 1] = f end
+    for _, a in ipairs({ "--command", "bash", "-c", shell_cmd }) do cmd[#cmd + 1] = a end
 
     ctx.log(string.format("[Grime Pkg] Изолированный Flake-запуск [nixpkgs#%s%s]: %s...", nix_pkg, use_sudo and " (sudo -E)" or "", target_name))
-    local ret = ctx.run_process(cmd)
+    local ret = ctx.run_process(cmd, nil, utils.nix_unfree_env())
     if ret ~= 0 then
         ctx.fail(string.format("Выполнение утилиты '%s' через nix shell завершилось ошибкой (код %d)", target_name, ret))
     end
@@ -1885,8 +1893,10 @@ local function handle_not_found(args, run_ctx)
 
         if should_run then
             local shell_cmd = build_nix_shell_command(cmd, cmd_args, use_sudo)
-            local proc = { "nix", "shell", "nixpkgs#" .. nix_pkg, "--command", "bash", "-c", shell_cmd }
-            local code = context.run_interactive(proc)
+            local proc = { "nix", "shell", "nixpkgs#" .. nix_pkg }
+            for _, f in ipairs(utils.nix_unfree_flags()) do proc[#proc + 1] = f end
+            for _, a in ipairs({ "--command", "bash", "-c", shell_cmd }) do proc[#proc + 1] = a end
+            local code = context.run_interactive(proc, nil, utils.nix_unfree_env())
             if code and code ~= 0 then
                 context.fail(string.format("Команда '%s' завершилась с кодом %d", cmd, code))
             end

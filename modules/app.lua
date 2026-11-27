@@ -656,13 +656,30 @@ local function load_manifest(app_dir, app_name, opts)
     return m
 end
 
+--- Есть ли в каталоге исходников файл новее артефакта. Служебные файлы (flake.nix/flake.lock/*.lock,
+--- .gitignore), служебные каталоги и сам собранный бинарник (skip_rel) не считаются изменением исходников:
+--- запуск через nix develop или повторная сборка переписывают их и ложно давали «Требует пересборки».
+local function sources_newer_than(src_dir, apath, skip_rel)
+    local argv = { "find", src_dir,
+        "(", "-name", ".git", "-o", "-name", "target", "-o", "-name", "node_modules",
+        "-o", "-name", "build", "-o", "-name", "result", ")", "-prune", "-o",
+        "-type", "f", "!", "-name", "flake.nix", "!", "-name", "*.lock", "!", "-name", ".gitignore" }
+    if skip_rel and skip_rel ~= "" then
+        argv[#argv + 1] = "!"; argv[#argv + 1] = "-path"; argv[#argv + 1] = src_dir .. "/" .. skip_rel
+    end
+    for _, t in ipairs({ "-newer", apath, "-print", "-quit" }) do argv[#argv + 1] = t end
+    local res = ctx.capture(argv)
+    return res and res.code == 0 and (res.stdout or ""):find("%S") ~= nil
+end
+
 local function check_artifact_status(app_dir, m)
     -- Если есть скомпилированный артефакт, привязанный в app_dir через -compile
     if m._local_artifact and ctx.exists(app_dir .. "/" .. m._local_artifact) then
         local apath = app_dir .. "/" .. m._local_artifact
         if m._source_dir and ctx.exists(m._source_dir) then
             local src_check = ctx.exists(m._source_dir .. "/src") and (m._source_dir .. "/src") or m._source_dir
-            if ctx.is_newer(src_check, apath) then
+            local skip = m._link_meta and m._link_meta.source_artifact
+            if sources_newer_than(src_check, apath, skip) then
                 return "needs_rebuild", "Требует пересборки"
             end
         end
@@ -1062,7 +1079,20 @@ local function flake_app(apps_root, raw_name)
     end
 end
 
-local function rm_app(apps_root, app_name)
+--- Ключи состояния именно этого приложения (приложения с точкой в имени не затрагиваем)
+local function app_state_keys(app_name)
+    local res = {}
+    if grime and grime.bus and grime.bus.keys then
+        local prefix = "app." .. app_name .. "."
+        local ok, keys = pcall(grime.bus.keys, prefix)
+        for _, k in ipairs(ok and keys or {}) do
+            if not k:sub(#prefix + 1):find(".", 1, true) then res[#res + 1] = k end
+        end
+    end
+    return res
+end
+
+local function rm_app(apps_root, app_name, assume_yes)
     local ok_name, why = utils.valid_name(app_name)
     if not ok_name then
         fail_once(string.format("Недопустимое имя приложения '%s': %s", tostring(app_name), why))
@@ -1071,27 +1101,30 @@ local function rm_app(apps_root, app_name)
     local app_dir = apps_root .. "/" .. app_name
     if not ctx.exists(app_dir) then fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root)); return end
 
-    -- Удаляем симлинк из ~/.local/bin/<app_name>, если он указывает внутрь удаляемого приложения
+    -- Симлинк ~/.local/bin/<app_name> удаляем, только если он указывает внутрь удаляемого приложения
     local bin_link = HOME .. "/.local/bin/" .. app_name
+    local link_ours = false
     local rl = ctx.capture({ "readlink", "-f", bin_link })
     if rl and rl.code == 0 and rl.stdout then
         local target_real = grime.str.trim(rl.stdout)
         local norm_app_dir = ctx.normalize_path(app_dir)
-        if target_real:sub(1, #norm_app_dir + 1) == (norm_app_dir .. "/") or target_real == norm_app_dir then
-            pcall(os.remove, bin_link)
-        end
+        link_ours = target_real:sub(1, #norm_app_dir + 1) == (norm_app_dir .. "/") or target_real == norm_app_dir
+    end
+    local keys = app_state_keys(app_name)
+
+    -- Что именно будет удалено (до подтверждения)
+    ctx.log(string.format("Будет удалено приложение '%s':", app_name))
+    ctx.log("  каталог: " .. app_dir)
+    if link_ours then ctx.log("  симлинк: " .. bin_link) end
+    if #keys > 0 then ctx.log("  ключи состояния: " .. table.concat(keys, ", ")) end
+    if not utils.confirm_destructive(string.format("Удалить приложение '%s' (%s) безвозвратно?", app_name, app_dir), assume_yes, ctx) then
+        return
     end
 
+    if link_ours then pcall(os.remove, bin_link) end
     if ctx.delete(app_dir, true) then
-        -- Удаляем ключи состояния именно этого приложения (приложения с точкой в имени не затрагиваем)
-        if grime and grime.bus and grime.bus.keys and grime.bus.delete then
-            local prefix = "app." .. app_name .. "."
-            local ok, keys = pcall(grime.bus.keys, prefix)
-            for _, k in ipairs(ok and keys or {}) do
-                if not k:sub(#prefix + 1):find(".", 1, true) then
-                    pcall(grime.bus.delete, k)
-                end
-            end
+        if grime and grime.bus and grime.bus.delete then
+            for _, k in ipairs(keys) do pcall(grime.bus.delete, k) end
         end
         ctx.log(string.format("✓ Приложение '%s' успешно удалено.", app_name))
         if ctx.has_next_step then ctx.module_return(app_dir) end
@@ -1548,8 +1581,11 @@ local function bundle_app(apps_root, raw_name)
     end
 
     local pkgs_prelude = string.format(
-        'let flake = builtins.getFlake ("path:" + %s); nixpkgs = flake.inputs.nixpkgs or (builtins.getFlake "nixpkgs"); pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};',
-        nix_quote(app_dir_abs)
+        'let flake = builtins.getFlake ("path:" + %s); nixpkgs = flake.inputs.nixpkgs or (builtins.getFlake "nixpkgs"); pkgs = %s;',
+        nix_quote(app_dir_abs),
+        utils.nix_allow_unfree()
+            and "import nixpkgs { system = builtins.currentSystem; config.allowUnfree = true; }"
+            or "nixpkgs.legacyPackages.${builtins.currentSystem}"
     )
 
     local bundle_cmd = nil
@@ -1704,7 +1740,7 @@ EOF
     end
 end
 
-local function rollback_app(apps_root, raw_name, target_commit)
+local function rollback_app(apps_root, raw_name, target_commit, assume_yes)
     local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -rollback <app_name> [commit]")
     if not app_name then return end
 
@@ -1714,6 +1750,10 @@ local function rollback_app(apps_root, raw_name, target_commit)
     end
 
     local target = target_commit or "HEAD~1"
+    -- git reset --hard отбрасывает несохранённые изменения и коммиты после цели: снимок заранее не создаётся
+    if not utils.confirm_destructive(string.format("Откатить '%s' на %s (hard reset: несохранённые изменения будут потеряны)?", app_name, target), assume_yes, ctx) then
+        return
+    end
     ctx.log(string.format("Откат приложения '%s' на ревизию %s...", app_name, target))
     local reset_ok, reset_out = git.reset(app_dir, target, { hard = true })
     if not reset_ok then
@@ -1940,14 +1980,15 @@ local function print_help()
     %s-bundle, --bundle%s         Упаковать приложение в автономный переносимый бинарник в dist/
                               grime app -bundle <имя>
     %s-rollback, --rollback%s     Откатить репозиторий приложения на предыдущий коммит/снапшот
-                              grime app -rollback <имя> [commit]
+                              grime app -rollback <имя> [commit] [-y]
     %s-rm, --rm, -remove%s        Удалить приложение
-                              grime app -rm <имя>
+                              grime app -rm <имя> [-y]
     %s-help, --help, -h%s         Показать эту справку
 
 %sОПЦИОНАЛЬНЫЕ ФЛАГИ:%s
     %s-d, -detach, --detach%s     Запуск приложения в фоновом режиме (демонизация, лог в app.log)
     %s-f, -force, --force, -9%s   Принудительная остановка процесса (SIGKILL)
+    %s-y, -yes, --yes%s           Подтвердить необратимое действие (-rm, -rollback); без TTY обязателен
     %s-p, -path, --path%s         Возврат пути приложения в конвейер или для подстановки в cd
     %s-l, -lang, --lang <lang>%s  Явный выбор стека (python, java, rust, cpp, lua, bash, fish)
 
@@ -1963,6 +2004,7 @@ local function print_help()
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,
+    ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
     ANSI.CYAN, ANSI.RESET,
@@ -2317,7 +2359,7 @@ local run_or_create = run_existing_app
 local function main()
     reset_failed()
     local apps_root = get_apps_root()
-    local is_detach, force = false, false
+    local is_detach, force, assume_yes = false, false, false
     local wants_help = false
     local path_requested = false
     local explicit_lang = nil
@@ -2345,6 +2387,8 @@ local function main()
             path_requested = true
         elseif alow == "--force" or alow == "-force" or alow == "-f" or alow == "-9" then
             force = true
+        elseif alow == "--yes" or alow == "-yes" or alow == "-y" then
+            assume_yes = true
         elseif ACTION_MAP[alow] then
             -- Точное совпадение с действием со знаком минус (-new, -build, -compile, -install, -run, -diff, -ps, -rm, -test)
             explicit_subcmd = ACTION_MAP[alow]
@@ -2537,12 +2581,12 @@ local function main()
         return 0
     elseif subcmd == "rollback" then
         if not filtered[1] then fail_once("Укажите имя приложения: grime app -rollback <app_name> [commit]"); return 1 end
-        rollback_app(apps_root, filtered[1], filtered[2])
+        rollback_app(apps_root, filtered[1], filtered[2], assume_yes)
         return 0
     elseif subcmd == "rm" then
         local app_name = require_app_dir(apps_root, filtered[1], "Укажите имя приложения: grime app -rm <app_name>")
         if not app_name then return 1 end
-        rm_app(apps_root, app_name)
+        rm_app(apps_root, app_name, assume_yes)
         return 0
     elseif subcmd == "flake" then
         flake_app(apps_root, filtered[1])
@@ -2587,6 +2631,7 @@ return {
     resolve_app_name = resolve_app_name,
     load_manifest = load_manifest,
     check_artifact_status = check_artifact_status,
+    sources_newer_than = sources_newer_than,
     build_app = build_app,
     compile_or_install_app = compile_or_install_app,
     run_app = run_app,

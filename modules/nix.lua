@@ -437,9 +437,12 @@ local function handle_build(target_dir, extra_tokens)
     end
 end
 
-local function handle_gc()
+local function handle_gc(assume_yes)
     if HOME == "" or HOME:sub(1, 1) ~= "/" then
         ctx.fail("Отказ: переменная HOME не задана, очистка кэша небезопасна")
+        return
+    end
+    if not utils.confirm_destructive("Выполнить сборку мусора Nix (удалит старые поколения профилей) и очистить кэш flakes GRIME?", assume_yes, ctx) then
         return
     end
     ctx.log("Запуск комплексной очистки хранилища Nix и кэша GRIME (Garbage Collection)...")
@@ -558,17 +561,11 @@ local function handle_install(packages)
         return
     end
 
-    local cmd = { "nix", "profile", "install" }
-    for _, p in ipairs(packages) do
-        if not p:find("[:#/]") then
-            table.insert(cmd, "nixpkgs#" .. p)
-        else
-            table.insert(cmd, p)
-        end
-    end
+    -- `nix profile add` (install устарел); unfree: --impure + NIXPKGS_ALLOW_UNFREE
+    local cmd, env = utils.nix_profile_add_cmd(packages)
 
     ctx.log("Установка пакетов в профиль Nix: " .. table.concat(packages, ", ") .. "...")
-    local ret = ctx.run_process(cmd)
+    local ret = ctx.run_process(cmd, nil, env)
     if ret == 0 then
         ctx.log("Пакеты успешно установлены в профиль Nix.")
     else
@@ -784,13 +781,19 @@ local function handle_bundle(target_dir, args, out_link)
     end
 
     table.insert(cmd, installable)
+    -- Flake-ссылки (nixpkgs#X) считаются в чистом режиме: unfree требует --impure + env
+    local env = nil
+    if installable:find("#", 1, true) and not installable:find("^[%./]") then
+        for _, f in ipairs(utils.nix_unfree_flags()) do table.insert(cmd, f) end
+        env = utils.nix_unfree_env()
+    end
     if out_link and #out_link > 0 then
         table.insert(cmd, "-o")
         table.insert(cmd, out_link)
     end
 
     ctx.log(string.format("⚡ [Grime Nix Bundle] Упаковка '%s' в переносимый бинарник...", installable))
-    local ret = ctx.run_process(cmd, target_dir)
+    local ret = ctx.run_process(cmd, target_dir, env)
     if ret == 0 then
         local bundle_name = out_link or installable:match("([^#/]+)$") or "bundle"
         ui.success(string.format("Автономный переносимый бандл успешно собран: %s", bundle_name))
@@ -846,12 +849,12 @@ local function print_help()
                                 grime nix --bundle [цель] [-o вывод]
     %sdiff, -d, --diff%s            Анализ изменений замыканий профиля (diff-closures)
                                 grime nix --diff
-    %sinstall, -i, --install%s      Установить пакеты в профиль пользователя Nix
+    %sinstall, -i, --install%s      Установить пакеты в профиль Nix (nix profile add; unfree разрешены)
                                 grime nix --install <пакеты...>
     %suninstall, --uninstall%s      Удалить пакеты из профиля пользователя Nix
                                 grime nix --uninstall <пакеты...>
     %sgc, --gc, --clean%s           Очистить неиспользуемые пути в Nix store (garbage collector)
-                                grime nix --gc
+                                grime nix --gc [-y]   (в неинтерактивном режиме обязателен --yes)
     %soptimise, --optimise%s        Дедупликация жестких ссылок в Nix store
                                 grime nix --optimise
     %scheck, -c, --check%s          Проверить валидность конфигурации flake.nix
@@ -932,6 +935,7 @@ local function main()
             gpu = { "--gpu", "--gl", "-gpu", "-gl" },
             nv = { "--nv", "--prime", "--nvidia", "-nv", "-prime", "-nvidia" },
             help = { "-h", "--help", "-help" },
+            yes = { "-y", "--yes", "-yes" },
         },
         value_flags = {
             to = { "--to", "-to" },
@@ -982,7 +986,7 @@ local function main()
     elseif action == "rm" then
         handle_rm(target_dir, command_tokens)
     elseif action == "gc" then
-        handle_gc()
+        handle_gc(parsed.flags.yes)
     elseif action == "optimise" then
         handle_optimise()
     elseif action == "enter" then
@@ -1081,31 +1085,9 @@ local function wrap_pipeline(args, rest_argv)
     return utils.wrap_pipeline_run(rest_argv)
 end
 
---- Чистая сборка проекта: (code, stdout, stderr) без ctx.fail.
---- opts: { tokens = дополнительные токены сборки (пакеты либо команда) }
-local function build(dir, opts)
-    opts = opts or {}
-    local plan, err = plan_build(dir, opts.tokens)
-    if not plan then return 1, "", tostring(err) end
-    local res = ctx.capture(plan.cmd, plan.cwd)
-    return res.code, res.stdout or "", res.stderr or ""
-end
-
---- Чистый запуск команды в devShell проекта: (code, stdout, stderr) без ctx.fail.
---- opts: { pure = bool }
-local function run_in_env(dir, cmd_tokens, opts)
-    opts = opts or {}
-    local plan, err = plan_run(dir, cmd_tokens, opts.pure)
-    if not plan then return 1, "", tostring(err) end
-    local res = ctx.capture(plan.cmd, plan.cwd)
-    return res.code, res.stdout or "", res.stderr or ""
-end
-
 return {
     main = main,
     wrap_pipeline = wrap_pipeline,
     ephemeral_flake_dir = ephemeral_flake_dir,
     develop_command = develop_command,
-    build = build,
-    run_in_env = run_in_env,
 }

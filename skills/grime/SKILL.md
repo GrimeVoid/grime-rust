@@ -1,3 +1,8 @@
+---
+name: grime
+description: Работа с оркестратором Grime (project, app, pkg, nix, box, git, ai, doctor, конвейеры через ":"). Используй при сборке, запуске, управлении проектами, пакетами и контейнерами вместо голого shell.
+---
+
 # Grime Orchestration System: Skill Guide for AI Agents
 
 You are operating inside an execution system orchestrated by **Grime**, a modular command-line pipeline and project lifecycle manager (Rust core + Lua 5.4 modules). Grime handles infrastructure, build systems, tooling environments, and modular pipelines. The up-to-date help for every module is `grime <module> --help`.

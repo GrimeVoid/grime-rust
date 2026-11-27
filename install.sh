@@ -302,6 +302,19 @@ else
     log_warning "Каталог modules/ не найден в $SCRIPT_DIR!"
 fi
 
+# Навык (skill) Grime для Claude Code: ~/.claude/skills/grime
+if [[ -d "$SCRIPT_DIR/skills/grime" ]]; then
+    CLAUDE_SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+    mkdir -p "$CLAUDE_SKILLS_DIR"
+    safe_remove "$CLAUDE_SKILLS_DIR/grime"
+    if [[ "$USE_SYMLINK" == "true" ]]; then
+        ln -sfnT -- "$SCRIPT_DIR/skills/grime" "$CLAUDE_SKILLS_DIR/grime"
+    else
+        cp -aT -- "$SCRIPT_DIR/skills/grime" "$CLAUDE_SKILLS_DIR/grime"
+    fi
+    log_success "Навык Grime установлен: $CLAUDE_SKILLS_DIR/grime"
+fi
+
 # Развёртывание шаблонов
 if [[ -d "$SCRIPT_DIR/templates" ]]; then
     deploy_dir "$SCRIPT_DIR/templates" "$CONFIG_DIR/templates" "Шаблоны"

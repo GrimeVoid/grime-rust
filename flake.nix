@@ -28,6 +28,12 @@
 
           buildInputs = [ ];
 
+          # Навык агента (Claude Code skill) кладём рядом с бинарником
+          postInstall = ''
+            mkdir -p $out/share/grime/skills
+            cp -r ${./skills}/. $out/share/grime/skills/
+          '';
+
           # Прогон тестов при сборке
           doCheck = false; # Можно включить true при необходимости
 

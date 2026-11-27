@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -7,34 +8,29 @@ use crate::daemon::{
     get_socket_path, read_ipc_frame_async, write_ipc_frame_async, ClientMessage, DaemonResponse,
     IpcFrameError, MAX_IPC_PAYLOAD_SIZE,
 };
+use crate::config::GrimeConfig;
+use crate::modules::ModuleRegistry;
 use crate::orchestrator::Orchestrator;
-use crate::pipeline::{has_preamble_flag, parse_pipeline_args};
+use crate::pipeline::{has_preamble_flag, is_preamble_only, parse_pipeline_args};
+use crate::cancellation::PipelineCanceller;
+use crate::event_bus::EventBus;
+use crate::state_bus::StateBus;
 
-fn print_global_help(config: &crate::config::GrimeConfig) {
-    let modules = crate::pipeline::discover_available_modules(config);
+fn print_global_help(registry: &ModuleRegistry) {
+    let modules = registry.list();
     let mut mod_lines = String::new();
     if modules.is_empty() {
         mod_lines.push_str("          (модули не обнаружены в директориях поиска)\n");
     } else {
         for m in &modules {
-            let desc = match m.as_str() {
-                "project" => "Жизненный цикл проектов (C++, Rust, Python, Java)",
-                "pkg" => "Универсальный мета-менеджер пакетов (pacman, nix, flatpak...)",
-                "app" => "Изолированные легковесные приложения",
-                "box" => "Оркестрация Distrobox-контейнеров",
-                "nix" => "Воспроизводимые Nix-окружения и Flakes",
-                "ai" => "Универсальный ИИ-оркестратор агентов (Claude Code, Aider)",
-                "cmd" => "Выполнение системных команд и TUI-утилит",
-                "host" => "Модуль-рубеж возврата на хост-машину",
-                "list" => "Список всех доступных модулей (алиасы: ls, modules)",
-                "doctor" => "Диагностика окружения, путей и зависимостей Grime",
-                "bus" => "Шина разделяемого состояния (StateBus) и событий",
-                "daemon" => "Управление фоновым сервисом-демоном (grime daemon)",
-                "git" => "Полноценное управление Git-репозиториями и версионированием",
-                "log" => "Централизованный сбор, хранение и фильтрация логов",
-                _ => "Модуль расширения Grime",
+            let desc = if m.description.is_empty() {
+                "Модуль расширения Grime".to_string()
+            } else if m.aliases.is_empty() {
+                m.description.clone()
+            } else {
+                format!("{} (алиасы: {})", m.description, m.aliases.join(", "))
             };
-            mod_lines.push_str(&format!("          \x1b[32m{:<20}\x1b[0m {}\n", m, desc));
+            mod_lines.push_str(&format!("          \x1b[32m{:<20}\x1b[0m {}\n", m.name, desc));
         }
     }
 
@@ -123,18 +119,30 @@ pub async fn connect_or_spawn_daemon() -> Result<UnixStream, std::io::Error> {
 }
 
 pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, config_path: Option<&Path>) -> i32 {
-    let parsed = parse_pipeline_args(raw_args);
+    // Быстрый путь `--version`: ни конфиг, ни реестр модулей не нужны
+    if is_preamble_only(raw_args) && has_preamble_flag(raw_args, &["--version", "-v"]) {
+        println!("grime {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+
+    // Конфиг и реестр модулей создаются один раз и передаются всем компонентам
+    let config = Arc::new(GrimeConfig::load_or_default(config_path));
+    let registry = Arc::new(ModuleRegistry::for_config(&config, modules_dir));
+
+    // Только преамбула (`--help`, пусто, `-f`): шагов нет, разбор конвейера не нужен
+    if is_preamble_only(raw_args) {
+        print_global_help(&registry);
+        return 0;
+    }
+    let parsed = parse_pipeline_args(raw_args, &registry);
 
     if has_preamble_flag(raw_args, &["--version", "-v"]) && parsed.steps.is_empty() {
         println!("grime {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
 
-    if (has_preamble_flag(raw_args, &["--help", "-h"]) && parsed.steps.is_empty())
-        || parsed.steps.is_empty()
-    {
-        let config = crate::config::GrimeConfig::load_or_default(config_path);
-        print_global_help(&config);
+    if parsed.steps.is_empty() {
+        print_global_help(&registry);
         return 0;
     }
 
@@ -201,7 +209,13 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
     // Интерактивные TUI-приложения (Neovim, fzf, диалоговые ИИ-агенты Claude Code/Aider) и стандартный конвейер
     // исполняются локально в процессе CLI-клиента с прямым доступом к нативным потокам (stdin/stdout/stderr)
     // и сигналам терминала.
-    let orchestrator = match Orchestrator::new(modules_dir, config_path) {
+    let orchestrator = match Orchestrator::new_with_shared(
+        config,
+        registry,
+        Arc::new(StateBus::new()),
+        Arc::new(EventBus::default()),
+        PipelineCanceller::new(),
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("[Grime] Ошибка инициализации оркестратора: {}", e);
@@ -211,16 +225,23 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
 
     let _ctrl_c = crate::cancellation::spawn_ctrl_c_watcher(orchestrator.canceller().clone());
 
-    match orchestrator.run_pipeline(&parsed) {
-        Ok(Some(result)) => {
+    // Клиентский runtime — current_thread: синхронный конвейер выносим в blocking-пул,
+    // чтобы единственный поток runtime оставался свободным для обработки Ctrl+C.
+    let outcome = tokio::task::spawn_blocking(move || orchestrator.run_pipeline(&parsed)).await;
+    match outcome {
+        Ok(Ok(Some(result))) => {
             if !result.is_empty() {
                 println!("{}", result);
             }
             0
         }
-        Ok(None) => 0,
-        Err(_err) => {
+        Ok(Ok(None)) => 0,
+        Ok(Err(_err)) => {
             // Сообщение об ошибке уже выведено ядром (Orchestrator) в едином формате [Grime Error]
+            1
+        }
+        Err(e) => {
+            eprintln!("[Grime] Внутренняя ошибка выполнения конвейера: {}", e);
             1
         }
     }

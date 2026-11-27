@@ -5,23 +5,29 @@
 
 pub mod api_args;
 pub mod api_bus;
+pub mod api_ephemeral;
 pub mod api_fs;
 pub mod api_fuzzy;
+pub mod api_modules;
 pub mod api_process;
 pub mod api_str_table;
 pub mod api_ui;
+pub mod bytecode;
 pub mod context;
 pub mod prelude;
 
 use colored::Colorize;
-use mlua::{Lua, MultiValue, Value};
+use mlua::{Function, Lua, MultiValue, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::cancellation::{attach_lua_cancellation_hook, PipelineCanceller};
 use crate::config::GrimeConfig;
 use crate::event_bus::{dispatch_event_to_lua, EventBus};
+use crate::modules::{ModuleMeta, ModuleRegistry, PathResolver};
 use crate::payload::{extract_payload, PipelinePayload};
 use crate::pipeline::PipelineStep;
 use crate::state_bus::StateBus;
@@ -44,17 +50,48 @@ pub struct StepExecutionResult {
     pub changed_target_dir: Option<PathBuf>,
 }
 
+impl StepExecutionResult {
+    /// Результат неуспешного шага с кодом возврата и сообщением об ошибке.
+    pub fn failed(code: i32, msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            status: StepStatus::Failed(code),
+            return_value: None,
+            payload: None,
+            error_message: Some(msg.into()),
+            changed_target_dir: None,
+        }
+    }
+}
+
+/// Итог вызова хука `wrap_pipeline` модуля.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WrapOutcome {
+    /// Шаг не переключает среду: выполняется как обычно.
+    None,
+    /// Уже в нужной среде: шаг пропускается.
+    Skip,
+    /// Выполнить этот же модуль с подставленными аргументами (подконвейер поглощается).
+    Args(Vec<String>),
+}
+
+/// Скомпилированный чанк модуля с отметкой времени файла.
+type ChunkCache = Mutex<HashMap<PathBuf, (Option<SystemTime>, Function)>>;
+
 /// Основной исполнительный движок Lua Grime.
 pub struct GrimeLuaEngine {
     lua: Lua,
-    modules_dir: PathBuf,
     config: Arc<GrimeConfig>,
+    registry: Arc<ModuleRegistry>,
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
     canceller: PipelineCanceller,
+    session_id: String,
+    ephemeral: Arc<crate::ephemeral::EphemeralSession>,
+    chunk_cache: ChunkCache,
 }
 
-pub const MAX_RECURSION_DEPTH: usize = 64;
+pub use crate::state_bus::MAX_RECURSION_DEPTH;
 
 /// Преобразует значение mlua::Value в бинарное представление rmpv::Value с защитой от бесконечной рекурсии.
 pub fn lua_value_to_rmpv(val: &mlua::Value) -> Result<rmpv::Value, mlua::Error> {
@@ -210,40 +247,58 @@ fn extract_os_exit_code(err: &mlua::Error) -> Option<i32> {
 }
 
 impl GrimeLuaEngine {
-    /// Создает новый экземпляр движка с дефолтными шинами.
+    /// Создает новый экземпляр движка с дефолтными шинами (конфиг и реестр строятся один раз).
     pub fn new(modules_dir: Option<PathBuf>, custom_config: Option<&Path>) -> Result<Self, mlua::Error> {
-        let state_bus = Arc::new(StateBus::new());
-        let event_bus = Arc::new(EventBus::default());
-        let canceller = PipelineCanceller::new();
-        Self::new_with_bus(modules_dir, custom_config, state_bus, event_bus, canceller)
+        let config = Arc::new(GrimeConfig::load_or_default(custom_config));
+        let registry = Arc::new(ModuleRegistry::for_config(&config, modules_dir));
+        Self::from_parts(
+            config,
+            registry,
+            Arc::new(StateBus::new()),
+            Arc::new(EventBus::default()),
+            PipelineCanceller::new(),
+            "session_default".to_string(),
+        )
     }
 
-    /// Создает новый экземпляр движка с заданными шинами и контроллером прерывания.
-    pub fn new_with_bus(
-        modules_dir: Option<PathBuf>,
-        custom_config: Option<&Path>,
+    /// Создает движок из общих компонентов (единый `Arc<GrimeConfig>` и реестр модулей).
+    pub fn from_parts(
+        config: Arc<GrimeConfig>,
+        registry: Arc<ModuleRegistry>,
         state_bus: Arc<StateBus>,
         event_bus: Arc<EventBus>,
         canceller: PipelineCanceller,
+        session_id: String,
     ) -> Result<Self, mlua::Error> {
-        if modules_dir.is_some() {
-            crate::pipeline::invalidate_modules_cache();
-        }
-        let lua = Lua::new();
-        let config = Arc::new(GrimeConfig::load_or_default(custom_config));
-        let resolved_modules = config.resolve_modules_dir(modules_dir);
-
+        let ephemeral = Arc::new(crate::ephemeral::EphemeralSession::new(&session_id));
         let engine = Self {
-            lua,
-            modules_dir: resolved_modules,
+            lua: Lua::new(),
+            ephemeral,
             config,
+            registry,
             state_bus,
             event_bus,
             canceller,
+            session_id,
+            chunk_cache: Mutex::new(HashMap::new()),
         };
-
         engine.init_runtime()?;
         Ok(engine)
+    }
+
+    /// Эфемерные ресурсы сессии (каталоги/файлы, удаляемые в конце конвейера).
+    pub fn ephemeral(&self) -> &Arc<crate::ephemeral::EphemeralSession> {
+        &self.ephemeral
+    }
+
+    /// Идентификатор сессии (метка событий этого движка в общей шине).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Реестр модулей.
+    pub fn registry(&self) -> &Arc<ModuleRegistry> {
+        &self.registry
     }
 
     /// Выполняет инкрементальный шаг сборщика мусора Lua для поддержания минимального footprint памяти.
@@ -275,15 +330,20 @@ impl GrimeLuaEngine {
     fn init_runtime(&self) -> Result<(), mlua::Error> {
         let lua = &self.lua;
 
-        // 1. Безопасная настройка package.path через mlua::Table
-        let modules_str = self.modules_dir.to_string_lossy();
+        // 1. Безопасная настройка package.path: все каталоги модулей в порядке приоритета
         let package_tbl: mlua::Table = lua.globals().get("package")?;
         let current_pkg_path: String = package_tbl.get("path").unwrap_or_default();
-        let updated_pkg_path = format!(
-            "{0}/?.lua;{0}/?/init.lua;{0}/languages/?.lua;{1}",
-            modules_str, current_pkg_path
-        );
-        package_tbl.set("path", updated_pkg_path)?;
+        let mut path_parts: Vec<String> = self
+            .registry
+            .dirs()
+            .iter()
+            .map(|d| {
+                let d = d.to_string_lossy();
+                format!("{0}/?.lua;{0}/?/init.lua;{0}/languages/?.lua", d)
+            })
+            .collect();
+        path_parts.push(current_pkg_path);
+        package_tbl.set("path", path_parts.join(";"))?;
 
         // Инициализация изолированного реестра функций cleanup по именам модулей
         lua.set_named_registry_value("_grime_module_cleanups", lua.create_table()?)?;
@@ -350,10 +410,11 @@ impl GrimeLuaEngine {
         // 4. Регистрация API файловой системы (grime.fs)
         api_fs::register_fs_api(lua, &grime_tbl)?;
 
-        // 5. Регистрация API конфигурации и единого реестра путей (grime.config, grime.paths)
-        let cfg = self.config.clone();
+        // 5. Регистрация API конфигурации и единого реестра путей (grime.config, grime.paths):
+        //    значения берутся из конфига, затем из аннотаций path.* модулей
+        let resolver = PathResolver::new(self.config.clone(), self.registry.clone());
         let cfg_tbl = lua.create_table()?;
-        let cfg_for_get = cfg.clone();
+        let cfg_for_get = self.config.clone();
         cfg_tbl.set(
             "get",
             lua.create_function(move |_, (key, default): (String, Option<String>)| {
@@ -361,54 +422,28 @@ impl GrimeLuaEngine {
             })?,
         )?;
 
-        let cfg_dir = cfg.clone();
+        let cfg_dir = self.config.clone();
         cfg_tbl.set(
             "config_dir",
-            lua.create_function(move |_, ()| {
-                Ok(cfg_dir.config_dir().to_string_lossy().to_string())
-            })?,
+            lua.create_function(move |_, ()| Ok(cfg_dir.config_dir().to_string_lossy().to_string()))?,
         )?;
 
-        let cfg_for_all = cfg.clone();
+        let resolver_all = resolver.clone();
         cfg_tbl.set(
             "get_all",
             lua.create_function(move |lua, ()| {
                 let tbl = lua.create_table()?;
-                for (k, v) in &cfg_for_all.paths {
-                    tbl.set(k.as_str(), v.as_str())?;
+                for (k, v) in resolver_all.all() {
+                    tbl.set(k, v)?;
                 }
                 Ok(tbl)
-            })?,
-        )?;
-
-        let cfg_proj = cfg.clone();
-        cfg_tbl.set(
-            "projects_root",
-            lua.create_function(move |_, ()| {
-                Ok(cfg_proj.projects_root().to_string_lossy().to_string())
-            })?,
-        )?;
-
-        let cfg_tpl = cfg.clone();
-        cfg_tbl.set(
-            "templates_root",
-            lua.create_function(move |_, ()| {
-                Ok(cfg_tpl.templates_root().to_string_lossy().to_string())
-            })?,
-        )?;
-
-        let cfg_apps = cfg.clone();
-        cfg_tbl.set(
-            "apps_root",
-            lua.create_function(move |_, ()| {
-                Ok(cfg_apps.apps_root().to_string_lossy().to_string())
             })?,
         )?;
         grime_tbl.set("config", cfg_tbl)?;
 
         let paths_tbl = lua.create_table()?;
-        for (k, v) in &self.config.paths {
-            paths_tbl.set(k.as_str(), v.as_str())?;
+        for (k, v) in resolver.all() {
+            paths_tbl.set(k, v)?;
         }
         grime_tbl.set("paths", paths_tbl)?;
 
@@ -484,8 +519,18 @@ impl GrimeLuaEngine {
         // 10.1. Регистрация парсера аргументов (grime.args)
         api_args::register_args_api(lua, &grime_tbl)?;
 
+        // 10.2. Регистрация реестра модулей (grime.modules)
+        api_modules::register_modules_api(lua, &grime_tbl, self.registry.clone())?;
+        api_ephemeral::register_ephemeral_api(lua, &grime_tbl, self.ephemeral.clone())?;
+
         // 11. Инициализация контекста конвейера (grime.ctx и _G.ctx)
-        context::init_context_table(lua, &grime_tbl, &self.config)?;
+        context::init_context_table(
+            lua,
+            &grime_tbl,
+            self.config.clone(),
+            resolver,
+            self.canceller.clone(),
+        )?;
 
         lua.globals().set("grime", grime_tbl)?;
 
@@ -493,7 +538,13 @@ impl GrimeLuaEngine {
         prelude::register_prelude(lua)?;
 
         // 13. Регистрация шин (grime.bus и grime.events)
-        api_bus::register_bus_api(lua, &lua.globals().get::<mlua::Table>("grime")?, self.state_bus.clone(), self.event_bus.clone())?;
+        api_bus::register_bus_api(
+            lua,
+            &lua.globals().get::<mlua::Table>("grime")?,
+            self.state_bus.clone(),
+            self.event_bus.clone(),
+            self.session_id.clone(),
+        )?;
 
         // 14. Установка хука безопасного прерывания (Cancellation Hook)
         attach_lua_cancellation_hook(lua, self.canceller.clone());
@@ -515,7 +566,6 @@ impl GrimeLuaEngine {
     ) -> Result<(), mlua::Error> {
         context::update_step_context(
             &self.lua,
-            &self.config,
             step,
             step_index,
             total_steps,
@@ -531,6 +581,157 @@ impl GrimeLuaEngine {
         context::set_environment(&self.lua, env)
     }
 
+    /// Находит метаданные модуля: точное имя/алиас, затем нечёткое совпадение.
+    fn locate_module(&self, module_name: &str) -> Result<ModuleMeta, String> {
+        if let Some(meta) = self.registry.get(module_name) {
+            return Ok(meta);
+        }
+        // Редкий путь: возможно, файл модуля появился после построения снимка реестра
+        if self.registry.refresh_if_changed() {
+            if let Some(meta) = self.registry.get(module_name) {
+                return Ok(meta);
+            }
+        }
+        if let Some(meta) = self
+            .registry
+            .resolve(module_name)
+            .and_then(|canon| self.registry.get(&canon))
+        {
+            eprintln!(
+                "{} Модуль '{}' не найден, запущен похожий модуль '{}'",
+                "[Grime]".cyan().bold(),
+                module_name,
+                meta.name
+            );
+            return Ok(meta);
+        }
+        Err(format!(
+            "Модуль '{}.lua' не найден в {:?}",
+            module_name,
+            self.registry.dirs()
+        ))
+    }
+
+    /// Компилирует чанк модуля. Результат кэшируется в памяти по `(путь, mtime файла)`,
+    /// а для стандартных каталогов (с дисковым индексом) — и как байткод на диске
+    /// (`bytecode`), что избавляет от разбора исходника при следующих запусках.
+    fn load_chunk(&self, meta: &ModuleMeta) -> Result<Function, mlua::Error> {
+        let file_md = fs::metadata(&meta.path).ok();
+        let file_mtime = file_md.as_ref().and_then(|m| m.modified().ok());
+        if let Ok(cache) = self.chunk_cache.lock() {
+            if let Some((cached_mtime, func)) = cache.get(&meta.path) {
+                if file_mtime.is_some() && *cached_mtime == file_mtime {
+                    return Ok(func.clone());
+                }
+            }
+        }
+        let fingerprint = file_md
+            .as_ref()
+            .filter(|_| self.registry.uses_disk_cache())
+            .map(|m| (crate::cache::mtime_ns(m), m.len()));
+
+        let from_disk = fingerprint.and_then(|(mtime_ns, size)| {
+            let bc = bytecode::load(&meta.path, mtime_ns, size)?;
+            // Порча/несовпадение формата — тихая перекомпиляция из исходника
+            self.lua.load(&bc[..]).set_mode(mlua::ChunkMode::Binary).into_function().ok()
+        });
+
+        let func = match from_disk {
+            Some(f) => f,
+            None => {
+                let content = fs::read_to_string(&meta.path).map_err(|e| {
+                    mlua::Error::runtime(format!("Ошибка чтения модуля '{}': {}", meta.path.display(), e))
+                })?;
+                let f = self
+                    .lua
+                    .load(&content)
+                    .set_name(format!("@{}", meta.path.display()))
+                    .into_function()?;
+                if let Some((mtime_ns, size)) = fingerprint {
+                    bytecode::store(&meta.path, mtime_ns, size, &f.dump(false));
+                }
+                f
+            }
+        };
+        if let Ok(mut cache) = self.chunk_cache.lock() {
+            cache.insert(meta.path.clone(), (file_mtime, func.clone()));
+        }
+        Ok(func)
+    }
+
+    /// Сбрасывает `_G.main` и `_G.cleanup` (модули в старом стиле объявляют их глобально).
+    fn clear_module_globals(&self) {
+        let globals = self.lua.globals();
+        let _ = globals.set("main", Value::Nil);
+        let _ = globals.set("cleanup", Value::Nil);
+    }
+
+    /// Запоминает `cleanup()` модуля (глобальный либо из возвращённой таблицы) под указанными именами.
+    /// Вызывается и после загрузки чанка, и после `main()`; уже найденный cleanup не затирается.
+    fn register_cleanup(&self, names: &[&str], returned: Option<&Value>) {
+        let globals = self.lua.globals();
+        let found = globals.get::<Function>("cleanup").ok().or_else(|| match returned {
+            Some(Value::Table(tbl)) => tbl.get::<Function>("cleanup").ok(),
+            _ => None,
+        });
+        let _ = globals.set("cleanup", Value::Nil);
+        let Some(cfn) = found else {
+            return;
+        };
+        if let Ok(cleanups) = self.lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
+            for name in names {
+                let _ = cleanups.set(*name, cfn.clone());
+            }
+        }
+    }
+
+    /// Вызывает хук `wrap_pipeline(args, rest_argv)` модуля с аннотацией `wraps: pipeline`.
+    /// Перед вызовом оркестратор должен установить контекст шага (`set_step_context`).
+    pub fn call_wrap_hook(
+        &self,
+        module_name: &str,
+        args: &[String],
+        rest_argv: &[String],
+    ) -> Result<WrapOutcome, mlua::Error> {
+        let Some(meta) = self.registry.get(module_name) else {
+            return Ok(WrapOutcome::None);
+        };
+        self.clear_module_globals();
+        let chunk = self.load_chunk(&meta)?;
+        let returned: Value = chunk.call(MultiValue::new())?;
+        let hook = match &returned {
+            Value::Table(tbl) => tbl.get::<Function>("wrap_pipeline").ok(),
+            _ => None,
+        }
+        .or_else(|| self.lua.globals().get::<Function>("wrap_pipeline").ok());
+        // Модули в старом стиле могли объявить main/cleanup глобально — не даём им утечь
+        self.clear_module_globals();
+
+        let Some(hook) = hook else {
+            return Ok(WrapOutcome::None);
+        };
+        let to_table = |items: &[String]| -> mlua::Result<mlua::Table> {
+            let t = self.lua.create_table_with_capacity(items.len(), 0)?;
+            for (i, it) in items.iter().enumerate() {
+                t.set(i + 1, it.as_str())?;
+            }
+            Ok(t)
+        };
+        let res: Value = hook.call((to_table(args)?, to_table(rest_argv)?))?;
+        Ok(match res {
+            Value::Table(tbl) => {
+                if matches!(tbl.get::<Value>("skip"), Ok(Value::Boolean(true))) {
+                    WrapOutcome::Skip
+                } else if let Ok(new_args) = tbl.get::<mlua::Table>("args") {
+                    WrapOutcome::Args(new_args.sequence_values::<String>().flatten().collect())
+                } else {
+                    WrapOutcome::None
+                }
+            }
+            _ => WrapOutcome::None,
+        })
+    }
+
     /// Выполняет модуль по имени (с поиском, fuzzy match, вызовом main и обработкой возвращаемых значений).
     pub fn execute_module(&self, module_name: &str) -> Result<StepExecutionResult, mlua::Error> {
         // Проверка отмены перед запуском модуля
@@ -539,76 +740,31 @@ impl GrimeLuaEngine {
                 .canceller
                 .get_reason()
                 .unwrap_or_else(|| "Выполнение конвейера отменено".to_string());
-            return Ok(StepExecutionResult {
-                success: false,
-                status: StepStatus::Failed(130),
-                return_value: None,
-                payload: None,
-                error_message: Some(format!("Конвейер отменен: {}", reason)),
-                changed_target_dir: None,
-            });
+            return Ok(StepExecutionResult::failed(130, format!("Конвейер отменен: {}", reason)));
         }
 
         let lua = &self.lua;
         let globals = lua.globals();
 
         // Принудительная очистка _G.main и _G.cleanup перед выполнением каждого модуля
-        let _ = globals.set("main", Value::Nil);
-        let _ = globals.set("cleanup", Value::Nil);
+        self.clear_module_globals();
         if let Ok(cleanups) = lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
             let _ = cleanups.set(module_name, Value::Nil);
         }
 
-        let mut target_mod_name = module_name.to_string();
-        let mut mod_file = self.modules_dir.join(format!("{}.lua", target_mod_name));
-        if !mod_file.exists() {
-            let mut available: Vec<String> = Vec::new();
-            if let Ok(entries) = fs::read_dir(&self.modules_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lua") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            available.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-
-            let cand_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
-            if let Some(matched) = crate::args::fuzzy_match_entity(module_name, &cand_refs, 0.75) {
-                eprintln!(
-                    "{} Модуль '{}' не найден, запущен похожий модуль '{}'",
-                    "[Grime]".cyan().bold(),
-                    module_name,
-                    matched
-                );
-                target_mod_name = matched.to_string();
-                mod_file = self.modules_dir.join(format!("{}.lua", target_mod_name));
-            } else {
-                return Ok(StepExecutionResult {
-                    success: false,
-                    status: StepStatus::Failed(1),
-                    return_value: None,
-                    payload: None,
-                    error_message: Some(format!(
-                        "Модуль '{}.lua' не найден в {:?}",
-                        module_name, self.modules_dir
-                    )),
-                    changed_target_dir: None,
-                });
+        let meta = match self.locate_module(module_name) {
+            Ok(m) => m,
+            Err(msg) => return Ok(StepExecutionResult::failed(1, msg)),
+        };
+        let cleanup_names = [module_name, meta.name.as_str()];
+        if let Ok(cleanups) = lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
+            for name in cleanup_names {
+                let _ = cleanups.set(name, Value::Nil);
             }
         }
 
-        let content = fs::read_to_string(&mod_file).map_err(|e| {
-            mlua::Error::runtime(format!(
-                "Ошибка чтения модуля '{}': {}",
-                mod_file.display(),
-                e
-            ))
-        })?;
-
-        // Запуск скрипта
-        let chunk = lua.load(&content).set_name(format!("@{}", mod_file.display()));
+        // Запуск скрипта (скомпилированный чанк берётся из кэша)
+        let chunk = self.load_chunk(&meta)?;
         let chunk_res: Result<Value, mlua::Error> = chunk.call(MultiValue::new());
 
         let mut direct_return_value: Option<Value> = None;
@@ -624,58 +780,32 @@ impl GrimeLuaEngine {
                 if let Some(code) = extract_os_exit_code(&e) {
                     os_exit_code = Some(code);
                 } else {
-                    return Ok(StepExecutionResult {
-                        success: false,
-                        status: StepStatus::Failed(1),
-                        return_value: None,
-                        payload: None,
-                        error_message: Some(format!("Ошибка исполнения модуля '{}': {}", module_name, e)),
-                        changed_target_dir: None,
-                    });
+                    return Ok(StepExecutionResult::failed(
+                        1,
+                        format!("Ошибка исполнения модуля '{}': {}", module_name, e),
+                    ));
                 }
             }
         }
 
-        // Сохраняем cleanup модуля в реестр по имени модуля сразу после загрузки чанка и очищаем _G.cleanup
-        let cleanup_fn_opt = globals
-            .get::<mlua::Function>("cleanup")
-            .ok()
-            .or_else(|| {
-                if let Some(Value::Table(ref tbl)) = direct_return_value {
-                    tbl.get::<mlua::Function>("cleanup").ok()
-                } else {
-                    None
-                }
-            });
-        let _ = globals.set("cleanup", Value::Nil);
-        if let Ok(cleanups) = lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
-            if let Some(cfn) = cleanup_fn_opt {
-                let _ = cleanups.set(module_name, cfn.clone());
-                let _ = cleanups.set(target_mod_name.as_str(), cfn);
-            } else {
-                let _ = cleanups.set(module_name, Value::Nil);
-                let _ = cleanups.set(target_mod_name.as_str(), Value::Nil);
-            }
-        }
+        // Сохраняем cleanup модуля в реестр по имени модуля сразу после загрузки чанка
+        self.register_cleanup(&cleanup_names, direct_return_value.as_ref());
 
         // Если модуль экспортирует функцию main() (в globals или в возвращенной таблице) и не вышел на этапе чанка, вызываем её
-        let main_fn_opt = globals
-            .get::<mlua::Function>("main")
-            .ok()
-            .or_else(|| {
-                if let Some(Value::Table(ref tbl)) = direct_return_value {
-                    tbl.get::<mlua::Function>("main").ok()
-                } else {
-                    None
-                }
-            });
+        let main_fn_opt = globals.get::<Function>("main").ok().or_else(|| {
+            match direct_return_value {
+                Some(Value::Table(ref tbl)) => tbl.get::<Function>("main").ok(),
+                _ => None,
+            }
+        });
         let _ = globals.set("main", Value::Nil);
 
         if os_exit_code.is_none() {
             if let Some(main_fn) = main_fn_opt {
                 let res: Result<Value, mlua::Error> = main_fn.call(());
+                // cleanup, объявленный внутри main(), тоже регистрируем (раньше он терялся)
+                self.register_cleanup(&cleanup_names, direct_return_value.as_ref());
                 let _ = globals.set("main", Value::Nil);
-                let _ = globals.set("cleanup", Value::Nil);
                 match res {
                     Ok(v) => {
                         direct_return_value = if v != Value::Nil { Some(v) } else { None };
@@ -684,14 +814,10 @@ impl GrimeLuaEngine {
                         if let Some(code) = extract_os_exit_code(&e) {
                             os_exit_code = Some(code);
                         } else {
-                            return Ok(StepExecutionResult {
-                                success: false,
-                                status: StepStatus::Failed(1),
-                                return_value: None,
-                                payload: None,
-                                error_message: Some(format!("Ошибка в main() модуля '{}': {}", module_name, e)),
-                                changed_target_dir: None,
-                            });
+                            return Ok(StepExecutionResult::failed(
+                                1,
+                                format!("Ошибка в main() модуля '{}': {}", module_name, e),
+                            ));
                         }
                     }
                 }
@@ -824,8 +950,8 @@ impl GrimeLuaEngine {
         })
     }
 
-    /// Вызов функции cleanup() для указанного модуля при прерывании или ошибке.
-    pub fn call_cleanup(&self, module_name: &str) {
+    /// Вызов функции cleanup() для указанного модуля; `verbose` печатает сообщение (только при отмене/ошибке).
+    pub fn call_cleanup(&self, module_name: &str, verbose: bool) {
         let mut cleanup_fn_opt: Option<mlua::Function> = None;
 
         if let Ok(cleanups) = self.lua.named_registry_value::<mlua::Table>("_grime_module_cleanups") {
@@ -836,11 +962,13 @@ impl GrimeLuaEngine {
         }
 
         if let Some(cleanup_fn) = cleanup_fn_opt {
-            eprintln!(
-                "{} Вызов cleanup() для модуля '{}'...",
-                "[Grime]".cyan().bold(),
-                module_name
-            );
+            if verbose {
+                eprintln!(
+                    "{} Вызов cleanup() для модуля '{}'...",
+                    "[Grime]".cyan().bold(),
+                    module_name
+                );
+            }
             self.canceller.set_cleaning_up(true);
             let _ = cleanup_fn.call::<()>(());
             self.canceller.set_cleaning_up(false);
@@ -849,7 +977,7 @@ impl GrimeLuaEngine {
 
     /// Публикация события в EventBus и отправка в Lua.
     pub fn emit_event(&self, name: &str, payload: serde_json::Value) {
-        self.event_bus.emit(name, payload.clone());
+        self.event_bus.emit_for_session(&self.session_id, name, payload.clone());
         let _ = dispatch_event_to_lua(&self.lua, name, &payload);
     }
 }
@@ -977,31 +1105,143 @@ mod tests {
         assert!(!dir.is_empty());
     }
 
+    fn tmp_modules(tag: &str) -> crate::test_support::TempDir {
+        crate::test_support::TempDir::new(&format!("lua_{}", tag))
+    }
+
     #[test]
     fn test_lua_paths_registry() {
-        let engine = GrimeLuaEngine::new(None, None).expect("Инициализация lua engine");
+        let dir = tmp_modules("paths");
+        fs::write(
+            dir.join("pathmod.lua"),
+            "--@grime path.projects: /ann/projects\n--@grime path.apps: /ann/apps\nreturn {}\n",
+        )
+        .unwrap();
+        let conf = dir.join("gproj.conf");
+        fs::write(&conf, "apps = /cfg/apps\n").unwrap();
+        let engine = GrimeLuaEngine::new(Some(dir.to_path_buf()), Some(&conf)).expect("Инициализация lua engine");
         let lua = &engine.lua;
 
         let script = r#"
-            assert(grime.paths ~= nil, "grime.paths should exist")
             assert(grime.paths.config ~= nil, "grime.paths.config should exist")
-            assert(grime.paths.projects ~= nil, "grime.paths.projects should exist")
-            assert(grime.paths.templates ~= nil, "grime.paths.templates should exist")
-            assert(grime.paths.apps ~= nil, "grime.paths.apps should exist")
-
-            assert(grime.ctx.paths ~= nil, "grime.ctx.paths should exist")
-            assert(grime.ctx.paths.apps == grime.paths.apps)
+            -- конфиг имеет приоритет над аннотацией, аннотация — над fallback
+            assert(grime.paths.apps == "/cfg/apps")
+            assert(grime.paths.projects == "/ann/projects")
+            assert(ctx.get_path("apps") == "/cfg/apps")
+            assert(ctx.get_path("projects", "fb") == "/ann/projects")
+            assert(ctx.get_path("templates", "fb") == "fb")
             assert(grime.ctx.paths.projects == grime.paths.projects)
-            assert(grime.ctx.paths.templates == grime.paths.templates)
-
             local all = grime.config.get_all()
-            assert(all.apps == grime.paths.apps)
-
+            assert(all.apps == grime.paths.apps and all.projects == grime.paths.projects)
+            assert(#ctx.config_dir() > 0)
             return grime.paths.apps
         "#;
 
         let apps_path: String = lua.load(script).eval().expect("paths registry eval");
-        assert!(!apps_path.is_empty());
+        assert_eq!(apps_path, "/cfg/apps");
+    }
+
+    #[test]
+    fn test_lua_modules_api() {
+        let dir = tmp_modules("modapi");
+        fs::write(dir.join("alpha.lua"), "--@grime description: Альфа\n--@grime alias: a1, a2\n--@grime boundary: true\nreturn {}\n").unwrap();
+        fs::write(dir.join("beta.lua"), "--@grime wraps: pipeline\n--@grime chain: passthrough\nreturn {}\n").unwrap();
+        let engine = GrimeLuaEngine::new(Some(dir.to_path_buf()), None).unwrap();
+        let ok: bool = engine
+            .lua
+            .load(
+                r#"
+                local list = grime.modules.list()
+                assert(#list == 2 and list[1].name == "alpha" and list[2].name == "beta")
+                assert(list[1].description == "Альфа" and list[1].boundary == true)
+                assert(#list[1].aliases == 2 and list[1].aliases[1] == "a1")
+                assert(list[2].wraps == "pipeline" and list[2].chain == "passthrough")
+                assert(grime.modules.get("a2").name == "alpha")
+                assert(grime.modules.get("nope") == nil)
+                assert(grime.modules.resolve("A1") == "alpha")
+                assert(grime.modules.resolve("alpa") == "alpha")
+                assert(grime.modules.resolve("zzzzzz") == nil)
+                return true
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_wrap_hook_outcomes_and_cleanup_after_main() {
+        let dir = tmp_modules("hook");
+        fs::write(
+            dir.join("wrapper.lua"),
+            r#"--@grime wraps: pipeline
+local M = {}
+function M.wrap_pipeline(args, rest)
+    if args[1] == "skip" then return { skip = true } end
+    if args[1] == "none" then return nil end
+    return { args = { "-run", "--", table.unpack(rest) } }
+end
+return M
+"#,
+        )
+        .unwrap();
+        // cleanup объявляется внутри main() — раньше он терялся
+        fs::write(
+            dir.join("late_cleanup.lua"),
+            "function main()
+  function cleanup() grime.bus.set('pipeline.late_cleaned', true) end
+  grime.ctx.success('x')
+end
+",
+        )
+        .unwrap();
+        let engine = GrimeLuaEngine::new(Some(dir.to_path_buf()), None).unwrap();
+        let rest: Vec<String> = ["grime", "-p", "/w", "cmd", "ls"].iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(engine.call_wrap_hook("wrapper", &["skip".into()], &rest).unwrap(), WrapOutcome::Skip);
+        assert_eq!(engine.call_wrap_hook("wrapper", &["none".into()], &rest).unwrap(), WrapOutcome::None);
+        match engine.call_wrap_hook("wrapper", &["x".into()], &rest).unwrap() {
+            WrapOutcome::Args(a) => assert_eq!(a, vec!["-run", "--", "grime", "-p", "/w", "cmd", "ls"]),
+            other => panic!("ожидались args, получено {:?}", other),
+        }
+        assert_eq!(engine.call_wrap_hook("missing", &[], &rest).unwrap(), WrapOutcome::None);
+
+        // Повторный запуск берёт скомпилированный чанк из кэша
+        let _ = engine.execute_module("late_cleanup").unwrap();
+        let _ = engine.execute_module("late_cleanup").unwrap();
+        assert_eq!(engine.chunk_cache.lock().unwrap().len(), 2);
+        engine.call_cleanup("late_cleanup", false);
+        assert_eq!(engine.state_bus().get("pipeline.late_cleaned"), Some(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn test_ctx_fs_wrappers_resolve_relative_and_reject_empty() {
+        let dir = tmp_modules("ctxfs");
+        let engine = GrimeLuaEngine::new(Some(dir.to_path_buf()), None).unwrap();
+        let script = format!(
+            r#"
+            ctx.target_dir = "{d}"
+            assert(ctx.mkdir_p("sub/inner") == true)
+            assert(ctx.write("sub/inner/f.txt", "hi") == true)
+            assert(ctx.exists("sub/inner/f.txt") and ctx.is_file("sub/inner/f.txt") and ctx.is_dir("sub"))
+            assert(ctx.read("sub/inner/f.txt") == "hi")
+            ctx.copy("sub/inner/f.txt", "g.txt")
+            ctx.rename("g.txt", "h.txt")
+            assert(ctx.exists("h.txt") and not ctx.exists("g.txt"))
+            assert(ctx.mtime("h.txt") > 0)
+            assert(ctx.needs_rebuild("h.txt", "nonexistent.out") == true)
+            assert(ctx.remove("h.txt") == true)
+            assert(ctx.normalize("/a/./b/../c") == "/a/c" and ctx.path_join("/a", "b") == "/a/b")
+            local ok, err = pcall(ctx.exists, "")
+            assert(not ok and tostring(err):find("Пустой путь"))
+            local ok2 = pcall(ctx.delete, "")
+            assert(not ok2)
+            return true
+            "#,
+            d = dir.to_string_lossy()
+        );
+        let ok: bool = engine.lua.load(&script).eval().expect("ctx fs eval");
+        assert!(ok);
     }
 
     #[test]
@@ -1104,9 +1344,10 @@ mod tests {
             assert(ctx.input == nil)
             assert(ctx.pipeline_input == nil)
             assert(ctx.normalize_path ~= nil)
-            assert(ctx.projects_root ~= nil and #ctx.projects_root() > 0)
-            assert(ctx.apps_root ~= nil and #ctx.apps_root() > 0)
-            assert(ctx.templates_root ~= nil and #ctx.templates_root() > 0)
+            assert(ctx.projects_root == nil and ctx.apps_root == nil and ctx.templates_root == nil,
+                "устаревшие ctx.*_root удалены из ядра")
+            assert(grime.config.projects_root == nil)
+            assert(ctx.get_path("no_such_path", "fb") == "fb")
             assert(ctx.config_dir ~= nil and #ctx.config_dir() > 0)
             assert(ctx.to_snake_case("AppTest") == "app_test")
 
@@ -1142,8 +1383,7 @@ mod tests {
 
     #[test]
     fn test_lua_os_exit_interception_and_cleanup_isolation() {
-        let tmp_dir = std::env::temp_dir().join(format!("grime_lua_lifecycle_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(&tmp_dir);
+        let tmp_dir = crate::test_support::TempDir::new("lua_lifecycle_test");
 
         fs::write(
             tmp_dir.join("mod_exit_err.lua"),
@@ -1189,7 +1429,7 @@ mod tests {
         )
         .unwrap();
 
-        let engine = GrimeLuaEngine::new(Some(tmp_dir.clone()), None).expect("init engine");
+        let engine = GrimeLuaEngine::new(Some(tmp_dir.to_path_buf()), None).expect("init engine");
 
         let res_err = engine.execute_module("mod_exit_err").expect("exec mod_exit_err");
         assert!(!res_err.success);
@@ -1205,17 +1445,16 @@ mod tests {
         let _ = engine.execute_module("mod_no_cleanup").unwrap();
 
         // Вызов cleanup для mod_no_cleanup не должен вызывать cleanup от mod_with_cleanup!
-        engine.call_cleanup("mod_no_cleanup");
+        engine.call_cleanup("mod_no_cleanup", true);
         assert!(!engine.state_bus().has("pipeline.cleaned_mod_a"));
 
         // А вызов cleanup для mod_with_cleanup вызывает именно его cleanup
-        engine.call_cleanup("mod_with_cleanup");
+        engine.call_cleanup("mod_with_cleanup", true);
         assert_eq!(
             engine.state_bus().get("pipeline.cleaned_mod_a"),
             Some(serde_json::json!(true))
         );
 
-        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub struct GrimeEvent {
     pub name: String,
     pub payload: JsonValue,
     pub timestamp: u64,
+    /// Идентификатор сессии оркестратора-источника (для фильтрации слушателями).
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl GrimeEvent {
@@ -24,7 +27,14 @@ impl GrimeEvent {
             name: name.into(),
             payload,
             timestamp,
+            session_id: None,
         }
+    }
+
+    /// Привязывает событие к сессии оркестратора.
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -52,6 +62,17 @@ impl EventBus {
         self.sender.send(event).unwrap_or(0)
     }
 
+    /// Публикация события, помеченного идентификатором сессии оркестратора.
+    pub fn emit_for_session(
+        &self,
+        session_id: &str,
+        name: impl Into<String>,
+        payload: JsonValue,
+    ) -> usize {
+        let event = GrimeEvent::new(name, payload).with_session(session_id);
+        self.sender.send(event).unwrap_or(0)
+    }
+
     /// Подписка на поток событий (для внешних Tokio задач / мониторинга).
     pub fn subscribe(&self) -> broadcast::Receiver<GrimeEvent> {
         self.sender.subscribe()
@@ -63,7 +84,11 @@ impl EventBus {
 /// Предоставляет API:
 /// - `grime.events.on("event_name", callback)` - подписка на событие
 /// - `grime.events.emit("event_name", payload)` - публикация события
-pub fn register_event_bus_api(lua: &Lua, event_bus: Arc<EventBus>) -> Result<(), mlua::Error> {
+pub fn register_event_bus_api(
+    lua: &Lua,
+    event_bus: Arc<EventBus>,
+    session_id: String,
+) -> Result<(), mlua::Error> {
     let globals = lua.globals();
 
     // Создаем внутреннее хранилище слушателей в _grime_listeners
@@ -106,7 +131,7 @@ pub fn register_event_bus_api(lua: &Lua, event_bus: Arc<EventBus>) -> Result<(),
             };
 
             // Отправляем в broadcast канал Rust
-            bus_clone.emit(&event_name, json_payload.clone());
+            bus_clone.emit_for_session(&session_id, &event_name, json_payload.clone());
 
             // Диспетчеризируем слушателям в текущей Lua VM
             dispatch_event_to_lua(lua, &event_name, &json_payload)?;
@@ -155,5 +180,9 @@ mod tests {
         let ev = rx.try_recv().expect("Event received");
         assert_eq!(ev.name, "pipeline.start");
         assert_eq!(ev.payload["id"], 1);
+        assert_eq!(ev.session_id, None);
+
+        bus.emit_for_session("s1", "x", json!(null));
+        assert_eq!(rx.try_recv().unwrap().session_id.as_deref(), Some("s1"));
     }
 }

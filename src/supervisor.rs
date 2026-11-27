@@ -7,10 +7,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::cancellation::PipelineCanceller;
+use crate::config::GrimeConfig;
 use crate::event_bus::EventBus;
+use crate::modules::ModuleRegistry;
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::ParsedPipeline;
 use crate::state_bus::StateBus;
+
+/// Текущее время в секундах UNIX-эпохи.
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Относится ли событие шины к сессии данной задачи (heartbeat чужих задач игнорируется).
+pub fn heartbeat_applies(evt: &crate::event_bus::GrimeEvent, session_id: &str) -> bool {
+    evt.session_id.as_deref() == Some(session_id)
+}
 
 /// Статус открепленной задачи под контролем супервизора.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -36,17 +51,12 @@ pub struct DetachedTask {
 
 impl DetachedTask {
     pub fn new(id: String, command: String, canceller: PipelineCanceller) -> Self {
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         Self {
             id,
             command,
             started_at: Instant::now(),
             finished_at: Arc::new(AtomicU64::new(0)),
-            last_heartbeat: Arc::new(AtomicU64::new(now_sec)),
+            last_heartbeat: Arc::new(AtomicU64::new(now_secs())),
             is_step_active: Arc::new(AtomicBool::new(false)),
             status: Arc::new(RwLock::new(TaskStatus::Running)),
             canceller,
@@ -55,11 +65,7 @@ impl DetachedTask {
 
     /// Сброс таймера активности (Heartbeat).
     pub fn touch_heartbeat(&self) {
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.last_heartbeat.store(now_sec, Ordering::SeqCst);
+        self.last_heartbeat.store(now_secs(), Ordering::SeqCst);
     }
 
     /// Установка флага активного выполнения шага конвейера.
@@ -90,11 +96,7 @@ impl DetachedTask {
                 | TaskStatus::Cancelled
         );
         if is_terminal {
-            let now_sec = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.finished_at.store(now_sec, Ordering::SeqCst);
+            self.finished_at.store(now_secs(), Ordering::SeqCst);
         }
 
         let mut st = self.status
@@ -163,10 +165,7 @@ impl TaskSupervisor {
     /// Если количество завершенных задач превышает 500, старейшие удаляются.
     pub async fn prune_completed_tasks(&self) {
         let mut map = self.tasks.lock().await;
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_sec = now_secs();
 
         // 1. Очистка завершенных задач старше 1 часа
         map.retain(|_, task| {
@@ -197,8 +196,8 @@ impl TaskSupervisor {
     pub async fn spawn_detached_pipeline(
         &self,
         mut parsed: ParsedPipeline,
-        modules_dir: Option<PathBuf>,
-        config_path: Option<PathBuf>,
+        config: Arc<GrimeConfig>,
+        registry: Arc<ModuleRegistry>,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
     ) -> String {
@@ -251,11 +250,15 @@ impl TaskSupervisor {
                     break;
                 }
 
+                // Пока у задачи есть живые дочерние процессы (например `sleep 90` или сборка),
+                // она не зависла, а лишь «молчит»: сбрасываем таймер и не убиваем её.
+                if task_for_monitor.canceller.active_child_count() > 0 {
+                    task_for_monitor.touch_heartbeat();
+                    continue;
+                }
+
                 let last = task_for_monitor.last_heartbeat.load(Ordering::SeqCst);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = now_secs();
 
                 if now.saturating_sub(last) >= idle_timeout {
                     eprintln!(
@@ -290,8 +293,8 @@ impl TaskSupervisor {
 
         tokio::spawn(async move {
             let orch_res = Orchestrator::new_with_shared(
-                modules_dir,
-                config_path.as_deref(),
+                config,
+                registry,
                 shared_state,
                 shared_event,
                 canceller.clone(),
@@ -312,8 +315,19 @@ impl TaskSupervisor {
             // Подписка на шину событий: отслеживание переходов между шагами и пользовательских событий
             let mut event_rx = orchestrator.event_bus().subscribe();
             let task_heartbeat = task_for_exec.clone();
+            let session_id = orchestrator.session_id().to_string();
             let heartbeat_listener = tokio::spawn(async move {
-                while let Ok(evt) = event_rx.recv().await {
+                loop {
+                    let evt = match event_rx.recv().await {
+                        Ok(evt) => evt,
+                        // Слушатель отстал от шины: пропущенные события не критичны
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    // Шина общая для всех задач демона: учитываем только события своей сессии
+                    if !heartbeat_applies(&evt, &session_id) {
+                        continue;
+                    }
                     match evt.name.as_str() {
                         "pipeline.step.start" => {
                             task_heartbeat.set_step_active(true);
@@ -408,7 +422,7 @@ mod tests {
             for _ in 0..20 {
                 tokio::time::sleep(check_interval).await;
                 let last = task_clone.last_heartbeat.load(Ordering::SeqCst);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = now_secs();
                 if now.saturating_sub(last) >= 1 {
                     task_clone.set_status(TaskStatus::TerminatedByTimeout);
                     task_clone.canceller.cancel("Timeout");
@@ -445,8 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_supervisor_cancels_hanging_lua_step() {
-        let tmp_dir = std::env::temp_dir().join(format!("grime_sup_hang_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir = crate::test_support::TempDir::new("sup_hang_test");
         std::fs::write(
             tmp_dir.join("hang_mod.lua"),
             r#"
@@ -461,9 +474,11 @@ mod tests {
         .unwrap();
 
         let supervisor = TaskSupervisor::with_check_interval(1, Duration::from_millis(100));
-        let parsed = crate::pipeline::parse_pipeline_args(&["hang_mod".to_string()]);
+        let config = Arc::new(GrimeConfig::load_or_default(Some(&tmp_dir.join("gproj.conf"))));
+        let registry = Arc::new(ModuleRegistry::scan(vec![tmp_dir.to_path_buf()]));
+        let parsed = crate::pipeline::parse_pipeline_args(&["hang_mod".to_string()], &registry);
         let task_id = supervisor
-            .spawn_detached_pipeline(parsed, Some(tmp_dir.clone()), None, None, None)
+            .spawn_detached_pipeline(parsed, config, registry, None, None)
             .await;
 
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -474,16 +489,12 @@ mod tests {
             "Зависший в бесконечном цикле Lua-шаг должен быть принудительно прерван Watchdog-ом"
         );
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[tokio::test]
     async fn test_supervisor_retention_policy_prune() {
         let supervisor = TaskSupervisor::new(60);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_secs();
 
         // Добавляем 505 недавних завершенных задач (< 1 часа назад)
         {
@@ -524,6 +535,46 @@ mod tests {
             assert!(map.contains_key("task_6"));
             assert!(map.contains_key("task_505"));
         }
+    }
+
+    #[test]
+    fn test_heartbeat_filtered_by_session_id() {
+        use crate::event_bus::GrimeEvent;
+        let own = GrimeEvent::new("pipeline.step.start", serde_json::json!(null)).with_session("sess_a");
+        let foreign = GrimeEvent::new("pipeline.step.start", serde_json::json!(null)).with_session("sess_b");
+        let anonymous = GrimeEvent::new("x", serde_json::json!(null));
+        assert!(heartbeat_applies(&own, "sess_a"));
+        assert!(!heartbeat_applies(&foreign, "sess_a"));
+        assert!(!heartbeat_applies(&anonymous, "sess_a"));
+    }
+
+    #[tokio::test]
+    async fn test_watchdog_keeps_task_with_active_child_process() {
+        let tmp_dir = crate::test_support::TempDir::new("sup_child_test");
+        std::fs::write(
+            tmp_dir.join("sleeper.lua"),
+            "function main()\n  grime.process.run('sleep 3')\nend\n",
+        )
+        .unwrap();
+
+        let supervisor = TaskSupervisor::with_check_interval(1, Duration::from_millis(100));
+        let config = Arc::new(GrimeConfig::load_or_default(Some(&tmp_dir.join("gproj.conf"))));
+        let registry = Arc::new(ModuleRegistry::scan(vec![tmp_dir.to_path_buf()]));
+        let parsed = crate::pipeline::parse_pipeline_args(&["sleeper".to_string()], &registry);
+        let task_id = supervisor
+            .spawn_detached_pipeline(parsed, config, registry, None, None)
+            .await;
+
+        // Шаг молчит дольше idle_timeout (1с), но у него живой дочерний процесс
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert_eq!(
+            supervisor.get_task_status(&task_id).await,
+            Some(TaskStatus::Running),
+            "Watchdog не должен убивать задачу с активным дочерним процессом"
+        );
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(supervisor.get_task_status(&task_id).await, Some(TaskStatus::Succeeded));
+
     }
 
     #[tokio::test]

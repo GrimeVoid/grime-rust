@@ -1,150 +1,113 @@
 use colored::Colorize;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cancellation::PipelineCanceller;
 use crate::config::GrimeConfig;
 use crate::event_bus::EventBus;
-use crate::lua_engine::GrimeLuaEngine;
+use crate::lua_engine::{GrimeLuaEngine, WrapOutcome};
+use crate::modules::ModuleRegistry;
 use crate::payload::PipelinePayload;
-use crate::pipeline::{
-    canonical_module_name, format_subpipeline_cli, is_host_step, ParsedPipeline, PipelineStep,
-};
+use crate::pipeline::{ParsedPipeline, PipelineStep};
 use crate::state_bus::StateBus;
 
-const BOX_ONE_SHOT_ACTIONS: &[&str] = &[
-    "list", "ls", "status", "ps", "stop", "create", "new", "init", "rm", "delete", "remove",
-    "del", "export", "exp", "keepalive", "idle", "help", "-h", "--help", "runner", "wrap", "do",
-];
-
-fn detect_current_container() -> Option<String> {
-    if let Ok(id) = std::env::var("CONTAINER_ID") {
-        let trimmed = id.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    if let Ok(content) = std::fs::read_to_string("/run/.containerenv") {
-        for line in content.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("name=") {
-                let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+/// Уникальный идентификатор сессии оркестратора (метка его событий в общей шине).
+fn next_session_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "sess_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
-fn extract_box_env_switch(step: &PipelineStep, config: &GrimeConfig) -> Option<String> {
-    if step
-        .args
-        .iter()
-        .any(|a| crate::args_engine::is_passthrough_separator(a))
-    {
-        return None;
+/// Собирает argv подконвейера для хука `wrap_pipeline`:
+/// `grime -p <target_dir> [-f] <модуль1> <арги...> : <модуль2> ...`.
+fn build_rest_argv(target_dir: &Path, force: bool, sub_steps: &[PipelineStep]) -> Vec<String> {
+    let mut argv = vec![
+        "grime".to_string(),
+        "-p".to_string(),
+        target_dir.to_string_lossy().to_string(),
+    ];
+    if force {
+        argv.push("-f".to_string());
     }
-
-    let is_switch_action = |s: &str| {
-        matches!(
-            s.to_lowercase().trim_start_matches('-'),
-            "enter" | "shell" | "sh" | "e" | "run" | "r" | "exec"
-        )
-    };
-
-    if step.args.iter().any(|a| {
-        let lower = a.to_lowercase();
-        let clean = lower.trim_start_matches('-');
-        !is_switch_action(&lower)
-            && (a.starts_with('-') || BOX_ONE_SHOT_ACTIONS.contains(&clean))
-    }) {
-        return None;
-    }
-
-    let default_box = || {
-        config
-            .get_opt("distrobox_default", Some("default"))
-            .unwrap_or_else(|| "default".to_string())
-    };
-
-    match step.args.len() {
-        0 => Some(default_box()),
-        1 => {
-            if is_switch_action(&step.args[0]) {
-                Some(default_box())
-            } else {
-                Some(step.args[0].clone())
-            }
+    for (i, s) in sub_steps.iter().enumerate() {
+        if i > 0 {
+            argv.push(":".to_string());
         }
-        2 => {
-            let a0_is_act = is_switch_action(&step.args[0]);
-            let a1_is_act = is_switch_action(&step.args[1]);
-            if a0_is_act && !a1_is_act && !step.args[1].starts_with('-') {
-                Some(step.args[1].clone())
-            } else if a1_is_act && !a0_is_act && !step.args[0].starts_with('-') {
-                Some(step.args[0].clone())
-            } else {
-                None
-            }
-        }
-        _ => None,
+        argv.push(s.module.clone());
+        argv.extend(s.args.iter().cloned());
     }
+    argv
 }
 
-fn extract_nix_env_switch(step: &PipelineStep) -> bool {
-    match step.args.len() {
-        0 => true,
-        1 => {
-            let first = step.args[0].to_lowercase();
-            matches!(
-                first.trim_start_matches('-'),
-                "enter" | "shell" | "sh"
-            )
-        }
-        _ => false,
-    }
+/// План исполнения шага: какой шаг реально выполнить и с какого индекса продолжить.
+enum StepPlan<'a> {
+    /// Пропустить шаг (уже в нужной среде).
+    Skip,
+    Run {
+        step: Cow<'a, PipelineStep>,
+        next_idx: usize,
+    },
 }
 
 pub struct Orchestrator {
     engine: GrimeLuaEngine,
-    config: GrimeConfig,
+    config: Arc<GrimeConfig>,
+    registry: Arc<ModuleRegistry>,
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
     canceller: PipelineCanceller,
+    session_id: String,
 }
 
 impl Orchestrator {
     pub fn new(modules_dir: Option<PathBuf>, config_path: Option<&Path>) -> Result<Self, mlua::Error> {
-        let state_bus = Arc::new(StateBus::new());
-        let event_bus = Arc::new(EventBus::default());
-        let canceller = PipelineCanceller::new();
-        Self::new_with_shared(modules_dir, config_path, state_bus, event_bus, canceller)
+        let config = Arc::new(GrimeConfig::load_or_default(config_path));
+        let registry = Arc::new(ModuleRegistry::for_config(&config, modules_dir));
+        Self::new_with_shared(
+            config,
+            registry,
+            Arc::new(StateBus::new()),
+            Arc::new(EventBus::default()),
+            PipelineCanceller::new(),
+        )
     }
 
+    /// Создаёт оркестратор поверх общих компонентов: один `Arc<GrimeConfig>` и реестр на всех.
     pub fn new_with_shared(
-        modules_dir: Option<PathBuf>,
-        config_path: Option<&Path>,
+        config: Arc<GrimeConfig>,
+        registry: Arc<ModuleRegistry>,
         state_bus: Arc<StateBus>,
         event_bus: Arc<EventBus>,
         canceller: PipelineCanceller,
     ) -> Result<Self, mlua::Error> {
-        let engine = GrimeLuaEngine::new_with_bus(
-            modules_dir,
-            config_path,
+        let session_id = next_session_id();
+        let engine = GrimeLuaEngine::from_parts(
+            config.clone(),
+            registry.clone(),
             state_bus.clone(),
             event_bus.clone(),
             canceller.clone(),
+            session_id.clone(),
         )?;
-        let config = GrimeConfig::load_or_default(config_path);
 
         Ok(Orchestrator {
             engine,
             config,
+            registry,
             state_bus,
             event_bus,
             canceller,
+            session_id,
         })
     }
 
@@ -160,18 +123,140 @@ impl Orchestrator {
         &self.canceller
     }
 
-    pub fn config(&self) -> &GrimeConfig {
+    pub fn config(&self) -> &Arc<GrimeConfig> {
         &self.config
+    }
+
+    pub fn registry(&self) -> &Arc<ModuleRegistry> {
+        &self.registry
+    }
+
+    /// Идентификатор сессии, которым помечаются все события этого оркестратора.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Разбор аргументов командной строки с реестром этого оркестратора.
+    pub fn parse_args(&self, raw_args: &[String]) -> ParsedPipeline {
+        crate::pipeline::parse_pipeline_args(raw_args, &self.registry)
     }
 
     pub fn set_environment(&self, env: &std::collections::HashMap<String, String>) -> Result<(), mlua::Error> {
         self.engine.set_environment(env)
     }
 
-    fn run_cleanup(engine: &GrimeLuaEngine, executed_modules: &[String]) {
+    /// Вызов `cleanup()` задействованных модулей в порядке LIFO.
+    /// `verbose` включает сообщение о вызове: только для аварийного пути, не для штатного завершения.
+    fn run_cleanup(&self, executed_modules: &[String], verbose: bool) {
         for m in executed_modules.iter().rev() {
-            engine.call_cleanup(m);
+            self.engine.call_cleanup(m, verbose);
         }
+    }
+
+    /// Единая точка аварийного завершения: cleanup (LIFO), событие `pipeline.failed`, текст ошибки.
+    fn abort(&self, executed_modules: &[String], event: serde_json::Value, err: String) -> String {
+        self.run_cleanup(executed_modules, true);
+        self.engine.emit_event("pipeline.failed", event);
+        err
+    }
+
+    /// Аварийное завершение по отмене конвейера (Ctrl+C, таймаут, KillTask).
+    fn abort_cancelled(&self, executed_modules: &[String], module: Option<&str>) -> String {
+        let reason = self
+            .canceller
+            .get_reason()
+            .unwrap_or_else(|| "Конвейер прерван пользователем".to_string());
+        eprintln!("{} {}", "[Grime Cancelled]".yellow().bold(), reason);
+        let mut event = serde_json::json!({ "cancelled": true, "reason": reason });
+        if let Some(m) = module {
+            event["module"] = serde_json::json!(m);
+        }
+        self.abort(executed_modules, event, format!("Конвейер прерван: {}", reason))
+    }
+
+    /// Аварийное завершение по ошибке шага.
+    fn abort_error(&self, executed_modules: &[String], module: &str, event_error: &str, err: String) -> String {
+        eprintln!("{} {}", "[Grime Error]".red().bold(), err);
+        self.abort(
+            executed_modules,
+            serde_json::json!({ "module": module, "error": event_error }),
+            err,
+        )
+    }
+
+    /// Планирует шаг: для модуля с `wraps: pipeline` спрашивает хук `wrap_pipeline`,
+    /// нужно ли выполнить подконвейер (до следующего модуля-рубежа) в другой среде.
+    fn plan_step<'a>(
+        &self,
+        steps: &'a [PipelineStep],
+        step_idx: usize,
+        mod_name: &str,
+        target_dir: &Path,
+        force: bool,
+    ) -> Result<StepPlan<'a>, String> {
+        let raw_step = &steps[step_idx];
+        let plain = || StepPlan::Run {
+            step: Cow::Borrowed(raw_step),
+            next_idx: step_idx + 1,
+        };
+
+        let wraps = self.registry.get(mod_name).is_some_and(|m| m.wraps_pipeline());
+        if !wraps || step_idx + 1 >= steps.len() {
+            return Ok(plain());
+        }
+
+        let boundary_idx = (step_idx + 1..steps.len()).find(|&i| self.registry.is_boundary(&steps[i].module));
+        let sub_steps = &steps[step_idx + 1..boundary_idx.unwrap_or(steps.len())];
+        if sub_steps.is_empty() {
+            return Ok(plain());
+        }
+
+        let rest_argv = build_rest_argv(target_dir, force, sub_steps);
+        let outcome = self
+            .engine
+            .set_step_context(raw_step, step_idx, steps.len(), target_dir, None, None, force)
+            .and_then(|_| self.engine.call_wrap_hook(mod_name, &raw_step.args, &rest_argv))
+            .map_err(|e| format!("Ошибка хука wrap_pipeline модуля '{}': {}", mod_name, e))?;
+
+        Ok(match outcome {
+            WrapOutcome::None => plain(),
+            WrapOutcome::Skip => StepPlan::Skip,
+            WrapOutcome::Args(args) => StepPlan::Run {
+                step: Cow::Owned(PipelineStep {
+                    module: mod_name.to_string(),
+                    args,
+                }),
+                // Подконвейер поглощён хуком: продолжаем после рубежа (или завершаем)
+                next_idx: boundary_idx.map_or(steps.len(), |b| b + 1),
+            },
+        })
+    }
+
+    /// Проверка требований (`requires:`) модулей всех шагов: один отчёт по всем проблемам.
+    /// Без `--force` обязательные проблемы — отказ; с ним (и для необязательных) — предупреждения.
+    fn preflight(&self, parsed: &ParsedPipeline) -> Result<(), String> {
+        let roots: Vec<String> = parsed.steps.iter().map(|s| self.registry.canonical_name(&s.module)).collect();
+        let rep = crate::deps::preflight(&self.registry, &roots);
+        for w in &rep.warnings {
+            eprintln!("{} {}", "[Grime Warning]".yellow().bold(), w);
+        }
+        if rep.errors.is_empty() {
+            return Ok(());
+        }
+        if parsed.force {
+            for e in &rep.errors {
+                eprintln!("{} {} (продолжаем из-за --force)", "[Grime Warning]".yellow().bold(), e);
+            }
+            return Ok(());
+        }
+        let mut msg = String::from("Не выполнены требования модулей:");
+        for e in &rep.errors {
+            msg.push_str("\n  - ");
+            msg.push_str(e);
+        }
+        msg.push_str("\n  (используйте -f, чтобы продолжить несмотря на это)");
+        eprintln!("{} {}", "[Grime Error]".red().bold(), msg);
+        Err(msg)
     }
 
     pub fn run_pipeline(&self, parsed: &ParsedPipeline) -> Result<Option<String>, String> {
@@ -183,6 +268,12 @@ impl Orchestrator {
 
         // 1. RAII очистка сессионных данных pipeline.* после завершения конвейера
         let _session_guard = self.state_bus.create_session_guard();
+
+        // 1.1. RAII удаление эфемерных ресурсов сессии (успех, ошибка, отмена, паника)
+        let _eph_guard = self.engine.ephemeral().guard();
+
+        // 1.2. Pre-flight: зависимости (module:/bin:) всех шагов проверяются до первого шага
+        self.preflight(parsed)?;
 
         // 2. Сброс состояния прерывания
         self.canceller.reset();
@@ -198,6 +289,7 @@ impl Orchestrator {
         let mut pipeline_data: Option<String> = None;
         let mut pipeline_payload: Option<PipelinePayload> = None;
         let mut executed_modules: Vec<String> = Vec::new();
+        let mut had_failures = false;
 
         // Публикация события старта конвейера
         self.engine.emit_event(
@@ -212,122 +304,19 @@ impl Orchestrator {
         while step_idx < total_steps {
             // Проверка безопасной отмены конвейера при Ctrl+C / SIGINT
             if self.canceller.is_cancelled() {
-                let reason = self
-                    .canceller
-                    .get_reason()
-                    .unwrap_or_else(|| "Конвейер прерван пользователем".to_string());
-                eprintln!("{} {}", "[Grime Cancelled]".yellow().bold(), reason);
-
-                Self::run_cleanup(&self.engine, &executed_modules);
-
-                self.engine.emit_event(
-                    "pipeline.failed",
-                    serde_json::json!({
-                        "cancelled": true,
-                        "reason": reason
-                    }),
-                );
-                return Err(format!("Конвейер прерван: {}", reason));
+                return Err(self.abort_cancelled(&executed_modules, None));
             }
 
-            let raw_step = &steps[step_idx];
-            let mod_name = canonical_module_name(&raw_step.module);
+            let mod_name = self.registry.canonical_name(&steps[step_idx].module);
 
-            // Рубеж сред `: box <name> : ... : host :` и `: nix : ... : host :`
-            let mut next_step_idx = step_idx + 1;
-            let effective_step: std::borrow::Cow<'_, PipelineStep> =
-                if mod_name == "box" && step_idx + 1 < total_steps {
-                    if let Some(box_name) = extract_box_env_switch(raw_step, &self.config) {
-                        if detect_current_container().as_deref() == Some(box_name.as_str()) {
-                            step_idx += 1;
-                            continue;
-                        }
-                        let host_idx = steps
-                            .iter()
-                            .enumerate()
-                            .skip(step_idx + 1)
-                            .find(|(_, candidate)| is_host_step(&candidate.module))
-                            .map(|(idx, _)| idx);
-
-                        let end_sub_idx = host_idx.unwrap_or(total_steps);
-                        let sub_steps = &steps[(step_idx + 1)..end_sub_idx];
-                        if !sub_steps.is_empty() {
-                            let mut synth_args = vec![
-                                "-run".to_string(),
-                                box_name,
-                                "--".to_string(),
-                                "grime".to_string(),
-                                "-p".to_string(),
-                                current_target_dir.to_string_lossy().to_string(),
-                            ];
-                            if parsed.force {
-                                synth_args.push("-f".to_string());
-                            }
-                            for (i, s) in sub_steps.iter().enumerate() {
-                                if i > 0 {
-                                    synth_args.push(":".to_string());
-                                }
-                                synth_args.push(s.module.clone());
-                                synth_args.extend(s.args.clone());
-                            }
-
-                            next_step_idx = host_idx.map_or(total_steps, |h| h + 1);
-                            std::borrow::Cow::Owned(PipelineStep {
-                                module: "box".to_string(),
-                                args: synth_args,
-                            })
-                        } else {
-                            std::borrow::Cow::Borrowed(raw_step)
-                        }
-                    } else {
-                        std::borrow::Cow::Borrowed(raw_step)
+            let (effective_step, next_step_idx) =
+                match self.plan_step(steps, step_idx, &mod_name, &current_target_dir, parsed.force) {
+                    Ok(StepPlan::Skip) => {
+                        step_idx += 1;
+                        continue;
                     }
-                } else if mod_name == "nix" && step_idx + 1 < total_steps && extract_nix_env_switch(raw_step) {
-                    let host_idx = steps
-                        .iter()
-                        .enumerate()
-                        .skip(step_idx + 1)
-                        .find(|(_, candidate)| is_host_step(&candidate.module))
-                        .map(|(idx, _)| idx);
-
-                    let end_sub_idx = host_idx.unwrap_or(total_steps);
-                    let sub_steps = &steps[(step_idx + 1)..end_sub_idx];
-                    if !sub_steps.is_empty() {
-                        let sub_cli = format_subpipeline_cli(sub_steps);
-                        eprintln!(
-                            "{} Переключение среды в Nix DevShell -> {}",
-                            "[Grime Nix]".cyan().bold(),
-                            sub_cli
-                        );
-
-                        let mut synth_args = vec![
-                            "-run".to_string(),
-                            "--".to_string(),
-                            "grime".to_string(),
-                            "-p".to_string(),
-                            current_target_dir.to_string_lossy().to_string(),
-                        ];
-                        if parsed.force {
-                            synth_args.push("-f".to_string());
-                        }
-                        for (i, s) in sub_steps.iter().enumerate() {
-                            if i > 0 {
-                                synth_args.push(":".to_string());
-                            }
-                            synth_args.push(s.module.clone());
-                            synth_args.extend(s.args.clone());
-                        }
-
-                        next_step_idx = host_idx.map_or(total_steps, |h| h + 1);
-                        std::borrow::Cow::Owned(PipelineStep {
-                            module: "nix".to_string(),
-                            args: synth_args,
-                        })
-                    } else {
-                        std::borrow::Cow::Borrowed(raw_step)
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(raw_step)
+                    Ok(StepPlan::Run { step, next_idx }) => (step, next_idx),
+                    Err(err) => return Err(self.abort_error(&executed_modules, &mod_name, &err, err.clone())),
                 };
 
             let effective_total_steps = if next_step_idx >= total_steps {
@@ -347,9 +336,7 @@ impl Orchestrator {
                 parsed.force,
             ) {
                 let err_msg = format!("Ошибка установки контекста для '{}': {}", mod_name, e);
-                eprintln!("{} {}", "[Grime Error]".red().bold(), err_msg);
-                Self::run_cleanup(&self.engine, &executed_modules);
-                return Err(err_msg);
+                return Err(self.abort_error(&executed_modules, &mod_name, &err_msg, err_msg.clone()));
             }
 
             // Событие старта шага
@@ -369,39 +356,17 @@ impl Orchestrator {
                 Err(e) => {
                     let err_str = e.to_string();
                     if self.canceller.is_cancelled() || err_str.contains("[CANCELLATION]") {
-                        let reason = self
-                            .canceller
-                            .get_reason()
-                            .unwrap_or_else(|| "Конвейер прерван пользователем".to_string());
-                        eprintln!("{} {}", "[Grime Cancelled]".yellow().bold(), reason);
-                        Self::run_cleanup(&self.engine, &executed_modules);
-                        self.engine.emit_event(
-                            "pipeline.failed",
-                            serde_json::json!({
-                                "module": mod_name,
-                                "cancelled": true,
-                                "reason": reason
-                            }),
-                        );
-                        return Err(format!("Конвейер прерван: {}", reason));
+                        return Err(self.abort_cancelled(&executed_modules, Some(&mod_name)));
                     }
                     let full_err = format!("Ошибка выполнения модуля '{}': {}", mod_name, err_str);
-                    eprintln!("{} {}", "[Grime Error]".red().bold(), full_err);
-                    Self::run_cleanup(&self.engine, &executed_modules);
-                    self.engine.emit_event(
-                        "pipeline.failed",
-                        serde_json::json!({
-                            "module": mod_name,
-                            "error": err_str
-                        }),
-                    );
-                    return Err(full_err);
+                    return Err(self.abort_error(&executed_modules, &mod_name, &err_str, full_err));
                 }
             };
 
             if !result.success {
                 let err_msg = result
                     .error_message
+                    .clone()
                     .unwrap_or_else(|| format!("Модуль '{}' завершился со статусом ошибки", mod_name));
                 let clean_display = err_msg
                     .trim_start_matches("[Grime Error] ")
@@ -412,21 +377,16 @@ impl Orchestrator {
                 } else {
                     eprintln!("{} {}", "[Grime Error]".red().bold(), clean_display);
                 }
+                had_failures = true;
 
-                // Вызов функции cleanup() у задействованных модулей в порядке LIFO
-                Self::run_cleanup(&self.engine, &executed_modules);
-
-                self.engine.emit_event(
-                    "pipeline.failed",
-                    serde_json::json!({
-                        "module": mod_name,
-                        "error": err_msg
-                    }),
-                );
-
+                // Вызов cleanup() у задействованных модулей в порядке LIFO
+                let event = serde_json::json!({ "module": mod_name, "error": err_msg });
+                self.abort(&executed_modules, event, String::new());
                 if !parsed.force {
                     return Err(err_msg);
                 }
+                // С --force конвейер продолжается: cleanup уже выполнен, список очищаем
+                executed_modules.clear();
             }
 
             // Смена рабочей директории: ТОЛЬКО если шаг явно запросил это через ctx.set_target_dir()
@@ -462,7 +422,7 @@ impl Orchestrator {
             // Инкрементальная сборка мусора Lua между шагами для предотвращения накопления памяти
             self.engine.gc_step(100);
 
-            // Событие успешного завершения шага
+            // Событие завершения шага
             self.engine.emit_event(
                 "pipeline.step.finish",
                 serde_json::json!({
@@ -475,11 +435,14 @@ impl Orchestrator {
             step_idx = next_step_idx;
         }
 
-        // Публикация события успешного завершения всего конвейера
+        // Штатное завершение: cleanup() задействованных модулей в порядке LIFO
+        self.run_cleanup(&executed_modules, false);
+
+        // Публикация события завершения всего конвейера (при -f с ошибками шагов success = false)
         self.engine.emit_event(
             "pipeline.finish",
             serde_json::json!({
-                "success": true,
+                "success": !had_failures,
                 "result": pipeline_data
             }),
         );
@@ -492,58 +455,24 @@ impl Orchestrator {
 mod tests {
     use super::*;
 
-    fn make_step(args: &[&str]) -> PipelineStep {
-        PipelineStep {
-            module: "box".to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
     #[test]
-    fn test_extract_box_env_switch_run_and_enter() {
-        let cfg = GrimeConfig::load_or_default(None);
-
+    fn test_build_rest_argv_layout() {
+        let steps = vec![
+            PipelineStep { module: "pkg".into(), args: vec!["install".into(), "fzf".into()] },
+            PipelineStep { module: "cmd".into(), args: vec!["echo".into(), "hello world".into()] },
+        ];
         assert_eq!(
-            extract_box_env_switch(&make_step(&["-run", "fedora-box"]), &cfg),
-            Some("fedora-box".to_string())
+            build_rest_argv(Path::new("/w"), true, &steps),
+            vec!["grime", "-p", "/w", "-f", "pkg", "install", "fzf", ":", "cmd", "echo", "hello world"]
         );
         assert_eq!(
-            extract_box_env_switch(&make_step(&["fedora-box", "-run"]), &cfg),
-            Some("fedora-box".to_string())
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["-enter", "fedora-box"]), &cfg),
-            Some("fedora-box".to_string())
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["fedora-box", "-enter"]), &cfg),
-            Some("fedora-box".to_string())
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["fedora-box"]), &cfg),
-            Some("fedora-box".to_string())
+            build_rest_argv(Path::new("/w"), false, &steps[..1]),
+            vec!["grime", "-p", "/w", "pkg", "install", "fzf"]
         );
     }
 
     #[test]
-    fn test_extract_box_env_switch_rejects_one_shot_and_passthrough() {
-        let cfg = GrimeConfig::load_or_default(None);
-
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["-run", "fedora-box", "--", "ls"]), &cfg),
-            None
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["-run", "fedora-box", "//", "ls"]), &cfg),
-            None
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["list"]), &cfg),
-            None
-        );
-        assert_eq!(
-            extract_box_env_switch(&make_step(&["-stop", "fedora-box"]), &cfg),
-            None
-        );
+    fn test_session_ids_unique() {
+        assert_ne!(next_session_id(), next_session_id());
     }
 }

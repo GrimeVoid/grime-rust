@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use crate::cancellation::PipelineCanceller;
 use crate::config::GrimeConfig;
 use crate::event_bus::EventBus;
+use crate::modules::ModuleRegistry;
 use crate::orchestrator::Orchestrator;
 use crate::pipeline::parse_pipeline_args;
 use crate::state_bus::StateBus;
@@ -51,6 +52,44 @@ pub struct DaemonResponse {
     pub error: Option<String>,
     pub detached: bool,
     pub task_id: Option<String>,
+}
+
+impl DaemonResponse {
+    /// Успешный ответ с необязательным результатом.
+    pub fn ok(result: Option<String>) -> Self {
+        Self {
+            success: true,
+            exit_code: 0,
+            result,
+            error: None,
+            detached: false,
+            task_id: None,
+        }
+    }
+
+    /// Ответ с ошибкой (код возврата 1).
+    pub fn err(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            exit_code: 1,
+            result: None,
+            error: Some(error.into()),
+            detached: false,
+            task_id: None,
+        }
+    }
+
+    /// Привязывает ответ к задаче супервизора.
+    pub fn with_task(mut self, task_id: String) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    /// Помечает ответ как относящийся к откреплённой задаче.
+    pub fn detached(mut self) -> Self {
+        self.detached = true;
+        self
+    }
 }
 
 pub fn get_socket_path() -> PathBuf {
@@ -203,12 +242,50 @@ fn is_relevant_lua_event(ev: &Event) -> bool {
         .any(|p| p.extension().is_some_and(|ext| ext == "lua"))
 }
 
+/// Берёт эксклюзивный `flock` на `<сокет>.lock`: защита от гонки двух одновременных автозапусков демона.
+/// Блокировка живёт, пока открыт возвращённый файл (то есть всё время работы демона).
+fn acquire_daemon_lock(sock_path: &Path) -> Result<fs::File, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let mut lock_name = sock_path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err("Демон Grime уже запущен или запускается другим процессом".into());
+    }
+    Ok(file)
+}
+
+/// Создаёт слушающий сокет под umask 0077: права 0600 выставляются сразу, без окна гонки.
+fn bind_private_socket(sock_path: &Path) -> std::io::Result<UnixListener> {
+    let old_umask = unsafe { libc::umask(0o077) };
+    let res = UnixListener::bind(sock_path);
+    unsafe { libc::umask(old_umask) };
+    let listener = res?;
+    // Страховка на случай, если файловая система игнорирует umask
+    let _ = fs::set_permissions(sock_path, fs::Permissions::from_mode(0o600));
+    Ok(listener)
+}
+
 pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let sock_path = get_socket_path();
+    let _daemon_lock = acquire_daemon_lock(&sock_path)?;
+
     if ping_daemon_sync() {
         return Err("Демон Grime уже запущен и отвечает на запросы".into());
     }
 
-    let sock_path = get_socket_path();
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
     }
@@ -217,9 +294,7 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
         let _ = fs::create_dir_all(parent);
     }
 
-    let listener = UnixListener::bind(&sock_path)?;
-    // Принудительно ограничиваем права доступа к Unix-сокету только текущим пользователем (0o600)
-    let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    let listener = bind_private_socket(&sock_path)?;
 
     println!(
         "{} Демон grime запущен на сокете: {} (Протокол: MessagePack)",
@@ -230,9 +305,13 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
     let shared_state_bus = Arc::new(StateBus::new());
     let shared_event_bus = Arc::new(EventBus::default());
 
+    // Конфиг и реестр модулей создаются один раз и разделяются всеми оркестраторами демона
+    let config = Arc::new(GrimeConfig::load_or_default(config_path));
+    let registry = Arc::new(ModuleRegistry::for_config(&config, modules_dir));
+
     let initial_orch = Orchestrator::new_with_shared(
-        modules_dir.clone(),
-        config_path,
+        config.clone(),
+        registry.clone(),
         shared_state_bus.clone(),
         shared_event_bus.clone(),
         PipelineCanceller::new(),
@@ -240,43 +319,58 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
 
     let orchestrator = Arc::new(RwLock::new(initial_orch));
 
+    // Подметание осиротевших эфемерных каталогов (убитые процессы): сразу и периодически
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(crate::ephemeral::SWEEP_INTERVAL);
+        loop {
+            tick.tick().await;
+            let _ = tokio::task::spawn_blocking(crate::ephemeral::sweep_default).await;
+        }
+    });
+
     let supervisor = Arc::new(TaskSupervisor::with_shared_buses(
         60,
         shared_state_bus.clone(),
         shared_event_bus.clone(),
     ));
 
-    // Настройка Hot-Reload через notify с использованием единого резолвера директории модулей
-    let mod_dir_to_watch = GrimeConfig::load_or_default(config_path)
-        .resolve_modules_dir(modules_dir.clone());
+    // Настройка Hot-Reload через notify: наблюдаем за всеми существующими каталогами модулей
+    let watch_dirs: Vec<PathBuf> = registry.dirs().iter().filter(|d| d.exists()).cloned().collect();
 
-    if mod_dir_to_watch.exists() {
+    if !watch_dirs.is_empty() {
         let orch_reload = orchestrator.clone();
-        let watch_dir = mod_dir_to_watch.clone();
-        let conf_p = config_path.map(|p| p.to_path_buf());
+        let config_reload = config.clone();
+        let registry_reload = registry.clone();
         let state_reload = shared_state_bus.clone();
         let event_reload = shared_event_bus.clone();
 
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            let mut watcher = match notify::recommended_watcher(tx) {
-                Ok(w) => w,
-                Err(e) => {
-                    eprintln!("Не удалось запустить watcher: {}", e);
-                    return;
+            // Вотчеры должны жить, пока работает поток
+            let mut watchers = Vec::new();
+            for dir in &watch_dirs {
+                let mut watcher = match notify::recommended_watcher(tx.clone()) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("Не удалось запустить watcher: {}", e);
+                        continue;
+                    }
+                };
+                if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+                    eprintln!("Ошибка наблюдения за директорией {:?}: {}", dir, e);
+                    continue;
                 }
-            };
-
-            if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
-                eprintln!("Ошибка наблюдения за директорией {:?}: {}", watch_dir, e);
+                println!(
+                    "{} Hot-reload активен для каталога: {}",
+                    "[grime-daemon]".green().bold(),
+                    dir.display()
+                );
+                watchers.push(watcher);
+            }
+            if watchers.is_empty() {
                 return;
             }
-
-            println!(
-                "{} Hot-reload активен для каталога: {}",
-                "[grime-daemon]".green().bold(),
-                watch_dir.display()
-            );
+            drop(tx);
 
             while let Ok(res) = rx.recv() {
                 let Ok(ev) = res else {
@@ -293,10 +387,10 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                     "{} Обнаружено изменение Lua-модулей! Перезагрузка состояния...",
                     "[grime-daemon Hot-Reload]".yellow().bold()
                 );
-                crate::pipeline::invalidate_modules_cache();
+                registry_reload.invalidate();
                 if let Ok(new_orch) = Orchestrator::new_with_shared(
-                    Some(watch_dir.clone()),
-                    conf_p.as_deref(),
+                    config_reload.clone(),
+                    registry_reload.clone(),
                     state_reload.clone(),
                     event_reload.clone(),
                     PipelineCanceller::new(),
@@ -312,16 +406,14 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
         });
     }
 
-    let conf_path_buf = config_path.map(|p| p.to_path_buf());
-
     // Обработка входящих соединений
     loop {
         match listener.accept().await {
             Ok((mut socket, _)) => {
                 let orch = orchestrator.clone();
                 let sup = supervisor.clone();
-                let m_dir = modules_dir.clone();
-                let c_path = conf_path_buf.clone();
+                let config = config.clone();
+                let registry = registry.clone();
 
                 tokio::spawn(async move {
                     let msg: ClientMessage = match read_ipc_frame_async(
@@ -339,38 +431,24 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                                 payload_len,
                                 MAX_IPC_PAYLOAD_SIZE
                             );
-                            let resp = DaemonResponse {
-                                success: false,
-                                exit_code: 1,
-                                result: None,
-                                error: Some(format!(
-                                    "Payload size exceeds MAX_IPC_PAYLOAD_SIZE limit ({} > {})",
-                                    payload_len, MAX_IPC_PAYLOAD_SIZE
-                                )),
-                                detached: false,
-                                task_id: None,
-                            };
+                            let resp = DaemonResponse::err(format!(
+                                "Payload size exceeds MAX_IPC_PAYLOAD_SIZE limit ({} > {})",
+                                payload_len, MAX_IPC_PAYLOAD_SIZE
+                            ));
                             let _ = write_ipc_frame_async(&mut socket, &resp).await;
                             return;
                         }
                         Err(IpcFrameError::Deserialize(e)) => {
-                            let resp = DaemonResponse {
-                                success: false,
-                                exit_code: 1,
-                                result: None,
-                                error: Some(format!("Ошибка парсинга MessagePack: {}", e)),
-                                detached: false,
-                                task_id: None,
-                            };
+                            let resp = DaemonResponse::err(format!("Ошибка парсинга MessagePack: {}", e));
                             let _ = write_ipc_frame_async(&mut socket, &resp).await;
                             return;
                         }
                         Err(IpcFrameError::Io(_)) => return,
                     };
 
-                    match msg {
+                    let resp = match msg {
                         ClientMessage::Run { cwd, args, env, detach } => {
-                            let mut parsed = parse_pipeline_args(&args);
+                            let mut parsed = parse_pipeline_args(&args, &registry);
                             if parsed.work_path.is_none() && !cwd.is_empty() {
                                 parsed.work_path = Some(PathBuf::from(&cwd));
                             }
@@ -378,63 +456,31 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                             if detach || parsed.detach {
                                 // Запуск открепленной задачи в супервизоре с Heartbeat, cwd и env
                                 let task_id = sup
-                                    .spawn_detached_pipeline(parsed, m_dir, c_path, Some(cwd), Some(env))
+                                    .spawn_detached_pipeline(parsed, config, registry, Some(cwd), Some(env))
                                     .await;
-
-                                let resp = DaemonResponse {
-                                    success: true,
-                                    exit_code: 0,
-                                    result: Some(format!("Задача успешно откреплена (Task ID: {})", task_id)),
-                                    error: None,
-                                    detached: true,
-                                    task_id: Some(task_id),
-                                };
-                                let _ = write_ipc_frame_async(&mut socket, &resp).await;
+                                DaemonResponse::ok(Some(format!("Задача успешно откреплена (Task ID: {})", task_id)))
+                                    .with_task(task_id)
+                                    .detached()
                             } else {
                                 // Сервисное выполнение через демон: берем эксклюзивный write-замок
                                 // для исключения гонок в разделяемой Lua VM и выполняем в spawn_blocking
                                 let orch_guard = orch.write_owned().await;
                                 let run_res = tokio::task::spawn_blocking(move || {
-                                    if !env.is_empty() {
-                                        let _ = orch_guard.set_environment(&env);
-                                    }
+                                    // Окружение заменяется при каждом запуске (в том числе пустым),
+                                    // чтобы переменные прошлого клиента не просачивались в новый
+                                    let _ = orch_guard.set_environment(&env);
                                     orch_guard.run_pipeline(&parsed)
                                 })
                                 .await
                                 .unwrap_or_else(|e| Err(format!("Ошибка выполнения задачи демона: {}", e)));
 
-                                let resp = match run_res {
-                                    Ok(res) => DaemonResponse {
-                                        success: true,
-                                        exit_code: 0,
-                                        result: res,
-                                        error: None,
-                                        detached: false,
-                                        task_id: None,
-                                    },
-                                    Err(err) => DaemonResponse {
-                                        success: false,
-                                        exit_code: 1,
-                                        result: None,
-                                        error: Some(err),
-                                        detached: false,
-                                        task_id: None,
-                                    },
-                                };
-                                let _ = write_ipc_frame_async(&mut socket, &resp).await;
+                                match run_res {
+                                    Ok(res) => DaemonResponse::ok(res),
+                                    Err(err) => DaemonResponse::err(err),
+                                }
                             }
                         }
-                        ClientMessage::Ping => {
-                            let resp = DaemonResponse {
-                                success: true,
-                                exit_code: 0,
-                                result: Some("pong".to_string()),
-                                error: None,
-                                detached: false,
-                                task_id: None,
-                            };
-                            let _ = write_ipc_frame_async(&mut socket, &resp).await;
-                        }
+                        ClientMessage::Ping => DaemonResponse::ok(Some("pong".to_string())),
                         ClientMessage::TaskStatus { task_id } => {
                             let status = sup.get_task_status(&task_id).await;
                             let status_str = match status {
@@ -445,42 +491,58 @@ pub async fn run_daemon(modules_dir: Option<PathBuf>, config_path: Option<&Path>
                                 Some(TaskStatus::Cancelled) => "cancelled",
                                 None => "not_found",
                             };
-                            let resp = DaemonResponse {
-                                success: status.is_some(),
-                                exit_code: 0,
-                                result: Some(status_str.to_string()),
-                                error: None,
-                                detached: false,
-                                task_id: Some(task_id),
-                            };
-                            let _ = write_ipc_frame_async(&mut socket, &resp).await;
+                            let mut resp = DaemonResponse::ok(Some(status_str.to_string())).with_task(task_id);
+                            resp.success = status.is_some();
+                            resp
                         }
                         ClientMessage::KillTask { task_id } => {
-                            let killed = sup.kill_task(&task_id).await;
-                            let resp = DaemonResponse {
-                                success: killed,
-                                exit_code: if killed { 0 } else { 1 },
-                                result: if killed {
-                                    Some(format!("Задача '{}' остановлена", task_id))
-                                } else {
-                                    None
-                                },
-                                error: if killed {
-                                    None
-                                } else {
-                                    Some(format!("Задача '{}' не найдена", task_id))
-                                },
-                                detached: false,
-                                task_id: Some(task_id),
-                            };
-                            let _ = write_ipc_frame_async(&mut socket, &resp).await;
+                            if sup.kill_task(&task_id).await {
+                                DaemonResponse::ok(Some(format!("Задача '{}' остановлена", task_id)))
+                            } else {
+                                DaemonResponse::err(format!("Задача '{}' не найдена", task_id))
+                            }
+                            .with_task(task_id)
                         }
-                    }
+                    };
+                    let _ = write_ipc_frame_async(&mut socket, &resp).await;
                 });
             }
             Err(e) => {
                 eprintln!("[grime-daemon] Ошибка accept: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_response_constructors() {
+        let ok = DaemonResponse::ok(Some("x".into())).with_task("t1".into()).detached();
+        assert!(ok.success && ok.detached && ok.exit_code == 0);
+        assert_eq!(ok.task_id.as_deref(), Some("t1"));
+        let err = DaemonResponse::err("boom");
+        assert!(!err.success && err.exit_code == 1 && err.error.as_deref() == Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_socket_created_with_private_permissions() {
+        let _td = crate::test_support::TempDir::new("sock_test");
+        let path = _td.join("d.sock");
+        let _listener = bind_private_socket(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_daemon_lock_is_exclusive() {
+        let _td = crate::test_support::TempDir::new("lock_test");
+        let path = _td.join("d.sock");
+        let first = acquire_daemon_lock(&path).expect("первая блокировка");
+        assert!(acquire_daemon_lock(&path).is_err(), "вторая блокировка должна отказать");
+        drop(first);
+        assert!(acquire_daemon_lock(&path).is_ok());
     }
 }

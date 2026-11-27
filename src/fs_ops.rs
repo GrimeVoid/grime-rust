@@ -55,6 +55,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     components.into_iter().collect()
 }
 
+/// Системные каталоги, защищённые целиком вместе с поддеревом.
 pub static SYSTEM_PROTECTED_DIRS: &[&str] = &[
     "/etc",
     "/usr",
@@ -67,7 +68,18 @@ pub static SYSTEM_PROTECTED_DIRS: &[&str] = &[
     "/proc",
     "/dev",
     "/run",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/sbin",
+    "/srv",
+    "/mnt",
+    "/media",
 ];
+
+/// Каталоги, защищённые только как корень (сам каталог), но не его поддерево:
+/// внутри `/home/<user>` и `/tmp/...` работать можно.
+pub static PROTECTED_ROOT_ONLY_DIRS: &[&str] = &["/home", "/tmp"];
 
 /// Проверяет, является ли путь разрешенным подкаталогом/файлом в XDG_RUNTIME_DIR (например `/run/user/<uid>/grime*`)
 fn is_allowed_runtime_path(path: &Path) -> bool {
@@ -91,20 +103,20 @@ fn check_path_against_system_rules(p: &Path) -> bool {
         return true;
     }
 
-    if let Some(home) = get_cached_home_dir() {
-        if p == home {
-            return true;
-        }
-    }
-    if let Some(home_canon) = get_cached_canonical_home() {
-        if p == home_canon {
+    // Сам $HOME и все его предки (например `/home`) защищены; подкаталоги $HOME разрешены
+    for home in [get_cached_home_dir(), get_cached_canonical_home()].into_iter().flatten() {
+        if home.ancestors().any(|anc| p == anc) {
             return true;
         }
     }
 
+    if PROTECTED_ROOT_ONLY_DIRS.iter().any(|d| p == Path::new(d)) {
+        return true;
+    }
+
     for &sys in SYSTEM_PROTECTED_DIRS {
         let sys_path = Path::new(sys);
-        if p == sys_path || p.starts_with(sys_path) {
+        if p.starts_with(sys_path) {
             if sys == "/run" && is_allowed_runtime_path(p) {
                 continue;
             }
@@ -117,6 +129,11 @@ fn check_path_against_system_rules(p: &Path) -> bool {
 
 /// Проверяет, является ли путь системным каталогом, корнем `/` или `$HOME`, удаление которых запрещено.
 pub fn is_system_or_root_path(path: &Path) -> bool {
+    // 0. Пустой путь опасен (трактуется как текущий каталог) и всегда отклоняется
+    if path.as_os_str().is_empty() {
+        return true;
+    }
+
     // 1. Проверяем канонический путь
     if let Ok(canonical) = path.canonicalize() {
         if check_path_against_system_rules(&canonical) {
@@ -136,8 +153,32 @@ pub fn is_system_or_root_path(path: &Path) -> bool {
     check_path_against_system_rules(&normalized)
 }
 
+/// Создание каталога со всеми родителями (`mkdir -p`).
+pub fn mkdir_p(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|e| format!("Ошибка создания каталога '{}': {}", path.display(), e))
+}
+
+/// Запись файла с защитой системных путей; недостающие родительские каталоги создаются.
+pub fn write_file(path: &Path, content: &str) -> Result<(), String> {
+    if is_system_or_root_path(path) {
+        return Err(format!(
+            "Попытка записи в защищенный системный путь: '{}'!",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, content)
+        .map_err(|e| format!("Ошибка записи файла '{}': {}", path.display(), e))
+}
+
 /// Безопасное удаление файла, директории или символической ссылки.
 pub fn delete_safe(path: &Path, missing_ok: bool) -> Result<bool, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Пустой путь: удаление отклонено".to_string());
+    }
     let root_meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => {
@@ -199,6 +240,22 @@ pub fn copy_recursive(src: &Path, dst: &Path) -> Result<PathBuf, String> {
 
     let src_meta = fs::symlink_metadata(src)
         .map_err(|_| format!("Исходный путь не найден: {}", src.display()))?;
+
+    // Копирование каталога в собственный подкаталог привело бы к бесконечной рекурсии
+    if src_meta.is_dir() {
+        let abs = |p: &Path| {
+            p.canonicalize()
+                .unwrap_or_else(|_| normalize_path(&std::env::current_dir().unwrap_or_default().join(p)))
+        };
+        let (src_abs, dst_abs) = (abs(src), abs(dst));
+        if dst_abs.starts_with(&src_abs) {
+            return Err(format!(
+                "Нельзя копировать каталог '{}' в собственный подкаталог '{}'",
+                src.display(),
+                dst.display()
+            ));
+        }
+    }
 
     if src_meta.file_type().is_symlink() {
         let link_target = fs::read_link(src)
@@ -354,8 +411,15 @@ pub fn get_latest_mtime(target: &Path) -> f64 {
         return 0.0;
     }
 
+    // Служебные и сборочные каталоги не влияют на «свежесть» исходников
+    const SKIPPED_DIRS: &[&str] = &[".git", "target", "node_modules", "build"];
     let mut latest: f64 = 0.0;
-    for entry in WalkDir::new(target).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(target).into_iter().filter_entry(|e| {
+        e.depth() == 0
+            || !(e.file_type().is_dir()
+                && e.file_name().to_str().is_some_and(|n| SKIPPED_DIRS.contains(&n)))
+    });
+    for entry in walker.filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
@@ -450,8 +514,7 @@ mod tests {
         assert!(res_usr.unwrap_err().contains("Попытка удаления защищенного системного каталога"));
 
         // Проверка резолва через симлинк на системный каталог
-        let test_dir = std::env::temp_dir().join(format!("grime_sys_protect_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(&test_dir);
+        let test_dir = crate::test_support::TempDir::new("sys_protect_test");
         let link_to_etc = test_dir.join("link_to_etc");
         let _ = std::os::unix::fs::symlink("/etc", &link_to_etc);
 
@@ -465,13 +528,52 @@ mod tests {
         assert!(delete_safe(&normal_dir, false).is_ok());
 
         let _ = fs::remove_file(&link_to_etc);
-        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_home_tmp_roots_and_empty_path_protection() {
+        // Корни и предки $HOME защищены
+        assert!(is_system_or_root_path(Path::new("/home")));
+        assert!(is_system_or_root_path(Path::new("/tmp")));
+        for p in ["/bin", "/lib", "/lib64", "/sbin", "/srv", "/mnt", "/media", "/srv/data"] {
+            assert!(is_system_or_root_path(Path::new(p)), "{}", p);
+        }
+        if let Some(home) = get_cached_home_dir() {
+            for anc in home.ancestors() {
+                assert!(is_system_or_root_path(anc), "{:?}", anc);
+            }
+            // Подкаталоги $HOME разрешены
+            assert!(!is_system_or_root_path(&home.join("Projects/some_project")));
+        }
+        // Подкаталоги /tmp разрешены (временные каталоги тестов)
+        assert!(!is_system_or_root_path(&std::env::temp_dir().join("grime_ok_subdir")));
+
+        // Пустой путь
+        assert!(is_system_or_root_path(Path::new("")));
+        assert!(delete_safe(Path::new(""), true).is_err());
+        assert!(delete_safe(Path::new("/home"), false).is_err());
+    }
+
+    #[test]
+    fn test_copy_into_own_subdir_rejected_and_mtime_skips_build_dirs() {
+        let root = crate::test_support::TempDir::new("copy_self");
+        let src = root.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        let err = copy_recursive(&src, &src.join("sub/copy")).unwrap_err();
+        assert!(err.contains("собственный подкаталог"), "{}", err);
+
+        // target/ игнорируется при расчёте mtime
+        let old = get_latest_mtime(&src);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs::create_dir_all(src.join("target")).unwrap();
+        fs::write(src.join("target/new.bin"), "x").unwrap();
+        assert_eq!(get_latest_mtime(&src), old);
     }
 
     #[test]
     fn test_symlink_deletion_without_modifying_target_permissions() {
-        let test_root = std::env::temp_dir().join(format!("grime_symlink_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(&test_root);
+        let test_root = crate::test_support::TempDir::new("symlink_test");
 
         // 1. Создаем целевой файл с правами readonly (0o444)
         let target_file = test_root.join("target_file.txt");
@@ -521,13 +623,11 @@ mod tests {
         cleanup_perms.set_mode(0o644);
         let _ = fs::set_permissions(&target_file, cleanup_perms);
         let _ = fs::remove_file(&target_file);
-        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[test]
     fn test_move_safe_protection_and_copy_recursive_symlinks() {
-        let test_root = std::env::temp_dir().join(format!("grime_move_copy_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(&test_root);
+        let test_root = crate::test_support::TempDir::new("move_copy_test");
 
         let dummy_src = test_root.join("dummy_src.txt");
         fs::write(&dummy_src, "hello").unwrap();
@@ -552,8 +652,6 @@ mod tests {
         assert!(meta.file_type().is_symlink(), "Скопированный файл должен оставаться симлинком");
         assert_eq!(fs::read_link(&copied_sym).unwrap(), PathBuf::from("real.txt"));
         assert_eq!(fs::read_to_string(&copied_sym).unwrap(), "symlinked content");
-
-        let _ = fs::remove_dir_all(&test_root);
     }
 }
 

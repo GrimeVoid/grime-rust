@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use mlua::{Lua, Value};
@@ -18,6 +19,8 @@ pub struct StateBus {
     data: Arc<RwLock<HashMap<String, JsonValue>>>,
     persistence_path: Option<PathBuf>,
     last_loaded_mtime: Arc<Mutex<Option<SystemTime>>>,
+    /// Счётчик фактических записей на диск (для диагностики и тестов пакетной записи).
+    persist_count: Arc<AtomicUsize>,
 }
 
 impl Default for StateBus {
@@ -28,6 +31,17 @@ impl Default for StateBus {
 
 impl StateBus {
     pub fn new() -> Self {
+        // Тестовые бинарии не должны писать state/.lock в общий /tmp: шина живёт только в памяти,
+        // если путь явно не задан через GRIME_STATE_FILE.
+        let in_test = cfg!(test)
+            || std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.contains("/deps/")))
+                .unwrap_or(false);
+        let explicit = std::env::var("GRIME_STATE_FILE").map(|v| !v.trim().is_empty()).unwrap_or(false);
+        if in_test && !explicit {
+            return Self::with_persistence_path(None);
+        }
         Self::with_persistence_path(Some(Self::default_persistence_path()))
     }
 
@@ -36,6 +50,7 @@ impl StateBus {
             data: Arc::new(RwLock::new(HashMap::new())),
             persistence_path,
             last_loaded_mtime: Arc::new(Mutex::new(None)),
+            persist_count: Arc::new(AtomicUsize::new(0)),
         };
         bus.init_defaults();
         bus.load_persisted();
@@ -48,14 +63,6 @@ impl StateBus {
             if !env_file.trim().is_empty() {
                 return PathBuf::from(env_file);
             }
-        }
-        if cfg!(test)
-            || std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.contains("/deps/")))
-                .unwrap_or(false)
-        {
-            return std::env::temp_dir().join(format!("grime_test_state_{}.json", std::process::id()));
         }
         let home = crate::fs_ops::get_cached_home_dir()
             .map(|p| p.to_path_buf())
@@ -163,12 +170,37 @@ impl StateBus {
         }
     }
 
+    /// Эксклюзивная блокировка `flock` на `<state>.lock` для безопасного read-modify-write
+    /// между несколькими процессами (CLI и демон). Блокировка снимается при закрытии файла.
+    fn lock_file(&self) -> Option<fs::File> {
+        let path = self.persistence_path.as_ref()?;
+        let lock_name = format!(
+            "{}.lock",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("state.json")
+        );
+        let lock_path = path.with_file_name(lock_name);
+        if let Some(parent) = lock_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .ok()?;
+        use std::os::unix::io::AsRawFd;
+        // Блокирующий LOCK_EX: операции записи короткие
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        (rc == 0).then_some(file)
+    }
+
     /// Атомарное сохранение всех персистентных ключей на диск через `.state.json.tmp` и `fs::rename`.
     fn persist_map(&self, map: &HashMap<String, JsonValue>) {
         let Some(ref path) = self.persistence_path else {
             return;
         };
         Self::write_persisted_to_file(path, map);
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) {
             if let Ok(mut guard) = self.last_loaded_mtime.lock() {
                 *guard = Some(mtime);
@@ -195,7 +227,7 @@ impl StateBus {
         );
         let tmp_path = path.with_file_name(tmp_name);
 
-        if let Ok(serialized) = serde_json::to_string_pretty(&JsonValue::Object(persistent_obj)) {
+        if let Ok(serialized) = serde_json::to_string(&JsonValue::Object(persistent_obj)) {
             if fs::write(&tmp_path, serialized).is_ok() {
                 let _ = fs::rename(&tmp_path, path);
             }
@@ -213,16 +245,36 @@ impl StateBus {
 
     /// Сохранить значение по ключу с валидацией пространства имен и автосохранением на диск.
     pub fn set(&self, key: &str, value: JsonValue) -> Result<(), String> {
-        Self::validate_namespace(key)?;
+        self.set_many(vec![(key.to_string(), value)])
+    }
+
+    /// Пакетная запись: все ключи валидируются до записи (при ошибке не пишется ничего),
+    /// затем берётся один `flock` и выполняется один persist на весь набор.
+    pub fn set_many(&self, entries: Vec<(String, JsonValue)>) -> Result<(), String> {
+        for (key, _) in &entries {
+            Self::validate_namespace(key)?;
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let persistent = entries.iter().any(|(k, _)| Self::is_persistent_key(k));
+        let _file_lock = if persistent { self.lock_file() } else { None };
         let mut map = self.data.write().map_err(|e| e.to_string())?;
-        if Self::is_persistent_key(key) {
+        if persistent {
             self.sync_from_disk_if_modified(&mut map);
         }
-        map.insert(key.to_string(), value);
-        if Self::is_persistent_key(key) {
+        for (key, value) in entries {
+            map.insert(key, value);
+        }
+        if persistent {
             self.persist_map(&map);
         }
         Ok(())
+    }
+
+    /// Число выполненных записей состояния на диск (общий счётчик для клонов шины).
+    pub fn persist_count(&self) -> usize {
+        self.persist_count.load(Ordering::Relaxed)
     }
 
     /// Проверить наличие ключа.
@@ -239,6 +291,7 @@ impl StateBus {
 
     /// Удалить значение по ключу.
     pub fn delete(&self, key: &str) -> bool {
+        let _file_lock = if Self::is_persistent_key(key) { self.lock_file() } else { None };
         if let Ok(mut map) = self.data.write() {
             if Self::is_persistent_key(key) {
                 self.sync_from_disk_if_modified(&mut map);
@@ -261,6 +314,7 @@ impl StateBus {
             format!("{}.", prefix)
         };
 
+        let _file_lock = if Self::is_persistent_key(&normalized_prefix) { self.lock_file() } else { None };
         if let Ok(mut map) = self.data.write() {
             if Self::is_persistent_key(&normalized_prefix) {
                 self.sync_from_disk_if_modified(&mut map);
@@ -326,6 +380,7 @@ impl Drop for PipelineSessionGuard {
     }
 }
 
+/// Единый предел глубины рекурсии конвертаций Lua <-> JSON/MsgPack на весь крейт.
 pub const MAX_RECURSION_DEPTH: usize = 64;
 
 /// Проверяет, является ли таблица Lua чистым последовательным массивом `1..=len` без дополнительных ключей.
@@ -481,6 +536,20 @@ pub fn register_state_bus_api(lua: &Lua, bus: Arc<StateBus>) -> Result<(), mlua:
         })?,
     )?;
 
+    let bus_set_many = bus.clone();
+    bus_tbl.set(
+        "set_many",
+        lua.create_function(move |_, tbl: mlua::Table| {
+            let mut entries = Vec::new();
+            for pair in tbl.pairs::<String, Value>() {
+                let (key, val) = pair?;
+                entries.push((key, lua_to_json(val)?));
+            }
+            bus_set_many.set_many(entries).map_err(mlua::Error::runtime)?;
+            Ok(true)
+        })?,
+    )?;
+
     let bus_has = bus.clone();
     bus_tbl.set(
         "has",
@@ -541,7 +610,8 @@ mod tests {
 
     #[test]
     fn test_bus_crud_and_raii() {
-        let tmp_state = std::env::temp_dir().join(format!("grime_state_test_{}.json", std::process::id()));
+        let _td = crate::test_support::TempDir::new("state_test");
+        let tmp_state = _td.join("state.json");
         let bus = Arc::new(StateBus::with_persistence_path(Some(tmp_state.clone())));
         bus.set("pipeline.test_val", json!({"score": 42})).unwrap();
         bus.set("modules.ai.model", json!("gpt-4o")).unwrap();
@@ -563,14 +633,12 @@ mod tests {
         assert!(!bus.has("pipeline.test_val"));
         // modules.* должен остаться
         assert!(bus.has("modules.ai.model"));
-
-        let _ = fs::remove_file(&tmp_state);
     }
 
     #[test]
     fn test_state_bus_persistence_across_instances() {
-        let tmp_state = std::env::temp_dir().join(format!("grime_persist_test_{}.json", std::process::id()));
-        let _ = fs::remove_file(&tmp_state);
+        let _td = crate::test_support::TempDir::new("persist_test");
+        let tmp_state = _td.join("state.json");
 
         {
             let bus1 = StateBus::with_persistence_path(Some(tmp_state.clone()));
@@ -599,8 +667,22 @@ mod tests {
         assert!(bus3.delete("daemon.terminal_dump"));
         let bus4 = StateBus::with_persistence_path(Some(tmp_state.clone()));
         assert!(!bus4.has("daemon.terminal_dump"));
+    }
 
-        let _ = fs::remove_file(&tmp_state);
+    #[test]
+    fn test_state_file_is_compact_and_lock_file_created() {
+        let _td = crate::test_support::TempDir::new("compact_test");
+        let tmp_state = _td.join("state.json");
+        let bus = StateBus::with_persistence_path(Some(tmp_state.clone()));
+        bus.set("log.a", json!({"k": [1, 2, 3]})).unwrap();
+        bus.set("log.b", json!("x")).unwrap();
+
+        let content = fs::read_to_string(&tmp_state).unwrap();
+        assert!(!content.contains('\n'), "JSON должен быть компактным: {}", content);
+        assert!(tmp_state.with_file_name(format!(
+            "{}.lock",
+            tmp_state.file_name().unwrap().to_string_lossy()
+        )).exists());
     }
 
     #[test]
@@ -655,11 +737,8 @@ mod tests {
 
     #[test]
     fn test_state_bus_live_sync_between_two_instances() {
-        let tmp_state = std::env::temp_dir().join(format!(
-            "grime_live_sync_test_{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&tmp_state);
+        let _td = crate::test_support::TempDir::new("live_sync_test");
+        let tmp_state = _td.join("state.json");
 
         let daemon_bus = StateBus::with_persistence_path(Some(tmp_state.clone()));
         let cli_bus = StateBus::with_persistence_path(Some(tmp_state.clone()));
@@ -679,7 +758,54 @@ mod tests {
         daemon_bus.set("session.daemon_second", json!(2)).unwrap();
         assert_eq!(cli_bus.get("session.cli_key"), Some(json!("from_cli")));
         assert_eq!(cli_bus.get("session.daemon_second"), Some(json!(2)));
+    }
 
-        let _ = fs::remove_file(&tmp_state);
+    #[test]
+    fn test_set_many_atomic_on_invalid_key() {
+        let _td = crate::test_support::TempDir::new("set_many_atomic");
+        let tmp = _td.join("state.json");
+        let bus = StateBus::with_persistence_path(Some(tmp.clone()));
+        let before = bus.persist_count();
+        let res = bus.set_many(vec![
+            ("session.ok".to_string(), json!(1)),
+            ("badkey".to_string(), json!(2)),
+        ]);
+        assert!(res.is_err());
+        assert_eq!(bus.get("session.ok"), None);
+        assert_eq!(bus.persist_count(), before);
+    }
+
+    #[test]
+    fn test_set_many_single_persist_and_cross_instance() {
+        let _td = crate::test_support::TempDir::new("set_many_single");
+        let tmp = _td.join("state.json");
+        let a = StateBus::with_persistence_path(Some(tmp.clone()));
+        let b = StateBus::with_persistence_path(Some(tmp.clone()));
+        let before = a.persist_count();
+        a.set_many(vec![
+            ("session.a".to_string(), json!(1)),
+            ("session.b".to_string(), json!(2)),
+            ("session.c".to_string(), json!(3)),
+        ])
+        .unwrap();
+        assert_eq!(a.persist_count(), before + 1);
+        assert_eq!(b.get("session.a"), Some(json!(1)));
+        assert_eq!(b.get("session.c"), Some(json!(3)));
+    }
+
+    #[test]
+    fn test_lua_bus_set_many() {
+        let lua = Lua::new();
+        lua.globals().set("grime", lua.create_table().unwrap()).unwrap();
+        let bus = Arc::new(StateBus::with_persistence_path(None));
+        register_state_bus_api(&lua, bus.clone()).unwrap();
+        let ok: bool = lua
+            .load("return grime.bus.set_many({['pipeline.x']=1, ['pipeline.y']={1,2}})")
+            .eval()
+            .unwrap();
+        assert!(ok);
+        assert_eq!(bus.get("pipeline.x"), Some(json!(1)));
+        assert_eq!(bus.get("pipeline.y"), Some(json!([1, 2])));
+        assert!(lua.load("return grime.bus.set_many({['bad']=1})").eval::<bool>().is_err());
     }
 }

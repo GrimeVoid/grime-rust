@@ -5,7 +5,30 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grime::orchestrator::Orchestrator;
 use grime::payload::PipelinePayload;
-use grime::pipeline::parse_pipeline_args;
+
+/// Изоляция тестов от реального `~/.cache/grime` и `$XDG_RUNTIME_DIR`: кэш и эфемерные ресурсы
+/// процесса тестов уходят во временный корень (явный параметр ядра, без правки окружения).
+fn isolate_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn remove_root() {
+            let _ = fs::remove_dir_all(isolated_root_path());
+        }
+        fn isolated_root_path() -> PathBuf {
+            std::env::temp_dir().join(format!("grime_it_root_{}", std::process::id()))
+        }
+        grime::cache::set_isolated_root(Some(isolated_root_path()));
+        // SAFETY: регистрируется extern "C" функция без аргументов
+        unsafe { libc::atexit(remove_root) };
+    });
+}
+
+/// Единая точка создания оркестратора в тестах (с изоляцией кэша).
+fn new_orch(modules_dir: Option<PathBuf>, config: Option<&Path>) -> Result<Orchestrator, mlua::Error> {
+    isolate_once();
+    Orchestrator::new(modules_dir, config)
+}
 
 // RAII временная директория для тестов без внешних зависимостей
 struct TestTempDir {
@@ -99,8 +122,8 @@ async fn test_stage1_shared_state_bus_and_raii() {
     let tmp = TestTempDir::new("grime_stage1");
     create_test_modules(tmp.path());
 
-    let orch = Orchestrator::new(Some(tmp.path().join("modules")), None).unwrap();
-    let parsed = parse_pipeline_args(&["test_producer".to_string(), ":".to_string(), "test_consumer".to_string()]);
+    let orch = new_orch(Some(tmp.path().join("modules")), None).unwrap();
+    let parsed = orch.parse_args(&["test_producer".to_string(), ":".to_string(), "test_consumer".to_string()]);
 
     // До запуска
     assert!(!orch.state_bus().has("pipeline.counter"));
@@ -137,8 +160,8 @@ async fn test_stage2_cancellation_and_cleanup() {
     let tmp = TestTempDir::new("grime_stage2");
     create_test_modules(tmp.path());
 
-    let orch = Arc::new(Orchestrator::new(Some(tmp.path().join("modules")), None).unwrap());
-    let parsed = parse_pipeline_args(&["test_cancellation".to_string()]);
+    let orch = Arc::new(new_orch(Some(tmp.path().join("modules")), None).unwrap());
+    let parsed = orch.parse_args(&["test_cancellation".to_string()]);
 
     let orch_clone = orch.clone();
     let canceller = orch.canceller().clone();
@@ -199,10 +222,10 @@ async fn test_stage4_event_bus_lifecycle() {
     let tmp = TestTempDir::new("grime_stage4");
     create_test_modules(tmp.path());
 
-    let orch = Orchestrator::new(Some(tmp.path().join("modules")), None).unwrap();
+    let orch = new_orch(Some(tmp.path().join("modules")), None).unwrap();
     let mut rx = orch.event_bus().subscribe();
 
-    let parsed = parse_pipeline_args(&["test_producer".to_string()]);
+    let parsed = orch.parse_args(&["test_producer".to_string()]);
     let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok());
 
@@ -240,11 +263,12 @@ async fn test_stage5_paths_registry_and_lua_context() {
     let mod_dir = tmp.path().join("modules");
     fs::create_dir_all(&mod_dir).unwrap();
 
-    // Копируем helper.lua в тестовую директорию
-    let helper_src = Path::new("modules/helper.lua");
-    if helper_src.exists() {
-        fs::copy(helper_src, mod_dir.join("helper.lua")).unwrap();
-    }
+    // Модуль-поставщик умолчаний именованных путей (ядро само их не знает)
+    fs::write(
+        mod_dir.join("paths_provider.lua"),
+        "--@grime description: Умолчания путей\n--@grime path.apps: ~/.grime_test/apps\n--@grime path.templates: ~/.grime_test/templates\n--@grime path.projects: ~/ProjectsFromAnnotation\nreturn {}\n",
+    )
+    .unwrap();
 
     // Создаем кастомный gproj.conf с произвольными путями
     let conf_path = tmp.path().join("gproj.conf");
@@ -270,10 +294,14 @@ custom_key = /tmp/special_dir
             assert(ctx.paths.custom_assets == "/tmp/assets", "custom_assets path mismatch")
             assert(ctx.paths.custom_key == "/tmp/special_dir", "custom_key path mismatch")
 
-            -- 2. Проверка автоматических дефолтов
-            assert(ctx.paths.apps ~= nil and #ctx.paths.apps > 0, "apps default missing")
-            assert(ctx.paths.templates ~= nil and #ctx.paths.templates > 0, "templates default missing")
+            -- 2. Умолчания из аннотаций path.* и ядра (config)
+            assert(ctx.paths.apps:find("/.grime_test/apps", 1, true), "apps default from annotation missing")
+            assert(ctx.paths.templates:find("/.grime_test/templates", 1, true), "templates default missing")
             assert(ctx.paths.config ~= nil and #ctx.paths.config > 0, "config default missing")
+            assert(ctx.get_path("apps") == ctx.paths.apps)
+            -- конфиг приоритетнее аннотации
+            assert(ctx.get_path("projects") == "/tmp/test_projects")
+            assert(ctx.projects_root == nil, "ctx.projects_root удалён из ядра")
 
             -- 3. Проверка get_path
             assert(ctx.get_path("custom_assets") == "/tmp/assets")
@@ -288,8 +316,8 @@ custom_key = /tmp/special_dir
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), Some(&conf_path)).unwrap();
-    let parsed = parse_pipeline_args(&["test_paths".to_string()]);
+    let orch = new_orch(Some(mod_dir), Some(&conf_path)).unwrap();
+    let parsed = orch.parse_args(&["test_paths".to_string()]);
     let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн с путями упал: {:?}", res);
@@ -302,11 +330,6 @@ async fn test_fuzzy_matching_entities_and_flags() {
     let mod_dir = temp.path().join("modules");
     fs::create_dir_all(&mod_dir).unwrap();
 
-    // Скопируем helper.lua и languages/argparse.lua во временную директорию модулей
-    let repo_modules = Path::new("modules");
-    if repo_modules.join("helper.lua").exists() {
-        fs::copy(repo_modules.join("helper.lua"), mod_dir.join("helper.lua")).unwrap();
-    }
     // Тестовый модуль: test_fuzzy.lua
     fs::write(
         mod_dir.join("test_fuzzy.lua"),
@@ -369,8 +392,8 @@ async fn test_fuzzy_matching_entities_and_flags() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["test_fuzzy".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["test_fuzzy".to_string()]);
     let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн с fuzzy тестами упал: {:?}", res);
@@ -416,8 +439,8 @@ async fn test_no_helper_lua_native_execution() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["native_test".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["native_test".to_string()]);
     let res = orch.run_pipeline(&parsed);
 
     assert!(res.is_ok(), "Пайплайн без helper.lua упал: {:?}", res);
@@ -476,8 +499,8 @@ async fn test_long_pipeline_multistep_chain() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&[
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&[
         "step1".to_string(),
         ":".to_string(),
         "step2".to_string(),
@@ -495,23 +518,26 @@ async fn test_long_pipeline_multistep_chain() {
 
 #[tokio::test]
 async fn test_command_list_and_aliases() {
-    // 1. Проверка алиасов в парсере конвейера
-    let p_list = parse_pipeline_args(&["list".to_string()]);
-    assert_eq!(p_list.steps.len(), 1);
-    assert_eq!(p_list.steps[0].module, "list");
+    // 1. Алиасы берутся из аннотаций модуля, а не из ядра
+    let tmp = TestTempDir::new("grime_aliases");
+    let mod_dir = tmp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+    fs::write(mod_dir.join("list.lua"), "--@grime alias: ls, modules\nfunction main() grime.ctx.success('listed') end\n").unwrap();
+    let orch = new_orch(Some(mod_dir), None).unwrap();
 
-    let p_ls = parse_pipeline_args(&["ls".to_string()]);
-    assert_eq!(p_ls.steps.len(), 1);
-    assert_eq!(p_ls.steps[0].module, "list");
+    for alias in ["list", "ls", "modules"] {
+        let p = orch.parse_args(&[alias.to_string()]);
+        assert_eq!(p.steps.len(), 1);
+        assert_eq!(p.steps[0].module, "list", "алиас {}", alias);
+    }
+    let res = orch.run_pipeline(&orch.parse_args(&["ls".to_string()]));
+    assert_eq!(res.unwrap().as_deref(), Some("listed"));
 
-    let p_modules = parse_pipeline_args(&["modules".to_string()]);
-    assert_eq!(p_modules.steps.len(), 1);
-    assert_eq!(p_modules.steps[0].module, "list");
-
-    // 2. Исполнение модуля list.lua в локальной директории modules (если модуль присутствует)
+    // 2. Исполнение реального модуля list.lua из репозитория (если присутствует)
     let local_mods = PathBuf::from("modules");
     if local_mods.join("list.lua").exists() {
-        let orch = Orchestrator::new(Some(local_mods), None).unwrap();
+        let orch = new_orch(Some(local_mods), None).unwrap();
+        let p_list = orch.parse_args(&["list".to_string()]);
         let res = orch.run_pipeline(&p_list);
         assert!(res.is_ok(), "Выполнение grime list завершилось ошибкой: {:?}", res);
         let ret = res.unwrap().unwrap();
@@ -556,8 +582,8 @@ async fn test_pipeline_table_to_json_serialization() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["producer_tbl".to_string(), ":".to_string(), "consumer_tbl".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["producer_tbl".to_string(), ":".to_string(), "consumer_tbl".to_string()]);
     let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Пайплайн упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "verified:apple");
@@ -590,17 +616,17 @@ async fn test_pipeline_stop_on_error_and_return_false() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir.clone()), None).unwrap();
+    let orch = new_orch(Some(mod_dir.clone()), None).unwrap();
     orch.state_bus().delete("modules.never.ran");
 
     // 1. Без force: конвейер останавливается на fail_step, never_step не выполняется
-    let parsed_no_force = parse_pipeline_args(&["fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
+    let parsed_no_force = orch.parse_args(&["fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
     let res = orch.run_pipeline(&parsed_no_force);
     assert!(res.is_err(), "Конвейер должен был вернуть ошибку без --force");
     assert!(!orch.state_bus().has("modules.never.ran"), "never_step не должен был запускаться!");
 
     // 2. С force: конвейер продолжает выполнение
-    let parsed_force = parse_pipeline_args(&["--force".to_string(), "fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
+    let parsed_force = orch.parse_args(&["--force".to_string(), "fail_step".to_string(), ":".to_string(), "never_step".to_string()]);
     assert!(parsed_force.force);
     let res_force = orch.run_pipeline(&parsed_force);
     assert!(res_force.is_ok(), "Конвейер с --force должен был продолжить работу");
@@ -639,8 +665,8 @@ async fn test_pipeline_input_special_characters_and_multiline() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["producer_multiline".to_string(), ":".to_string(), "consumer_multiline".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["producer_multiline".to_string(), ":".to_string(), "consumer_multiline".to_string()]);
     let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Многострочный пайплайн упал: {:?}", res);
     assert_eq!(res.unwrap().unwrap(), "multiline_verified");
@@ -655,10 +681,10 @@ async fn test_project_overwrite_protection() {
 
     let local_mods = PathBuf::from("modules");
     if local_mods.exists() {
-        let orch = Orchestrator::new(Some(local_mods), None).unwrap();
+        let orch = new_orch(Some(local_mods), None).unwrap();
 
         // 1. Попытка создания без --force в существующей непустой директории должна вернуть ошибку
-        let parsed_no_force = parse_pipeline_args(&[
+        let parsed_no_force = orch.parse_args(&[
             "project".to_string(),
             "-init".to_string(),
             "-cpp".to_string(),
@@ -674,7 +700,7 @@ async fn test_project_overwrite_protection() {
         assert_eq!(content, "DO NOT OVERWRITE ME!");
 
         // 2. С флагом --force инициализация проходит успешно
-        let parsed_force = parse_pipeline_args(&[
+        let parsed_force = orch.parse_args(&[
             "--force".to_string(),
             "project".to_string(),
             "-init".to_string(),
@@ -715,8 +741,8 @@ async fn test_module_returning_table_with_functions_not_leaked_as_json() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["ui_module".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["ui_module".to_string()]);
     let res = orch.run_pipeline(&parsed);
     assert!(res.is_ok(), "Выполнение ui_module упало: {:?}", res);
     let output = res.unwrap();
@@ -779,8 +805,8 @@ async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir.clone()), None).unwrap();
-    let parsed = parse_pipeline_args(&[
+    let orch = new_orch(Some(mod_dir.clone()), None).unwrap();
+    let parsed = orch.parse_args(&[
         "-p".to_string(),
         temp.path().to_string_lossy().to_string(),
         "step_one".to_string(),
@@ -825,7 +851,7 @@ async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
     )
     .unwrap();
 
-    let parsed_explicit = parse_pipeline_args(&[
+    let parsed_explicit = orch.parse_args(&[
         "step_explicit_dir".to_string(),
         ":".to_string(),
         "step_check_explicit".to_string(),
@@ -835,44 +861,51 @@ async fn test_stage3_optimizations_and_target_dir_and_cleanup_lifo() {
     assert_eq!(res_explicit.unwrap().unwrap(), "explicit_verified");
 }
 
-#[tokio::test]
-async fn test_box_host_environment_boundary_orchestration() {
-    let temp = TestTempDir::new("grime_box_host_boundary");
-    let mod_dir = temp.path().join("modules");
-    fs::create_dir_all(&mod_dir).unwrap();
-
-    // Мок модуля box.lua, фиксирующий вызов `box -run <name> -- grime -p <target_dir> ...`
+/// Модули-моки универсального переключения сред: `box` (wraps: pipeline) и `host` (boundary).
+fn write_env_switch_mocks(mod_dir: &Path) {
+    // Хук собирает команду `-run <имя> -- grime -p <dir> ...`; `here` — «уже в нужной среде»
     fs::write(
         mod_dir.join("box.lua"),
-        r#"
-        function main()
-            local args = grime.ctx.args or {}
-            assert(args[1] == "-run" or args[1] == "run", "Expected action -run, got: " .. tostring(args[1]))
-            assert(args[2] == "arch", "Expected box name arch, got: " .. tostring(args[2]))
-            assert(args[3] == "--", "Expected '--'")
-            assert(args[4] == "grime", "Expected 'grime'")
-            assert(args[5] == "-p", "Expected '-p' target_dir forwarding")
-            local joined = table.concat(args, "|")
-            assert(joined:find("pkg|install|%-n|fzf|:|cmd|echo|hello world"), "Subpipeline mismatch: " .. joined)
-            grime.ctx.success("from_box:" .. args[2])
-        end
-        "#,
+        r#"--@grime description: Мок контейнера
+--@grime wraps: pipeline
+local M = {}
+
+function M.wrap_pipeline(args, rest_argv)
+    if args[1] == "here" then return { skip = true } end
+    if args[1] == "oneshot" then return nil end
+    local out = { "-run", args[1], "--" }
+    for _, a in ipairs(rest_argv) do out[#out + 1] = a end
+    return { args = out }
+end
+
+function M.main()
+    local args = grime.ctx.args or {}
+    if args[1] == "oneshot" then grime.ctx.success("box_oneshot") return end
+    if args[1] == "here" then grime.ctx.success("box_here_main") return end
+    assert(args[1] == "-run", "Expected action -run, got: " .. tostring(args[1]))
+    assert(args[2] == "arch", "Expected box name arch, got: " .. tostring(args[2]))
+    assert(args[3] == "--", "Expected '--'")
+    assert(args[4] == "grime", "Expected 'grime'")
+    assert(args[5] == "-p", "Expected '-p' target_dir forwarding")
+    local joined = table.concat(args, "|")
+    assert(joined:find("pkg|install|%-n|fzf|:|cmd|echo|hello world", 1), "Subpipeline mismatch: " .. joined)
+    assert(not joined:find("host", 1, true), "boundary не должен попадать в подконвейер: " .. joined)
+    grime.ctx.success("from_box:" .. args[2])
+end
+
+return M
+"#,
     )
     .unwrap();
 
-    // Мок модуля host.lua
+    // Рубеж: поглощается хуком (шаг host не исполняется)
     fs::write(
         mod_dir.join("host.lua"),
-        r#"
-        function main()
-            local inp = grime.ctx.input or ""
-            grime.ctx.success(inp .. "->on_host")
-        end
-        "#,
+        "--@grime alias: exit-env, unhost, host-env\n--@grime boundary: true\nfunction main() grime.ctx.success((grime.ctx.input or '') .. '->on_host') end\n",
     )
     .unwrap();
 
-    // Мок модуля git.lua (должен выполниться уже на хосте после `: host :`)
+    // Шаг на хосте после рубежа
     fs::write(
         mod_dir.join("git.lua"),
         r#"
@@ -885,32 +918,84 @@ async fn test_box_host_environment_boundary_orchestration() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let raw_args: Vec<String> = vec![
-        "box",
-        "arch",
-        ":",
-        "pkg",
-        "install",
-        "-n",
-        "fzf",
-        ":",
-        "cmd",
-        "echo",
-        "hello world",
-        ":",
-        "host",
-        ":",
-        "git",
-        "status",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    // Шаги подконвейера, не обязанные выполняться на хосте
+    for name in ["pkg", "cmd"] {
+        fs::write(
+            mod_dir.join(format!("{}.lua", name)),
+            format!("function main() grime.bus.set('modules.envmock.ran_{}', true) grime.ctx.success('{}') end\n", name, name),
+        )
+        .unwrap();
+    }
+}
 
-    let parsed = parse_pipeline_args(&raw_args);
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[tokio::test]
+async fn test_box_host_environment_boundary_orchestration() {
+    let temp = TestTempDir::new("grime_box_host_boundary");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+    write_env_switch_mocks(&mod_dir);
+
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    orch.state_bus().delete("modules.envmock.ran_pkg");
+    orch.state_bus().delete("modules.envmock.ran_cmd");
+    let parsed = orch.parse_args(&strs(&[
+        "box", "arch", ":", "pkg", "install", "-n", "fzf", ":", "cmd", "echo", "hello world", ":",
+        "exit-env", ":", "git", "status",
+    ]));
+    // Алиас exit-env разрешается в host из аннотации
+    assert_eq!(parsed.steps[3].module, "host");
+
     let res = orch.run_pipeline(&parsed).expect("run_pipeline box->host");
     assert_eq!(res.as_deref(), Some("from_box:arch->git_status"));
+    // pkg/cmd поглощены хуком и на «хосте» не выполнялись
+    assert!(!orch.state_bus().has("modules.envmock.ran_pkg"));
+    assert!(!orch.state_bus().has("modules.envmock.ran_cmd"));
+}
+
+#[tokio::test]
+async fn test_wrap_hook_skip_nil_and_no_following_steps() {
+    let temp = TestTempDir::new("grime_wrap_skip");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+    write_env_switch_mocks(&mod_dir);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+
+    // skip: уже в нужной среде — шаг box пропущен, последующие шаги идут обычным циклом
+    let parsed = orch.parse_args(&strs(&["box", "here", ":", "cmd", "x"]));
+    let res = orch.run_pipeline(&parsed).unwrap();
+    assert_eq!(res.as_deref(), Some("cmd"));
+    assert!(orch.state_bus().has("modules.envmock.ran_cmd"));
+    orch.state_bus().delete("modules.envmock.ran_cmd");
+
+    // nil: шаг выполняется как обычно, подконвейер не поглощается
+    let parsed = orch.parse_args(&strs(&["box", "oneshot", ":", "cmd", "x"]));
+    let res = orch.run_pipeline(&parsed).unwrap();
+    assert_eq!(res.as_deref(), Some("cmd"));
+    assert!(orch.state_bus().has("modules.envmock.ran_cmd"));
+    orch.state_bus().delete("modules.envmock.ran_cmd");
+
+    // Нет следующих шагов: хук не вызывается, main выполняется с исходными аргументами
+    let parsed = orch.parse_args(&strs(&["box", "here"]));
+    let res = orch.run_pipeline(&parsed).unwrap();
+    assert_eq!(res.as_deref(), Some("box_here_main"));
+}
+
+#[tokio::test]
+async fn test_wrap_hook_without_boundary_swallows_until_end() {
+    let temp = TestTempDir::new("grime_wrap_to_end");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+    write_env_switch_mocks(&mod_dir);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+
+    let parsed = orch.parse_args(&strs(&["box", "arch", ":", "pkg", "install", "-n", "fzf", ":", "cmd", "echo", "hello world"]));
+    let res = orch.run_pipeline(&parsed).unwrap();
+    assert_eq!(res.as_deref(), Some("from_box:arch"));
+    assert!(!orch.state_bus().has("modules.envmock.ran_pkg"));
 }
 
 #[tokio::test]
@@ -930,8 +1015,8 @@ async fn test_single_source_of_error_and_root_cause_preservation() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["test_cascading_err".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["test_cascading_err".to_string()]);
     let res = orch.run_pipeline(&parsed);
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -951,10 +1036,10 @@ async fn test_single_source_of_error_and_root_cause_preservation() {
 async fn test_universal_dash_flags_standard() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let real_modules = repo_root.join("modules");
-    let orch = Orchestrator::new(Some(real_modules), None).unwrap();
+    let orch = new_orch(Some(real_modules), None).unwrap();
 
     // Проверка bus в едином конвейере с флагами со знаком минус (-set : --get)
-    let p_pipe = parse_pipeline_args(&[
+    let p_pipe = orch.parse_args(&[
         "bus".to_string(),
         "-set".to_string(),
         "pipeline.dash_test".to_string(),
@@ -968,7 +1053,7 @@ async fn test_universal_dash_flags_standard() {
     assert_eq!(res_pipe.as_deref(), Some("ok_dash"));
 
     // Проверка list с флагом -modules
-    let p_list = parse_pipeline_args(&["list".to_string(), "-modules".to_string()]);
+    let p_list = orch.parse_args(&["list".to_string(), "-modules".to_string()]);
     let res_list = orch.run_pipeline(&p_list);
     assert!(res_list.is_ok(), "grime list -modules должен отрабатывать успешно");
 }
@@ -1035,8 +1120,8 @@ async fn test_native_args_engine_in_lua() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["test_args".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["test_args".to_string()]);
     let res = orch.run_pipeline(&parsed).expect("test_args pipeline run");
     assert_eq!(res.as_deref(), Some("native_args_ok"));
 }
@@ -1099,8 +1184,8 @@ async fn test_stage8_strict_dash_and_path_flag() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let parsed = parse_pipeline_args(&["test_strict".to_string()]);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&["test_strict".to_string()]);
     let res = orch.run_pipeline(&parsed).expect("test_strict pipeline run");
     assert_eq!(res.as_deref(), Some("strict_dash_ok"));
 }
@@ -1111,26 +1196,36 @@ async fn test_nix_host_environment_boundary_orchestration() {
     let mod_dir = temp.path().join("modules");
     fs::create_dir_all(&mod_dir).unwrap();
 
-    // Мок модуля nix.lua, фиксирующий вызов `nix -run -- grime -p <target_dir> ...`
+    // Мок nix.lua с хуком: вызов `nix -run -- grime -p <target_dir> ...` без имени среды
     fs::write(
         mod_dir.join("nix.lua"),
-        r#"
-        function main()
-            local args = grime.ctx.args or {}
-            assert(args[1] == "-run", "Expected action -run, got: " .. tostring(args[1]))
-            assert(args[2] == "--", "Expected '--'")
-            assert(args[3] == "grime", "Expected 'grime'")
-            assert(args[4] == "-p", "Expected '-p' target_dir forwarding")
-            assert(grime.ctx.has_next_step == true, "nix step must see has_next_step == true before host step")
-            local joined = table.concat(args, "|")
-            assert(joined:find("project|%-build|:|cmd|cargo|test"), "Subpipeline mismatch: " .. joined)
-            grime.ctx.success("from_nix_devshell")
-        end
-        "#,
+        r#"--@grime wraps: pipeline
+local M = {}
+function M.wrap_pipeline(args, rest)
+    if #args > 0 then return nil end
+    local out = { "-run", "--" }
+    for _, a in ipairs(rest) do out[#out + 1] = a end
+    return { args = out }
+end
+function M.main()
+    local args = grime.ctx.args or {}
+    assert(args[1] == "-run", "Expected action -run, got: " .. tostring(args[1]))
+    assert(args[2] == "--", "Expected '--'")
+    assert(args[3] == "grime", "Expected 'grime'")
+    assert(args[4] == "-p", "Expected '-p' target_dir forwarding")
+    assert(grime.ctx.has_next_step == true, "nix step must see has_next_step == true before host step")
+    local joined = table.concat(args, "|")
+    assert(joined:find("project|%-build|:|cmd|cargo|test"), "Subpipeline mismatch: " .. joined)
+    grime.ctx.success("from_nix_devshell")
+end
+return M
+"#,
     )
     .unwrap();
 
-    // Мок модуля git.lua (должен выполниться уже на хосте после `: host :` как последний шаг)
+    fs::write(mod_dir.join("host.lua"), "--@grime boundary: true\nfunction main() end\n").unwrap();
+
+    // Мок git.lua (должен выполниться уже на хосте после `: host :` как последний шаг)
     fs::write(
         mod_dir.join("git.lua"),
         r#"
@@ -1145,30 +1240,186 @@ async fn test_nix_host_environment_boundary_orchestration() {
     )
     .unwrap();
 
-    let orch = Orchestrator::new(Some(mod_dir), None).unwrap();
-    let raw_args: Vec<String> = vec![
-        "nix",
-        ":",
-        "project",
-        "-build",
-        ":",
-        "cmd",
-        "cargo",
-        "test",
-        ":",
-        "host",
-        ":",
-        "git",
-        "-status",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-
-    let parsed = parse_pipeline_args(&raw_args);
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    let parsed = orch.parse_args(&strs(&[
+        "nix", ":", "project", "-build", ":", "cmd", "cargo", "test", ":", "host", ":", "git", "-status",
+    ]));
     let res = orch.run_pipeline(&parsed).expect("run_pipeline nix->host");
     assert_eq!(res.as_deref(), Some("from_nix_devshell->host_git_-status"));
 }
 
+#[tokio::test]
+async fn test_force_failure_reports_unsuccessful_finish_and_success_cleanup_lifo() {
+    let temp = TestTempDir::new("grime_finish_cleanup");
+    let mod_dir = temp.path().join("modules");
+    fs::create_dir_all(&mod_dir).unwrap();
+    fs::write(mod_dir.join("bad.lua"), "function main() return false end\n").unwrap();
+    for n in ["first", "second"] {
+        fs::write(
+            mod_dir.join(format!("{}.lua", n)),
+            format!(
+                "function cleanup()\n  local l = grime.bus.get('modules.order.list') or {{}}\n  l[#l+1] = '{n}'\n  grime.bus.set('modules.order.list', l)\nend\nfunction main() grime.ctx.success('{n}') end\n",
+                n = n
+            ),
+        )
+        .unwrap();
+    }
+    let orch = new_orch(Some(mod_dir), None).unwrap();
+    orch.state_bus().delete("modules.order.list");
 
+    // 1. Успешный конвейер: cleanup вызывается в порядке LIFO
+    let mut rx = orch.event_bus().subscribe();
+    let ok = orch.parse_args(&strs(&["first", ":", "second"]));
+    orch.run_pipeline(&ok).unwrap();
+    assert_eq!(orch.state_bus().get("modules.order.list"), Some(serde_json::json!(["second", "first"])));
+    let mut finish_ok = None;
+    while let Ok(ev) = rx.try_recv() {
+        assert_eq!(ev.session_id.as_deref(), Some(orch.session_id()));
+        if ev.name == "pipeline.finish" {
+            finish_ok = Some(ev.payload["success"].clone());
+        }
+    }
+    assert_eq!(finish_ok, Some(serde_json::json!(true)));
 
+    // 2. С -f после ошибочного шага pipeline.finish не рапортует success: true
+    let forced = orch.parse_args(&strs(&["-f", "bad", ":", "second"]));
+    assert!(orch.run_pipeline(&forced).is_ok());
+    let mut finish = None;
+    let mut failed_seen = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev.name.as_str() {
+            "pipeline.finish" => finish = Some(ev.payload["success"].clone()),
+            "pipeline.failed" => failed_seen = true,
+            _ => {}
+        }
+    }
+    assert!(failed_seen);
+    assert_eq!(finish, Some(serde_json::json!(false)));
+}
+
+// ---------------------------------------------------------------------------
+// requires: граф зависимостей и pre-flight
+// ---------------------------------------------------------------------------
+
+fn write_mods(tmp: &TestTempDir, files: &[(&str, &str)]) -> PathBuf {
+    let dir = tmp.path().join("modules");
+    fs::create_dir_all(&dir).unwrap();
+    for (n, body) in files {
+        fs::write(dir.join(format!("{n}.lua")), body).unwrap();
+    }
+    dir
+}
+
+fn args(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+const OK_BODY: &str = "function main() grime.ctx.success('ok') end\n";
+
+#[test]
+fn test_requires_missing_module_and_bin_reported_together_before_first_step() {
+    let tmp = TestTempDir::new("grime_req_missing");
+    let marker = tmp.path().join("ran");
+    let first = format!("function main() io.open('{}', 'w'):close() grime.ctx.success('first') end\n", marker.display());
+    let dir = write_mods(
+        &tmp,
+        &[
+            ("first", &first),
+            (
+                "needy",
+                &format!("--@grime requires: module:nope, bin:grime-no-such-bin-xyz\n{OK_BODY}"),
+            ),
+        ],
+    );
+    let orch = new_orch(Some(dir), None).unwrap();
+    let err = orch.run_pipeline(&orch.parse_args(&args(&["first", ":", "needy"]))).unwrap_err();
+    assert!(err.contains("'nope'") && err.contains("grime-no-such-bin-xyz"), "{err}");
+    assert!(!marker.exists(), "первый шаг не должен выполняться при провале pre-flight");
+
+    // С -f — предупреждения и продолжение
+    let res = orch.run_pipeline(&orch.parse_args(&args(&["-f", "first", ":", "needy"])));
+    assert!(res.is_ok(), "{res:?}");
+    assert!(marker.exists());
+}
+
+#[test]
+fn test_requires_cycle_transitive_and_optional() {
+    let tmp = TestTempDir::new("grime_req_cycle");
+    let dir = write_mods(
+        &tmp,
+        &[
+            ("ca", &format!("--@grime requires: module:cb\n{OK_BODY}")),
+            ("cb", &format!("--@grime requires: module:ca\n{OK_BODY}")),
+            ("ta", &format!("--@grime requires: module:tb\n{OK_BODY}")),
+            ("tb", &format!("--@grime requires: module:tc\n{OK_BODY}")),
+            ("tc", &format!("--@grime requires: bin:sh, module:nothing?, nix:hello\n{OK_BODY}")),
+            ("tz", &format!("--@grime requires: module:tm\n{OK_BODY}")),
+            ("deps", "function main() local d = grime.modules.deps('ta'); local r = grime.modules.get('tc').requires; grime.ctx.success(table.concat(d, ',') .. '|' .. #r .. r[3].kind .. r[3].name .. tostring(r[2].optional)) end\n"),
+        ],
+    );
+    let orch = new_orch(Some(dir), None).unwrap();
+    let err = orch.run_pipeline(&orch.parse_args(&args(&["ca"]))).unwrap_err();
+    assert!(err.contains("цикл зависимостей: ca → cb → ca"), "{err}");
+
+    // Транзитивность + необязательный отсутствующий модуль + nix: не ломают запуск
+    assert!(orch.run_pipeline(&orch.parse_args(&args(&["ta"]))).is_ok());
+    // Транзитивно отсутствующий (tz -> tm): ошибка с подсказкой
+    let err = orch.run_pipeline(&orch.parse_args(&args(&["tz"]))).unwrap_err();
+    assert!(err.contains("'tm'"), "{err}");
+
+    let out = orch.run_pipeline(&orch.parse_args(&args(&["deps"]))).unwrap();
+    assert_eq!(out.as_deref(), Some("tc,tb,ta|3nixhellotrue"));
+}
+
+// ---------------------------------------------------------------------------
+// ephemeral: очистка в конце конвейера
+// ---------------------------------------------------------------------------
+
+fn eph_module(tail: &str) -> String {
+    format!(
+        "function main()\n local d = grime.ephemeral.dir('w')\n local f = grime.ephemeral.file('data', '.txt')\n grime.bus.set('modules.eph.paths', d .. '\\n' .. f)\n {tail}\nend\n"
+    )
+}
+
+fn eph_paths(orch: &Orchestrator) -> (PathBuf, PathBuf) {
+    let v = orch.state_bus().get("modules.eph.paths").unwrap();
+    let s = v.as_str().unwrap().to_string();
+    let (d, f) = s.split_once('\n').unwrap();
+    (PathBuf::from(d), PathBuf::from(f))
+}
+
+#[test]
+fn test_ephemeral_removed_after_success_error_and_cancel() {
+    let tmp = TestTempDir::new("grime_eph");
+    let dir = write_mods(
+        &tmp,
+        &[
+            ("ok", &eph_module("grime.ctx.success('x')")),
+            ("boom", &eph_module("error('boom')")),
+            ("spin", &eph_module("grime.events.emit('spin.ready', {}) local i = 0 while true do i = i + 1 end")),
+        ],
+    );
+    let orch = new_orch(Some(dir), None).unwrap();
+
+    orch.run_pipeline(&orch.parse_args(&args(&["ok"]))).unwrap();
+    let (d, f) = eph_paths(&orch);
+    assert!(!d.exists() && !f.exists(), "успех: {d:?}");
+
+    assert!(orch.run_pipeline(&orch.parse_args(&args(&["boom"]))).is_err());
+    let (d, f) = eph_paths(&orch);
+    assert!(!d.exists() && !f.exists(), "ошибка: {d:?}");
+
+    let canceller = orch.canceller().clone();
+    let mut rx = orch.event_bus().subscribe();
+    std::thread::spawn(move || {
+        while let Ok(ev) = rx.blocking_recv() {
+            if ev.name == "spin.ready" {
+                canceller.cancel("тест");
+                break;
+            }
+        }
+    });
+    assert!(orch.run_pipeline(&orch.parse_args(&args(&["spin"]))).is_err());
+    let (d, f) = eph_paths(&orch);
+    assert!(!d.exists() && !f.exists(), "отмена: {d:?}");
+}

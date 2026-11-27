@@ -14,110 +14,20 @@ pub struct ParsedPipeline {
     pub detach: bool,
 }
 
-pub const HOST_ALIASES: &[&str] = &["host", "exit-env", "unhost", "host-env"];
-
 const PATH_FLAGS: &[&str] = &["-p", "-path", "--path"];
 const ARG_FLAGS: &[&str] = &["--args", "-arg"];
 const MOD_FLAGS: &[&str] = &["-mod", "--mod"];
 const SEPARATORS: &[&str] = &[":", "|"];
 use crate::args_engine::is_passthrough_separator;
+use crate::modules::ModuleRegistry;
 
-const BUILTIN_MODULE_NAMES: &[&str] = &[
-    "exec", "proj", "ls", "modules", "project", "pkg", "app", "box", "nix", "ai", "cmd",
-    "host", "list", "doctor", "bus", "daemon", "git", "log",
-];
-
-/// Динамическое сканирование директорий модулей Grime на диске
-pub fn discover_available_modules(config: &crate::config::GrimeConfig) -> Vec<String> {
-    let mut modules = Vec::new();
-    for dir in config.candidate_module_dirs() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let name = stem.to_string();
-                        if !modules.contains(&name) {
-                            modules.push(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    modules.sort();
-    modules
-}
-
-static MODULES_CACHE: std::sync::RwLock<Option<Vec<String>>> = std::sync::RwLock::new(None);
-
-/// Сбрасывает кэш доступных модулей (вызывается при Hot-Reload в демоне или смене директории модулей).
-pub fn invalidate_modules_cache() {
-    if let Ok(mut guard) = MODULES_CACHE.write() {
-        *guard = None;
-    }
-}
-
-pub fn cached_available_modules() -> Vec<String> {
-    if let Ok(guard) = MODULES_CACHE.read() {
-        if let Some(ref list) = *guard {
-            return list.clone();
-        }
-    }
-    let config = crate::config::GrimeConfig::load_or_default(None);
-    let discovered = discover_available_modules(&config);
-    if let Ok(mut guard) = MODULES_CACHE.write() {
-        *guard = Some(discovered.clone());
-    }
-    discovered
-}
-
-/// Проверяет, является ли токен известным именем (или алиасом) модуля Grime
-pub fn is_known_module(name: &str) -> bool {
-    if name.is_empty() || name.starts_with('-') {
-        return false;
-    }
-    let lower = name.to_lowercase();
-    if BUILTIN_MODULE_NAMES.contains(&lower.as_str()) || HOST_ALIASES.contains(&lower.as_str()) {
-        return true;
-    }
-    let available = cached_available_modules();
-    available.iter().any(|s| s == &lower)
-}
-
-pub fn canonical_module_name(name: &str) -> String {
-    let lower = name.to_lowercase();
-    let alias_resolved = match lower.as_str() {
-        "exec" => "cmd".to_string(),
-        "proj" => "project".to_string(),
-        "ls" | "modules" => "list".to_string(),
-        h if HOST_ALIASES.contains(&h) => "host".to_string(),
-        _ => lower,
-    };
-
-    let available = cached_available_modules();
-    if available.iter().any(|s| s == &alias_resolved) {
-        return alias_resolved;
-    }
-
-    let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
-    if let Some(matched) = crate::args::fuzzy_match_entity(&alias_resolved, &available_refs, 0.75) {
-        return matched.to_string();
-    }
-
-    alias_resolved
-}
-
-pub fn is_host_step(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    HOST_ALIASES.contains(&lower.as_str())
-}
-
-/// Проверяет наличие глобального флага (например `--help`/`-h` или `--version`/`-v`)
-/// исключительно в преамбуле команды (до первого имени модуля).
-pub fn has_preamble_flag(raw_args: &[String], targets: &[&str]) -> bool {
+/// Сканирует преамбулу команды (глобальные флаги ядра и начальный путь до первого имени модуля).
+/// Возвращает `(найден ли один из `targets`, индекс первого токена после преамбулы)`.
+/// Реестр модулей не нужен: преамбула распознаётся только по флагам и пути.
+fn scan_preamble(raw_args: &[String], targets: &[&str]) -> (bool, usize) {
     let mut idx = 0;
     let mut seen_work_path = false;
+    let mut found = false;
 
     while idx < raw_args.len() {
         let tok = &raw_args[idx];
@@ -127,7 +37,7 @@ pub fn has_preamble_flag(raw_args: &[String], targets: &[&str]) -> bool {
         if tok.starts_with('-') {
             let norm = crate::args::normalize_flag(tok, crate::args::GLOBAL_GRIME_FLAGS);
             if targets.contains(&norm) {
-                return true;
+                found = true;
             }
             if PATH_FLAGS.contains(&norm) {
                 idx += 2;
@@ -159,10 +69,22 @@ pub fn has_preamble_flag(raw_args: &[String], targets: &[&str]) -> bool {
         }
         break;
     }
-    false
+    (found, idx)
 }
 
-pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
+/// Проверяет наличие глобального флага (например `--help`/`-h` или `--version`/`-v`)
+/// исключительно в преамбуле команды (до первого имени модуля).
+pub fn has_preamble_flag(raw_args: &[String], targets: &[&str]) -> bool {
+    scan_preamble(raw_args, targets).0
+}
+
+/// Вся команда состоит только из преамбулы (шагов конвейера нет), то есть реестр модулей
+/// для разбора не нужен. Быстрый путь для `--version` / `--help` без аргументов-модулей.
+pub fn is_preamble_only(raw_args: &[String]) -> bool {
+    scan_preamble(raw_args, &[]).1 >= raw_args.len()
+}
+
+pub fn parse_pipeline_args(raw_args: &[String], registry: &ModuleRegistry) -> ParsedPipeline {
     let mut force = false;
     let mut detach = false;
     let mut work_path: Option<PathBuf> = None;
@@ -256,11 +178,13 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
         if let Some(arg_idx) = filtered.iter().position(|t| ARG_FLAGS.contains(&t.as_str())) {
             let modules: Vec<String> = filtered[..arg_idx]
                 .iter()
-                .map(|t| canonical_module_name(t))
+                .map(|t| registry.canonical_name(t))
                 .collect();
             let args_part: Vec<String> = filtered[arg_idx + 1..].to_vec();
+            // Модуль по умолчанию задаётся аннотацией `--@grime default: true`;
+            // если ни один не помечен, шагов нет (вызывающий код сообщит об ошибке).
             let target_modules = if modules.is_empty() {
-                vec!["project".to_string()]
+                registry.default_module().into_iter().collect()
             } else {
                 modules
             };
@@ -295,9 +219,10 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             pos += 1;
         }
 
-        let mod_name = canonical_module_name(&tokens[pos]);
+        let mod_name = registry.canonical_name(&tokens[pos]);
         pos += 1;
 
+        let chain_passthrough = registry.get(&mod_name).is_some_and(|m| m.chain_passthrough());
         let mut mod_args: Vec<String> = Vec::new();
         let mut after_flag_sep = false;
 
@@ -319,12 +244,12 @@ pub fn parse_pipeline_args(raw_args: &[String]) -> ParsedPipeline {
             }
 
             if SEPARATORS.contains(&tok.as_str()) {
-                // Если в `grime app App1 : App2` токен после `:` не является существующим модулем Grime,
-                // передаём `:` и `App2` в аргументы текущего шага `app`.
-                if mod_name == "app" && tok == ":" && pos + 1 < tokens.len() {
+                // Для модулей с аннотацией `chain: passthrough` (например `grime app App1 : App2`)
+                // токен после `:`, не являющийся существующим модулем Grime, остаётся аргументом шага.
+                if tok == ":" && pos + 1 < tokens.len() && chain_passthrough {
                     let next_tok = &tokens[pos + 1];
                     let next_norm = crate::args::normalize_flag(next_tok, MOD_FLAGS);
-                    if !MOD_FLAGS.contains(&next_norm) && !is_known_module(next_tok) {
+                    if !MOD_FLAGS.contains(&next_norm) && !registry.is_known(next_tok) {
                         mod_args.push(tok.clone());
                         pos += 1;
                         continue;
@@ -387,9 +312,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_is_preamble_only() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_preamble_only(&a(&[])));
+        assert!(is_preamble_only(&a(&["--version"])));
+        assert!(is_preamble_only(&a(&["-f", "-h"])));
+        assert!(is_preamble_only(&a(&["-p", "/tmp"])));
+        assert!(!is_preamble_only(&a(&["-v", "list"])));
+        assert!(!is_preamble_only(&a(&["list", "--help"])));
+        assert!(!is_preamble_only(&a(&["--args", "x"])));
+    }
+    use std::sync::OnceLock;
+
+    /// Реестр на временных модулях с аннотациями (ядро не знает имён модулей).
+    fn reg() -> &'static ModuleRegistry {
+        static REG: OnceLock<ModuleRegistry> = OnceLock::new();
+        REG.get_or_init(|| {
+            let td = crate::test_support::TempDir::new("pipeline_reg");
+            let dir = td.to_path_buf();
+            let defs: &[(&str, &str)] = &[
+                ("project", "--@grime alias: proj\n"),
+                ("cmd", "--@grime alias: exec\n"),
+                ("list", "--@grime alias: ls, modules\n"),
+                ("host", "--@grime alias: exit-env, unhost, host-env\n--@grime boundary: true\n"),
+                ("app", "--@grime chain: passthrough\n"),
+                ("pkg", ""),
+                ("ai", ""),
+            ];
+            for (n, body) in defs {
+                std::fs::write(dir.join(format!("{}.lua", n)), body).unwrap();
+            }
+            // td удаляется после скана: реестру файлы далее не нужны
+            ModuleRegistry::scan(vec![dir])
+        })
+    }
+
+    #[test]
+    fn test_legacy_form_uses_default_annotation() {
+        let td = crate::test_support::TempDir::new("pipeline_def");
+        let dir = td.to_path_buf();
+        std::fs::write(dir.join("main.lua"), "--@grime default: true\n").unwrap();
+        std::fs::write(dir.join("other.lua"), "").unwrap();
+        let with_default = ModuleRegistry::scan(vec![dir]);
+        let args = vec!["--args".to_string(), "build".to_string()];
+        let res = parse_pipeline_args(&args, &with_default);
+        assert_eq!(res.steps, vec![PipelineStep { module: "main".into(), args: vec!["build".into()] }]);
+
+        // Без помеченного модуля legacy-форма даёт пустой список шагов
+        let td = crate::test_support::TempDir::new("pipeline_nodef");
+        let dir = td.to_path_buf();
+        std::fs::write(dir.join("other.lua"), "").unwrap();
+        let res = parse_pipeline_args(&args, &ModuleRegistry::scan(vec![dir]));
+        assert!(res.steps.is_empty());
+    }
+
+    #[test]
     fn test_simple_module() {
         let args = vec!["cpp".to_string(), "create".to_string()];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "cpp");
         assert_eq!(res.steps[0].args, vec!["create"]);
@@ -408,7 +388,7 @@ mod tests {
             "git".to_string(),
             "status".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 2);
         assert_eq!(res.steps[0].module, "project");
         assert_eq!(res.steps[0].args, vec!["MyGame"]);
@@ -426,7 +406,7 @@ mod tests {
             "proj".to_string(),
             "build".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert!(res.force);
         assert!(!res.detach);
         assert_eq!(res.work_path, Some(PathBuf::from("/home/user/dev")));
@@ -443,7 +423,7 @@ mod tests {
             "--message".to_string(),
             "test".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert!(res.detach);
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "ai");
@@ -454,7 +434,7 @@ mod tests {
             "cmd".to_string(),
             "make".to_string(),
         ];
-        let res_long = parse_pipeline_args(&args_long);
+        let res_long = parse_pipeline_args(&args_long, reg());
         assert!(res_long.detach);
         assert_eq!(res_long.steps.len(), 1);
         assert_eq!(res_long.steps[0].module, "cmd");
@@ -473,7 +453,7 @@ mod tests {
             "конфиг".to_string(),
             "niri?".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "ai");
         assert_eq!(
@@ -495,7 +475,7 @@ mod tests {
             "git".to_string(),
             "status".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 2);
         assert_eq!(res.steps[0].module, "ai");
         assert_eq!(
@@ -514,7 +494,7 @@ mod tests {
             "-m".to_string(),
             "привет".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "ai");
         assert_eq!(res.steps[0].args, vec!["-m", "привет"]);
@@ -528,7 +508,7 @@ mod tests {
             "-m".to_string(),
             "привет".to_string(),
         ];
-        let res_colon = parse_pipeline_args(&args_colon);
+        let res_colon = parse_pipeline_args(&args_colon, reg());
         assert_eq!(res_colon.steps.len(), 1);
         assert_eq!(res_colon.steps[0].module, "ai");
         assert!(res_colon.work_path.is_some());
@@ -544,7 +524,7 @@ mod tests {
             "project".to_string(),
             "build".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert!(res.force);
         assert!(res.detach);
         assert_eq!(res.work_path, Some(PathBuf::from("/home/user/project")));
@@ -564,7 +544,7 @@ mod tests {
             ":".to_string(),
             "ai".to_string(), "-m".to_string(), "review".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 4);
         assert_eq!(res.steps[0].module, "pkg");
         assert_eq!(res.steps[0].args, vec!["list"]);
@@ -584,7 +564,7 @@ mod tests {
             "->".to_string(),
             "App2".to_string(),
         ];
-        let res_arrow = parse_pipeline_args(&args_arrow);
+        let res_arrow = parse_pipeline_args(&args_arrow, reg());
         assert_eq!(res_arrow.steps.len(), 1);
         assert_eq!(res_arrow.steps[0].module, "app");
         assert_eq!(res_arrow.steps[0].args, vec!["App1", "->", "App2"]);
@@ -596,7 +576,7 @@ mod tests {
             ":".to_string(),
             "App2".to_string(),
         ];
-        let res_colon_app = parse_pipeline_args(&args_colon_app);
+        let res_colon_app = parse_pipeline_args(&args_colon_app, reg());
         assert_eq!(res_colon_app.steps.len(), 1);
         assert_eq!(res_colon_app.steps[0].module, "app");
         assert_eq!(res_colon_app.steps[0].args, vec!["App1", ":", "App2"]);
@@ -609,7 +589,7 @@ mod tests {
             "cmd".to_string(),
             "ls".to_string(),
         ];
-        let res_colon_mod = parse_pipeline_args(&args_colon_mod);
+        let res_colon_mod = parse_pipeline_args(&args_colon_mod, reg());
         assert_eq!(res_colon_mod.steps.len(), 2);
         assert_eq!(res_colon_mod.steps[0].module, "app");
         assert_eq!(res_colon_mod.steps[0].args, vec!["App1"]);
@@ -628,7 +608,7 @@ mod tests {
             "4".to_string(),
             "-c".to_string(),
         ];
-        let res = parse_pipeline_args(&args);
+        let res = parse_pipeline_args(&args, reg());
         assert_eq!(res.steps.len(), 1);
         assert_eq!(res.steps[0].module, "pkg");
         assert_eq!(
@@ -649,7 +629,7 @@ mod tests {
             "4".to_string(),
             "-c".to_string(),
         ];
-        let res_dash = parse_pipeline_args(&args_dash);
+        let res_dash = parse_pipeline_args(&args_dash, reg());
         assert_eq!(res_dash.steps.len(), 1);
         assert_eq!(res_dash.steps[0].module, "pkg");
         assert_eq!(
@@ -668,7 +648,7 @@ mod tests {
             ":".to_string(),
             "cmd".to_string(),
         ];
-        let res_slash = parse_pipeline_args(&args_slash);
+        let res_slash = parse_pipeline_args(&args_slash, reg());
         assert!(!res_slash.force);
         assert!(!res_slash.detach);
         assert_eq!(res_slash.steps.len(), 1);
@@ -688,7 +668,7 @@ mod tests {
             "-f".to_string(),
             "a".to_string(),
         ];
-        let res_rm = parse_pipeline_args(&rm_args);
+        let res_rm = parse_pipeline_args(&rm_args, reg());
         assert!(!res_rm.force, "Ядро не должно красть -f у модуля cmd");
         assert_eq!(res_rm.steps.len(), 1);
         assert_eq!(res_rm.steps[0].module, "cmd");
@@ -701,7 +681,7 @@ mod tests {
             "-d".to_string(),
             "dir".to_string(),
         ];
-        let res_ls = parse_pipeline_args(&ls_args);
+        let res_ls = parse_pipeline_args(&ls_args, reg());
         assert!(!res_ls.detach, "Ядро не должно красть -d у модуля cmd");
         assert_eq!(res_ls.steps.len(), 1);
         assert_eq!(res_ls.steps[0].module, "cmd");
@@ -715,7 +695,7 @@ mod tests {
             "-p".to_string(),
             "80".to_string(),
         ];
-        let res_nmap = parse_pipeline_args(&nmap_args);
+        let res_nmap = parse_pipeline_args(&nmap_args, reg());
         assert_eq!(res_nmap.work_path, None, "Ядро не должно красть -p у модуля pkg");
         assert_eq!(res_nmap.steps.len(), 1);
         assert_eq!(res_nmap.steps[0].module, "pkg");
@@ -729,7 +709,7 @@ mod tests {
             "--".to_string(),
             "-d".to_string(),
         ];
-        let res_app = parse_pipeline_args(&app_args);
+        let res_app = parse_pipeline_args(&app_args, reg());
         assert!(!res_app.detach, "Ядро не должно красть -d после --");
         assert_eq!(res_app.steps.len(), 1);
         assert_eq!(res_app.steps[0].module, "app");
@@ -746,7 +726,7 @@ mod tests {
             "-p".to_string(),
             "/tmp".to_string(),
         ];
-        let res_app_slash = parse_pipeline_args(&app_slash);
+        let res_app_slash = parse_pipeline_args(&app_slash, reg());
         assert!(!res_app_slash.detach);
         assert!(!res_app_slash.force);
         assert_eq!(res_app_slash.work_path, None);
@@ -777,5 +757,14 @@ mod tests {
             formatted,
             "project build : cmd sh -c 'echo '\\''hello $USER'\\'' && ls \"a b\"'"
         );
+    }
+
+    #[test]
+    fn test_aliases_and_host_resolved_from_annotations() {
+        for (alias, canon) in [("ls", "list"), ("modules", "list"), ("exec", "cmd"), ("proj", "project"), ("unhost", "host")] {
+            let res = parse_pipeline_args(&[alias.to_string()], reg());
+            assert_eq!(res.steps[0].module, canon, "{}", alias);
+        }
+        assert!(reg().is_boundary("exit-env"));
     }
 }

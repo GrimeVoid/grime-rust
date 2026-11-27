@@ -189,7 +189,7 @@ impl PipelineCanceller {
 pub fn attach_lua_cancellation_hook(lua: &Lua, canceller: PipelineCanceller) {
     let canceller_clone = canceller.clone();
     lua.set_hook(
-        HookTriggers::default().every_nth_instruction(250),
+        HookTriggers::default().every_nth_instruction(10_000),
         move |_lua, _debug| {
             if canceller_clone.is_cancelled() && !canceller_clone.is_cleaning_up() {
                 let reason = canceller_clone
@@ -201,11 +201,6 @@ pub fn attach_lua_cancellation_hook(lua: &Lua, canceller: PipelineCanceller) {
             }
         },
     );
-}
-
-/// Снятие хука прерывания с виртуальной машины Lua.
-pub fn detach_lua_cancellation_hook(lua: &Lua) {
-    lua.remove_hook();
 }
 
 /// Асинхронный двухэтапный слушатель сигнала Ctrl+C:

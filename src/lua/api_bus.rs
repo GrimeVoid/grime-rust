@@ -14,12 +14,13 @@ pub fn register_bus_api(
     _grime_tbl: &Table,
     state_bus: Arc<StateBus>,
     event_bus: Arc<EventBus>,
+    session_id: String,
 ) -> Result<(), mlua::Error> {
     // 1. Регистрация StateBus API (grime.bus)
     register_state_bus_api(lua, state_bus)?;
 
     // 2. Регистрация EventBus API (grime.events)
-    register_event_bus_api(lua, event_bus)?;
+    register_event_bus_api(lua, event_bus, session_id)?;
 
     Ok(())
 }

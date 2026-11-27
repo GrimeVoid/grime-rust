@@ -1,12 +1,16 @@
 pub mod args;
 pub mod args_engine;
+pub mod cache;
 pub mod cancellation;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod deps;
+pub mod ephemeral;
 pub mod event_bus;
 pub mod fs_ops;
 pub mod lua;
+pub mod modules;
 pub use lua as lua_engine;
 pub mod orchestrator;
 pub mod payload;
@@ -14,3 +18,5 @@ pub mod pipeline;
 pub mod process;
 pub mod state_bus;
 pub mod supervisor;
+#[cfg(test)]
+pub(crate) mod test_support;

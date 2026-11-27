@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::cancellation::{ChildRegistration, PipelineCanceller};
@@ -11,6 +11,29 @@ pub struct ProcessCaptureResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Исполняемый ли обычный файл по пути (с разыменованием симлинков): `mode & 0o111 != 0`.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Поиск исполняемого файла как `which`, но без порождения процесса.
+/// Имя с `/` проверяется напрямую; иначе обходятся каталоги `path_var` (пустой элемент — текущий каталог).
+pub fn which_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains('/') {
+        let p = PathBuf::from(name);
+        return is_executable_file(&p).then_some(p);
+    }
+    let path_var = path_var?;
+    std::env::split_paths(path_var)
+        .map(|dir| if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir })
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 #[inline]
@@ -33,6 +56,28 @@ fn resolve_effective_cwd(cwd: &Path) -> &Path {
     }
 }
 
+/// Общий билдер `Command`: аргументы, рабочий каталог (с откатом на `.`) и окружение.
+fn build_command(
+    cmd: &[String],
+    cwd: &Path,
+    env: Option<&HashMap<String, String>>,
+) -> Command {
+    let mut command = Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    command.current_dir(resolve_effective_cwd(cwd));
+    if let Some(envs) = env {
+        command.envs(envs);
+    }
+    command
+}
+
+/// Является ли stdin процесса-родителя терминалом.
+/// Для TTY-stdin дочерний процесс нельзя выносить в отдельную группу процессов:
+/// фоновая группа получила бы SIGTTIN при чтении с терминала.
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(0) == 1 }
+}
+
 fn execute_command_internal(
     cmd: &[String],
     cwd: &Path,
@@ -45,30 +90,22 @@ fn execute_command_internal(
         return 0;
     }
 
-    let effective_cwd = resolve_effective_cwd(cwd);
-
-    let mut command = Command::new(&cmd[0]);
-    if cmd.len() > 1 {
-        command.args(&cmd[1..]);
-    }
-    command.current_dir(effective_cwd);
-
-    if let Some(envs) = env {
-        command.envs(envs);
-    }
-
+    let mut command = build_command(cmd, cwd, env);
     command.stdin(Stdio::inherit());
+
+    // Неинтерактивный процесс делаем лидером собственной группы, чтобы при отмене сигнал
+    // получали и подпроцессы (sh -c ...), но только если stdin не терминал (иначе SIGTTIN).
+    // Отмена по PID продолжает работать и без отдельной группы.
+    let own_group = !interactive && !stdin_is_tty();
     if interactive {
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
-    } else {
-        // Неинтерактивный процесс делаем лидером собственной группы процессов,
-        // чтобы при отмене конвейера сигнал получали и дочерние подпроцессы (например, порождённые sh -c)
+    } else if own_group {
         command.process_group(0);
     }
 
     let reg = ChildRegistration {
-        process_group: !interactive,
+        process_group: own_group,
         interactive,
     };
 
@@ -165,16 +202,7 @@ pub fn capture_command(
         };
     }
 
-    let effective_cwd = resolve_effective_cwd(cwd);
-
-    let mut command = Command::new(&cmd[0]);
-    if cmd.len() > 1 {
-        command.args(&cmd[1..]);
-    }
-    command.current_dir(effective_cwd);
-    if let Some(envs) = env {
-        command.envs(envs);
-    }
+    let mut command = build_command(cmd, cwd, env);
 
     if stdin_input.is_some() {
         command.stdin(Stdio::piped());
@@ -278,6 +306,21 @@ mod tests {
         let res = capture_command(&cmd, Path::new("."), None, Some(&large_input), None);
         assert_eq!(res.exit_code, 0);
         assert_eq!(res.stdout.len(), large_input.len());
+    }
+
+    #[test]
+    fn test_non_interactive_command_reading_stdin_does_not_hang() {
+        // Неинтерактивная команда, читающая stdin, не должна зависать по SIGTTIN:
+        // при TTY-stdin она остаётся в foreground-группе, иначе получает свою группу.
+        // Здесь stdin родителя перенаправлен в /dev/null через sh, чтобы тест был детерминирован.
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "read x < /dev/null; exit 0".to_string(),
+        ];
+        let start = Instant::now();
+        assert_eq!(run_command(&cmd, Path::new("."), None, None), 0);
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

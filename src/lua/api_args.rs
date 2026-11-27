@@ -11,6 +11,15 @@ use crate::args_engine::{
     ArgSpec, FlagValue, ParsedArgs,
 };
 
+/// Шаблоны флага: строка либо массив строк; прочие значения дают пустой список.
+fn lua_patterns(val: Value) -> Result<Vec<String>, mlua::Error> {
+    Ok(match val {
+        Value::Table(tbl) => tbl.sequence_values::<String>().flatten().collect(),
+        Value::String(s) => vec![s.to_str()?.to_string()],
+        _ => Vec::new(),
+    })
+}
+
 /// Преобразует таблицу спецификации Lua в нативную структуру `ArgSpec`.
 pub fn lua_table_to_spec(spec_tbl: &Table) -> Result<ArgSpec, mlua::Error> {
     let mut spec = ArgSpec::default();
@@ -42,17 +51,7 @@ pub fn lua_table_to_spec(spec_tbl: &Table) -> Result<ArgSpec, mlua::Error> {
     // 3. flags
     if let Ok(flags_tbl) = spec_tbl.get::<Table>("flags") {
         for (flag_name, val) in flags_tbl.pairs::<String, Value>().flatten() {
-            let patterns = match val {
-                Value::Table(tbl) => {
-                    let mut pats = Vec::new();
-                    for s in tbl.sequence_values::<String>().flatten() {
-                        pats.push(s);
-                    }
-                    pats
-                }
-                Value::String(s) => vec![s.to_str()?.to_string()],
-                _ => Vec::new(),
-            };
+            let patterns = lua_patterns(val)?;
             spec.flags.insert(flag_name, patterns);
         }
     }
@@ -60,17 +59,7 @@ pub fn lua_table_to_spec(spec_tbl: &Table) -> Result<ArgSpec, mlua::Error> {
     // 4. value_flags
     if let Ok(val_flags_tbl) = spec_tbl.get::<Table>("value_flags") {
         for (vname, val) in val_flags_tbl.pairs::<String, Value>().flatten() {
-            let patterns = match val {
-                Value::Table(tbl) => {
-                    let mut pats = Vec::new();
-                    for s in tbl.sequence_values::<String>().flatten() {
-                        pats.push(s);
-                    }
-                    pats
-                }
-                Value::String(s) => vec![s.to_str()?.to_string()],
-                _ => Vec::new(),
-            };
+            let patterns = lua_patterns(val)?;
             spec.value_flags.insert(vname, patterns);
         }
     }

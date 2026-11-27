@@ -2,6 +2,8 @@
 //!
 //! Обеспечивает безопасное взаимодействие с файловой системой без паник,
 //! с развертыванием путей пользователя (`~`), проверками и нормализацией.
+//! Таблица [`FS_OPS`] — единый источник операций: из неё строятся и `grime.fs.*`,
+//! и `ctx.*` (с разрешением относительных путей от `target_dir`, см. `context.rs`).
 
 use mlua::{Lua, MultiValue, Table, Value};
 use std::fs;
@@ -9,12 +11,135 @@ use std::path::PathBuf;
 
 use crate::fs_ops::{
     copy_recursive, delete_safe, expand_and_normalize, expand_tilde, get_latest_mtime, is_newer,
-    is_system_or_root_path, move_safe, normalize_path,
+    mkdir_p, move_safe, normalize_path, write_file,
 };
+
+/// Разрешение строкового пути из Lua в реальный путь (для `grime.fs` и `ctx` оно разное).
+pub type PathResolveFn = fn(&Lua, &str) -> mlua::Result<PathBuf>;
+
+/// Описание файловой операции: имя, алиасы, число путевых аргументов и реализация.
+pub struct FsOp {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    /// Количество первых аргументов, являющихся путями (они проходят через резолвер).
+    pub paths: usize,
+    /// Реализация: разрешённые пути и остальные (не путевые) аргументы Lua.
+    pub run: fn(&Lua, &[PathBuf], &[Value]) -> mlua::Result<Value>,
+}
+
+fn rt_err(e: String) -> mlua::Error {
+    mlua::Error::runtime(e)
+}
+
+fn str_arg(lua: &Lua, rest: &[Value], idx: usize) -> mlua::Result<String> {
+    match rest.get(idx) {
+        Some(Value::String(s)) => Ok(s.to_str()?.to_string()),
+        Some(Value::Nil) | None => Err(mlua::Error::runtime("Ожидался строковый аргумент")),
+        Some(other) => Ok(lua
+            .coerce_string(other.clone())?
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| mlua::Error::runtime("Ожидался строковый аргумент"))?),
+    }
+}
+
+fn path_value(lua: &Lua, p: PathBuf) -> mlua::Result<Value> {
+    Ok(Value::String(lua.create_string(p.to_string_lossy().as_bytes())?))
+}
+
+/// Все файловые операции с путевыми аргументами.
+pub static FS_OPS: &[FsOp] = &[
+    FsOp { name: "exists", aliases: &[], paths: 1, run: |_, p, _| Ok(Value::Boolean(p[0].exists())) },
+    FsOp { name: "is_dir", aliases: &[], paths: 1, run: |_, p, _| Ok(Value::Boolean(p[0].is_dir())) },
+    FsOp { name: "is_file", aliases: &[], paths: 1, run: |_, p, _| Ok(Value::Boolean(p[0].is_file())) },
+    FsOp {
+        name: "mkdir_p",
+        aliases: &[],
+        paths: 1,
+        run: |_, p, _| mkdir_p(&p[0]).map(|_| Value::Boolean(true)).map_err(rt_err),
+    },
+    FsOp {
+        name: "delete",
+        aliases: &["remove"],
+        paths: 1,
+        run: |_, p, rest| {
+            let missing_ok = !matches!(rest.first(), Some(Value::Boolean(false)));
+            delete_safe(&p[0], missing_ok).map(Value::Boolean).map_err(rt_err)
+        },
+    },
+    FsOp {
+        name: "copy",
+        aliases: &[],
+        paths: 2,
+        run: |lua, p, _| path_value(lua, copy_recursive(&p[0], &p[1]).map_err(rt_err)?),
+    },
+    FsOp {
+        name: "move",
+        aliases: &["rename"],
+        paths: 2,
+        run: |lua, p, _| path_value(lua, move_safe(&p[0], &p[1]).map_err(rt_err)?),
+    },
+    FsOp {
+        name: "read",
+        aliases: &[],
+        paths: 1,
+        run: |lua, p, _| match fs::read_to_string(&p[0]) {
+            Ok(s) => Ok(Value::String(lua.create_string(s)?)),
+            Err(_) => Ok(Value::Nil),
+        },
+    },
+    FsOp {
+        name: "write",
+        aliases: &[],
+        paths: 1,
+        run: |lua, p, rest| {
+            let content = str_arg(lua, rest, 0)?;
+            write_file(&p[0], &content).map(|_| Value::Boolean(true)).map_err(rt_err)
+        },
+    },
+    FsOp {
+        name: "mtime",
+        aliases: &[],
+        paths: 1,
+        run: |_, p, _| Ok(Value::Number(get_latest_mtime(&p[0]))),
+    },
+    FsOp {
+        name: "is_newer",
+        aliases: &["needs_rebuild"],
+        paths: 2,
+        run: |_, p, _| Ok(Value::Boolean(is_newer(&p[0], &p[1]))),
+    },
+];
+
+/// Устанавливает все операции [`FS_OPS`] (с алиасами) в таблицу `target`.
+/// Пути каждой операции предварительно проходят через `resolve`.
+pub fn install_fs_ops(lua: &Lua, target: &Table, resolve: PathResolveFn) -> Result<(), mlua::Error> {
+    for op in FS_OPS {
+        let func = lua.create_function(move |lua, args: MultiValue| {
+            let mut iter = args.into_iter();
+            let mut paths = Vec::with_capacity(op.paths);
+            for _ in 0..op.paths {
+                let raw = match iter.next() {
+                    Some(Value::String(s)) => s.to_str()?.to_string(),
+                    _ => return Err(mlua::Error::runtime(format!("{}: ожидался путь (строка)", op.name))),
+                };
+                paths.push(resolve(lua, &raw)?);
+            }
+            let rest: Vec<Value> = iter.collect();
+            (op.run)(lua, &paths, &rest)
+        })?;
+        target.set(op.name, func.clone())?;
+        for alias in op.aliases {
+            target.set(*alias, func.clone())?;
+        }
+    }
+    Ok(())
+}
 
 /// Регистрирует подтаблицу `grime.fs` со всеми файловыми функциями.
 pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> {
     let fs_tbl = lua.create_table()?;
+
+    install_fs_ops(lua, &fs_tbl, |_, raw| Ok(expand_tilde(raw).into_owned()))?;
 
     // grime.fs.normalize(path) -> string
     fs_tbl.set(
@@ -22,104 +147,6 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
         lua.create_function(|_, path: String| {
             let normalized = expand_and_normalize(&path);
             Ok(normalized.to_string_lossy().to_string())
-        })?,
-    )?;
-
-    // grime.fs.exists(path) -> bool
-    fs_tbl.set(
-        "exists",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            Ok(p.as_ref().exists())
-        })?,
-    )?;
-
-    // grime.fs.is_dir(path) -> bool
-    fs_tbl.set(
-        "is_dir",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            Ok(p.as_ref().is_dir())
-        })?,
-    )?;
-
-    // grime.fs.is_file(path) -> bool
-    fs_tbl.set(
-        "is_file",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            Ok(p.as_ref().is_file())
-        })?,
-    )?;
-
-    // grime.fs.mkdir_p(path) -> bool
-    fs_tbl.set(
-        "mkdir_p",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            match fs::create_dir_all(p.as_ref()) {
-                Ok(_) => Ok(true),
-                Err(e) => Err(mlua::Error::runtime(format!("Ошибка создания каталога '{}': {}", p.as_ref().display(), e))),
-            }
-        })?,
-    )?;
-
-    // grime.fs.delete(path, missing_ok) -> bool
-    fs_tbl.set(
-        "delete",
-        lua.create_function(|_, (path, missing_ok): (String, Option<bool>)| {
-            let p = expand_tilde(&path);
-            match delete_safe(p.as_ref(), missing_ok.unwrap_or(true)) {
-                Ok(val) => Ok(val),
-                Err(e) => Err(mlua::Error::runtime(e)),
-            }
-        })?,
-    )?;
-    fs_tbl.set("remove", fs_tbl.get::<Value>("delete")?)?;
-
-    // grime.fs.copy(src, dst) -> string
-    fs_tbl.set(
-        "copy",
-        lua.create_function(|_, (src, dst): (String, String)| {
-            let s = expand_tilde(&src);
-            let d = expand_tilde(&dst);
-            match copy_recursive(s.as_ref(), d.as_ref()) {
-                Ok(res) => Ok(res.to_string_lossy().to_string()),
-                Err(e) => Err(mlua::Error::runtime(e)),
-            }
-        })?,
-    )?;
-
-    // grime.fs.move(src, dst) -> string
-    fs_tbl.set(
-        "move",
-        lua.create_function(|_, (src, dst): (String, String)| {
-            let s = expand_tilde(&src);
-            let d = expand_tilde(&dst);
-            match move_safe(s.as_ref(), d.as_ref()) {
-                Ok(res) => Ok(res.to_string_lossy().to_string()),
-                Err(e) => Err(mlua::Error::runtime(e)),
-            }
-        })?,
-    )?;
-    fs_tbl.set("rename", fs_tbl.get::<Value>("move")?)?;
-
-    // grime.fs.mtime(path) -> f64
-    fs_tbl.set(
-        "mtime",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            Ok(get_latest_mtime(p.as_ref()))
-        })?,
-    )?;
-
-    // grime.fs.is_newer(src, target) -> bool
-    fs_tbl.set(
-        "is_newer",
-        lua.create_function(|_, (src, target): (String, String)| {
-            let s = expand_tilde(&src);
-            let t = expand_tilde(&target);
-            Ok(is_newer(s.as_ref(), t.as_ref()))
         })?,
     )?;
 
@@ -142,39 +169,6 @@ pub fn register_fs_api(lua: &Lua, grime_tbl: &Table) -> Result<(), mlua::Error> 
         })?,
     )?;
     fs_tbl.set("path_join", fs_tbl.get::<Value>("join")?)?;
-
-    // grime.fs.read(path) -> string | nil
-    fs_tbl.set(
-        "read",
-        lua.create_function(|_, path: String| {
-            let p = expand_tilde(&path);
-            match fs::read_to_string(p.as_ref()) {
-                Ok(s) => Ok(Some(s)),
-                Err(_) => Ok(None),
-            }
-        })?,
-    )?;
-
-    // grime.fs.write(path, content) -> bool
-    fs_tbl.set(
-        "write",
-        lua.create_function(|_, (path, content): (String, String)| {
-            let p = expand_tilde(&path);
-            if is_system_or_root_path(p.as_ref()) {
-                return Err(mlua::Error::runtime(format!(
-                    "Попытка записи в защищенный системный путь: '{}'!",
-                    p.as_ref().display()
-                )));
-            }
-            if let Some(parent) = p.as_ref().parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            match fs::write(p.as_ref(), content) {
-                Ok(_) => Ok(true),
-                Err(e) => Err(mlua::Error::runtime(format!("Ошибка записи файла '{}': {}", p.as_ref().display(), e))),
-            }
-        })?,
-    )?;
 
     // grime.fs.list(path) -> table
     fs_tbl.set(

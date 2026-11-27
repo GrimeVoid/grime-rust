@@ -297,7 +297,7 @@ grime daemon -restart
 ## Security
 
 - **System path protection.** The core's file operations (`delete`, `copy`, `move`, `write`) refuse to touch system directories (`/`, `/etc`, `/usr`, `/var`, `/boot`, `/opt`, `/root`, `/nix`, and so on).
-- **Destructive project commands.** `project -rm` and `project --clear` work only by the **exact** name inside the projects directory and ask for confirmation; in non-interactive mode without `--yes` they refuse.
+- **Destructive commands.** `project -rm` and `project --clear` work only by the **exact** name inside the projects directory. Confirmation (shared `utils.confirm_destructive`) is also required by `app -rm`/`-rollback`, `box -rm`, `nix -gc`, `log -clear`, `bus rm`; in non-interactive mode without `--yes` (`-y`) they all refuse.
 - **AI restrictions (`ai`).** Commands from the agent's reply are checked token by token (quoting-aware). `<grime_spawn>` tags are allowed only for an allow-list of modules (`ai`, `cmd`, `app`, `project`, `nix`, `git`, `doctor`, `list`, `log`), and destructive flags (`-rm`, `-clear`, `-rollback`, `-gc`, `-force`, `-purge`, and similar) are forbidden. The AI cannot spawn `pkg`, `box`, `host`, `daemon`, or `bus` directly.
 - **`doctor -fix`.** Secrets are scrubbed from the context, the script is shown with its SHA-256, and it runs only after an interactive "y" (see above).
 - **The daemon socket** is created with mode `0600`.
@@ -348,6 +348,7 @@ Keys:
 | `apps` | Micro-apps root (default from `app`: `~/.config/grime/apps`) |
 | `distrobox_default` | Default Distrobox container (for example, `fedora-box`) |
 | `box_idle_timeout` | Seconds a container may idle before auto-stop (default 300) |
+| `nix_allow_unfree` | Allow unfree Nix packages (enabled by default; disable with `false`/`0`/`no`/`off`). Profile installs use `nix profile add` |
 | `ai_agent` | Default agent: `claude`, `aider`, or `auto` |
 | `doctor_agent` | Agent for `doctor -fix` (then `ai_agent`, otherwise `claude`) |
 | `claude`, `aider` | Path to the agent binary, or `auto` |

@@ -461,6 +461,7 @@ local spec = {
 | `apps` | `app` | Корень приложений (`path.apps`, по умолчанию `~/.config/grime/apps`) |
 | `distrobox_default` | `box` | Контейнер по умолчанию |
 | `box_idle_timeout` | `box` | Секунды простоя до автоостановки контейнера (по умолчанию 300) |
+| `nix_allow_unfree` | `nix`, `pkg`, `app` | Unfree-пакеты Nix разрешены по умолчанию (`allowUnfree` в генерируемых flake, `--impure` + `NIXPKGS_ALLOW_UNFREE=1` для `nixpkgs#…`); отключить: `false`/`0`/`no`/`off`. Установка в профиль — `nix profile add` |
 | `ai_agent` | `ai`, `doctor` | `claude`, `aider` или `auto` |
 | `doctor_agent` | `doctor` | Агент для `doctor -fix` |
 | `claude`, `aider` | адаптеры агентов | Путь к бинарю агента или `auto` |
@@ -542,8 +543,8 @@ grime app -flake <имя>                # синхронизация flake.nix
 grime app -compile <цель|путь|проект> [имя_команды]   # в apps + симлинк в ~/.local/bin
 grime app -bundle <имя>               # автономный бинарь в dist/
 grime app -path [имя]
-grime app -commit|-log|-diff|-snapshot|-status|-rollback <имя> …
-grime app -rm <имя>
+grime app -commit|-log|-diff|-snapshot|-status|-rollback <имя> …   # -rollback требует подтверждения (-y)
+grime app -rm <имя> [-y]            # подтверждение; без TTY нужен --yes
 ```
 Состояние фоновых приложений хранится в шине (`grime app -ps` показывает PID, память, uptime). Манифест `app.lua` читается в песочнице; допускаются «нулевые» приложения (по shebang или адаптеру языка).
 
@@ -626,6 +627,7 @@ doctor_agent=claude
 
 - **Системные пути.** `grime.fs`/`ctx` `delete`, `copy`, `move`, `write` отказываются работать с системными каталогами.
 - **Проекты.** `project -rm` и `--clear` — только по точному имени в каталоге проектов, с подтверждением; без TTY нужен `--yes`.
+- **Подтверждения.** Необратимые операции (`app -rm`, `app -rollback`, `box -rm`, `nix -gc`, `log -clear`, `bus rm`, `project -rm/--clear`) спрашивают `[y/N]` через общую `utils.confirm_destructive`; в конвейерах и скриптах (без TTY) обязателен `--yes` (`-y`).
 - **ИИ.** Проверка команд перед исполнением выполняется по токенам с учётом кавычек. `<grime_spawn>` разрешён только для модулей `ai`, `cmd`, `app`, `project`, `nix`, `git`, `doctor`, `list`, `log`; разрушительные флаги (`rm`, `clear`, `rollback`, `gc`, `optimise`, `force`, `reset`, `clean`, `delete`, `purge`, `uninstall`, `remove`, `prune`) для порождённых модулей запрещены; глубина вложенности тегов ограничена. Модули `pkg`, `box`, `host`, `daemon`, `bus` ИИ напрямую порождать не может.
 - **`doctor -fix`.** Секреты маскируются, скрипт показывается целиком с SHA-256, запускается только после интерактивного «y» в окне терминала; эфемерный каталог 0700, удаление по `trap`.
 - **Сокет демона** — права `0600`; размер IPC-сообщений ограничен (32 МБ), чтение — с таймаутом.

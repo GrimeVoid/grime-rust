@@ -24,6 +24,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/grime"
 USE_SYMLINK=false
 FORCE_BUILD=false
 SETUP_HOOK=true
+RUN_DOCTOR=true
 
 # Вспомогательные функции логирования
 log_info() {
@@ -66,6 +67,7 @@ ${BOLD}ОПЦИИ:${NC}
     -b, --build           Принудительно собрать бинарники перед установкой (через cargo или nix)
         --bin-dir <DIR>   Каталог для установки исполняемых файлов (по умолчанию: ~/.local/bin)
         --config-dir <DIR> Каталог конфигурации GRIME (по умолчанию: ~/.config/grime)
+        --no-doctor       Не запускать grime doctor в конце установки
         --no-hook         Пропустить настройку шелл-хуков command_not_found (Fish/Bash/Zsh)
 
 ${BOLD}ПРИМЕРЫ:${NC}
@@ -93,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-hook)
             SETUP_HOOK=false
+            shift
+            ;;
+        --no-doctor)
+            RUN_DOCTOR=false
             shift
             ;;
         --bin-dir)
@@ -239,40 +245,66 @@ mkdir -p "$CONFIG_DIR/templates"
 mkdir -p "$CONFIG_DIR/apps"
 mkdir -p "$CONFIG_DIR/logs"
 
-# Развёртывание модулей
-if [[ -d "$SCRIPT_DIR/modules" ]]; then
-    if [[ "$USE_SYMLINK" == "true" ]]; then
-        log_info "Создание симлинков на модули в $CONFIG_DIR/modules/..."
-        for item in "$SCRIPT_DIR/modules"/*; do
-            [[ -e "$item" ]] || continue
-            base_name="$(basename "$item")"
-            ln -sfn "$item" "$CONFIG_DIR/modules/$base_name"
-        done
-        log_success "Симлинки на модули успешно созданы."
-    else
-        log_info "Копирование модулей в $CONFIG_DIR/modules/..."
-        cp -a "$SCRIPT_DIR/modules/." "$CONFIG_DIR/modules/"
-        log_success "Модули успешно скопированы."
+# Безопасное удаление: только внутри каталога конфигурации GRIME
+safe_remove() {
+    local target="$1"
+    case "$target" in
+        "$CONFIG_DIR"/?*) ;;
+        *)
+            log_error "Отказ в удалении вне каталога установки: $target"
+            exit 1
+            ;;
+    esac
+    # Символическая ссылка удаляется как ссылка (цель не затрагивается)
+    if [[ -e "$target" || -L "$target" ]]; then
+        rm -rf -- "$target"
     fi
+}
+
+# Идемпотентное развёртывание содержимого каталога src в dst (внутри CONFIG_DIR).
+# Каждый элемент предварительно удаляется, поэтому переключение режимов
+# копирование <-> симлинки не пишет через старые ссылки и не плодит вложенные каталоги.
+deploy_dir() {
+    local src="$1" dst="$2" label="$3" item base
+    # Сам dst должен быть настоящим каталогом, а не ссылкой (иначе cp пишет в репозиторий)
+    if [[ -L "$dst" ]]; then
+        safe_remove "$dst"
+    fi
+    mkdir -p "$dst"
+    # Висячие ссылки от прошлых установок
+    find "$dst" -maxdepth 1 -xtype l -exec rm -f -- {} +
+    local had_dotglob=false had_nullglob=false
+    shopt -q dotglob && had_dotglob=true
+    shopt -q nullglob && had_nullglob=true
+    shopt -s dotglob nullglob
+    for item in "$src"/*; do
+        base="$(basename "$item")"
+        safe_remove "$dst/$base"
+        if [[ "$USE_SYMLINK" == "true" ]]; then
+            ln -sfnT -- "$item" "$dst/$base"
+        else
+            cp -aT -- "$item" "$dst/$base"
+        fi
+    done
+    "$had_dotglob" || shopt -u dotglob
+    "$had_nullglob" || shopt -u nullglob
+    if [[ "$USE_SYMLINK" == "true" ]]; then
+        log_success "$label: симлинки на $src созданы."
+    else
+        log_success "$label: файлы скопированы."
+    fi
+}
+
+# Развёртывание модулей (ядро ищет их в <config>/modules)
+if [[ -d "$SCRIPT_DIR/modules" ]]; then
+    deploy_dir "$SCRIPT_DIR/modules" "$CONFIG_DIR/modules" "Модули"
 else
     log_warning "Каталог modules/ не найден в $SCRIPT_DIR!"
 fi
 
 # Развёртывание шаблонов
 if [[ -d "$SCRIPT_DIR/templates" ]]; then
-    if [[ "$USE_SYMLINK" == "true" ]]; then
-        log_info "Создание симлинков на шаблоны в $CONFIG_DIR/templates/..."
-        for item in "$SCRIPT_DIR/templates"/*; do
-            [[ -e "$item" ]] || continue
-            base_name="$(basename "$item")"
-            ln -sfn "$item" "$CONFIG_DIR/templates/$base_name"
-        done
-        log_success "Симлинки на шаблоны успешно созданы."
-    else
-        log_info "Копирование шаблонов в $CONFIG_DIR/templates/..."
-        cp -a "$SCRIPT_DIR/templates/." "$CONFIG_DIR/templates/"
-        log_success "Шаблоны успешно скопированы."
-    fi
+    deploy_dir "$SCRIPT_DIR/templates" "$CONFIG_DIR/templates" "Шаблоны"
 fi
 
 # ------------------------------------------------------------------------------
@@ -284,8 +316,16 @@ log_info "[3/4] Настройка шелл-интеграции command_not_fou
 if [[ "$SETUP_HOOK" == "true" ]]; then
     # 1. Fish shell
     if [[ -d "$HOME/.config/fish" ]] || command -v fish >/dev/null 2>&1; then
-        mkdir -p "$HOME/.config/fish/functions"
-        cat << 'EOF' > "$HOME/.config/fish/functions/fish_command_not_found.fish"
+        fish_fn_dir="$HOME/.config/fish/functions"
+        fish_fn="$fish_fn_dir/fish_command_not_found.fish"
+        mkdir -p "$fish_fn_dir"
+        if [[ -e "$fish_fn" || -L "$fish_fn" ]] && ! grep -q "grime pkg" "$fish_fn" 2>/dev/null; then
+            fish_bak="$fish_fn.bak.$(date +%Y%m%d%H%M%S)"
+            mv -- "$fish_fn" "$fish_bak"
+            log_warning "Найден чужой fish_command_not_found.fish, резервная копия: $fish_bak"
+        fi
+        cat << 'EOF' > "$fish_fn"
+# GRIME ephemeral command-not-found hook
 function fish_command_not_found
     grime pkg -not-found --no-confirm -- $argv
 end
@@ -335,7 +375,9 @@ echo ""
 log_info "[4/4] Запуск системной проверки GRIME Doctor..."
 echo ""
 
-if [[ -x "$BIN_DIR/grime" ]]; then
+if [[ "$RUN_DOCTOR" != "true" ]]; then
+    log_info "Диагностика пропущена (--no-doctor)."
+elif [[ -x "$BIN_DIR/grime" ]]; then
     "$BIN_DIR/grime" doctor || true
 else
     log_warning "Бинарник $BIN_DIR/grime не найден для запуска doctor."
@@ -355,7 +397,7 @@ echo ""
 echo -e "${BOLD}Полезные команды для начала работы:${NC}"
 echo -e "  ${CYAN}grime --help${NC}              Справка по всем модулям"
 echo -e "  ${CYAN}grime doctor${NC}              Комплексная диагностика окружения"
-echo -e "  ${CYAN}grime project <lang> init${NC} Создание нового проекта (cpp, rust, python, java)"
-echo -e "  ${CYAN}grime app new <name>${NC}      Создание изолированного микросервиса"
+echo -e "  ${CYAN}grime project -init cpp MyGame${NC} Создание нового проекта (cpp, rust, python, java)"
+echo -e "  ${CYAN}grime app -new MyApp${NC}             Создание изолированного микроприложения"
 echo -e "  ${CYAN}grime pkg list${NC}            Инспекция установленного системного ПО"
 echo -e "${BOLD}${GREEN}===================================================================${NC}"

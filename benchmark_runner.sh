@@ -1,64 +1,98 @@
 #!/usr/bin/env bash
-set -e
+# ==============================================================================
+#  Бенчмарк GRIME (hyperfine). Сравнение с Python-версией — опционально.
+#
+#  Переменные окружения:
+#    GRIME_BIN   путь к бинарнику Rust (по умолчанию: <репозиторий>/target/release/grime,
+#                иначе grime из $PATH)
+#    OUT_DIR     каталог результатов (по умолчанию: <репозиторий>/benchmark_results)
+#    PY_BIN      интерпретатор Python для сравнения (по умолчанию: python3, если задан PY_SCRIPT)
+#    PY_SCRIPT   путь к grime.py; если не задан — Python-замеры пропускаются
+#    PIPE_SEP    разделитель звеньев конвейера (по умолчанию ':'; для старого Python — '->')
+# ==============================================================================
+set -euo pipefail
 
-RUST_BIN="/home/danny/.local/bin/grime"
-PY_BIN="/home/danny/Archive/_Programing_/python/grimeProject/venv/bin/python3"
-PY_SCRIPT="/home/danny/Archive/_Programing_/python/grimeProject/grime.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "=== СТАРТ ГЛУБОКОГО БЕНЧМАРКИНГА GRIME (RUST VS PYTHON) ==="
-mkdir -p benchmark_results
+if [[ -z "${GRIME_BIN:-}" ]]; then
+    if [[ -x "$SCRIPT_DIR/target/release/grime" ]]; then
+        GRIME_BIN="$SCRIPT_DIR/target/release/grime"
+    else
+        GRIME_BIN="$(command -v grime || true)"
+    fi
+fi
+if [[ -z "$GRIME_BIN" || ! -x "$GRIME_BIN" ]]; then
+    echo "Бинарник grime не найден: задайте GRIME_BIN" >&2
+    exit 1
+fi
+command -v hyperfine >/dev/null 2>&1 || { echo "Требуется hyperfine" >&2; exit 1; }
 
-echo "--- 1. Сценарий A: Холодный запуск CLI (--help) ---"
-hyperfine --warmup 3 --runs 25 --export-json benchmark_results/scenario_a_help.json \
-  -n "Rust: grime --help" "$RUST_BIN --help" \
-  -n "Python (default): grime --help" "$PY_BIN $PY_SCRIPT --help" \
-  -n "Python (PYTHONOPTIMIZE=2)" "PYTHONOPTIMIZE=2 $PY_BIN $PY_SCRIPT --help" \
-  -n "Python (PYTHONDONTWRITEBYTECODE=1)" "PYTHONDONTWRITEBYTECODE=1 $PY_BIN $PY_SCRIPT --help"
+OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/benchmark_results}"
+PY_SCRIPT="${PY_SCRIPT:-}"
+PY_BIN="${PY_BIN:-python3}"
+SEP="${PIPE_SEP:-:}"
+WITH_PY=false
+if [[ -n "$PY_SCRIPT" ]]; then
+    [[ -f "$PY_SCRIPT" ]] || { echo "PY_SCRIPT не найден: $PY_SCRIPT" >&2; exit 1; }
+    WITH_PY=true
+fi
 
-echo "--- 2. Сценарий A: Холодный запуск CLI (--version) ---"
-hyperfine --warmup 3 --runs 25 --export-json benchmark_results/scenario_a_version.json \
-  -n "Rust: grime --version" "$RUST_BIN --version" \
-  -n "Python (default): grime --version" "$PY_BIN $PY_SCRIPT --version" \
-  -n "Python (PYTHONOPTIMIZE=2)" "PYTHONOPTIMIZE=2 $PY_BIN $PY_SCRIPT --version"
+mkdir -p "$OUT_DIR"
 
-echo "--- 3. Сценарий B: Парсинг и запуск модуля host ---"
-hyperfine --warmup 3 --runs 20 --export-json benchmark_results/scenario_b_host.json \
-  -n "Rust: grime host" "$RUST_BIN host" \
-  -n "Python: grime host" "$PY_BIN $PY_SCRIPT host"
-
-echo "--- 4. Сценарий B: Парсинг и запуск модуля doctor ---"
-hyperfine --warmup 2 --runs 15 --export-json benchmark_results/scenario_b_doctor.json \
-  -n "Rust: grime doctor" "$RUST_BIN doctor" \
-  -n "Python: grime doctor" "$PY_BIN $PY_SCRIPT doctor"
-
-echo "--- 5. Сценарий C: Многозвенный конвейер (3 звена) ---"
-hyperfine --warmup 3 --runs 20 --export-json benchmark_results/scenario_c_3steps.json \
-  -n "Rust (3 steps)" "$RUST_BIN bus set test.count 100 '->' bus get test.count '->' cmd awk '{print \$1 * 2}'" \
-  -n "Python (3 steps)" "$PY_BIN $PY_SCRIPT bus set test.count 100 '->' bus get test.count '->' cmd awk '{print \$1 * 2}'"
-
-echo "--- 6. Сценарий C: Многозвенный конвейер (5 звеньев) ---"
-hyperfine --warmup 3 --runs 20 --export-json benchmark_results/scenario_c_5steps.json \
-  -n "Rust (5 steps)" "$RUST_BIN bus set test.count 100 '->' bus get test.count '->' cmd awk '{print \$1 * 2}' '->' bus set test.double '->' bus get test.double" \
-  -n "Python (5 steps)" "$PY_BIN $PY_SCRIPT bus set test.count 100 '->' bus get test.count '->' cmd awk '{print \$1 * 2}' '->' bus set test.double '->' bus get test.double"
-
-echo "--- 7. Сценарий D: Работа с шиной данных (StateBus set) ---"
-hyperfine --warmup 3 --runs 25 --export-json benchmark_results/scenario_d_bus_set.json \
-  -n "Rust: bus set pipeline.mode production" "$RUST_BIN bus set pipeline.mode production" \
-  -n "Python: bus set pipeline.mode production" "$PY_BIN $PY_SCRIPT bus set pipeline.mode production"
-
-echo "--- 8. Замер пикового потребления памяти (RSS) ---"
-measure_rss() {
-  local label="$1"
-  shift
-  local out
-  out=$(command time -v "$@" 2>&1 | grep "Maximum resident set size" | awk '{print $6}')
-  echo "$label: ${out} KB"
+# Запуск hyperfine: bench <файл> <warmup> <runs> <аргументы grime...>
+# Для Python добавляется парная команда, если задан PY_SCRIPT.
+bench() {
+    local name="$1" warmup="$2" runs="$3" args="$4"
+    local cmds=(-n "Rust: $args" "$GRIME_BIN $args")
+    if $WITH_PY; then
+        cmds+=(-n "Python: $args" "$PY_BIN $PY_SCRIPT $args")
+    fi
+    hyperfine --warmup "$warmup" --runs "$runs" --export-json "$OUT_DIR/$name.json" "${cmds[@]}"
 }
 
-measure_rss "Rust CLI (--help)" "$RUST_BIN" --help > benchmark_results/rss_summary.txt
-measure_rss "Python CLI (--help)" "$PY_BIN" "$PY_SCRIPT" --help >> benchmark_results/rss_summary.txt
-measure_rss "Rust 5-step pipeline" "$RUST_BIN" bus set test.count 100 "->" bus get test.count "->" cmd awk '{print $1 * 2}' "->" bus set test.double "->" bus get test.double >> benchmark_results/rss_summary.txt
-measure_rss "Python 5-step pipeline" "$PY_BIN" "$PY_SCRIPT" bus set test.count 100 "->" bus get test.count "->" cmd awk '{print $1 * 2}' "->" bus set test.double "->" bus get test.double >> benchmark_results/rss_summary.txt
+PIPE3="bus set test.count 100 '$SEP' bus get test.count '$SEP' cmd awk '{print \$1 * 2}'"
+PIPE5="$PIPE3 '$SEP' bus set test.double '$SEP' bus get test.double"
 
-cat benchmark_results/rss_summary.txt
-echo "=== БЕНЧМАРКИНГ УСПЕШНО ЗАВЕРШЕН ==="
+echo "=== СТАРТ БЕНЧМАРКИНГА GRIME (бинарник: $GRIME_BIN; Python: $WITH_PY) ==="
+
+echo "--- 1. Сценарий A: холодный запуск CLI (--help) ---"
+bench scenario_a_help 3 25 "--help"
+
+echo "--- 2. Сценарий A: холодный запуск CLI (--version) ---"
+bench scenario_a_version 3 25 "--version"
+
+echo "--- 3. Сценарий B: модуль host ---"
+bench scenario_b_host 3 20 "host"
+
+echo "--- 4. Сценарий B: модуль doctor ---"
+bench scenario_b_doctor 2 15 "doctor"
+
+echo "--- 5. Сценарий C: конвейер (3 звена) ---"
+bench scenario_c_3steps 3 20 "$PIPE3"
+
+echo "--- 6. Сценарий C: конвейер (5 звеньев) ---"
+bench scenario_c_5steps 3 20 "$PIPE5"
+
+echo "--- 7. Сценарий D: StateBus set ---"
+bench scenario_d_bus_set 3 25 "bus set pipeline.mode production"
+
+echo "--- 8. Пиковое потребление памяти (RSS) ---"
+measure_rss() {
+    local label="$1"
+    shift
+    local out
+    out=$(command time -v "$@" 2>&1 >/dev/null | grep "Maximum resident set size" | awk '{print $NF}' || true)
+    echo "$label: ${out} KB"
+}
+
+{
+    measure_rss "Rust CLI (--help)" "$GRIME_BIN" --help
+    measure_rss "Rust 5-step pipeline" bash -c "$GRIME_BIN $PIPE5"
+    if $WITH_PY; then
+        measure_rss "Python CLI (--help)" "$PY_BIN" "$PY_SCRIPT" --help
+        measure_rss "Python 5-step pipeline" bash -c "$PY_BIN $PY_SCRIPT $PIPE5"
+    fi
+} > "$OUT_DIR/rss_summary.txt"
+
+cat "$OUT_DIR/rss_summary.txt"
+echo "=== БЕНЧМАРКИНГ ЗАВЕРШЁН (результаты: $OUT_DIR) ==="

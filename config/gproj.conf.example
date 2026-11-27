@@ -20,6 +20,10 @@ apps=$HOME/.config/grime/apps
 distrobox_default=fedora-box
 # box_idle_timeout=300
 
+# Nix: проприетарные (unfree) пакеты разрешены по умолчанию (--impure + NIXPKGS_ALLOW_UNFREE,
+# allowUnfree в генерируемых flake). Отключить: false/0/no/off
+# nix_allow_unfree=false
+
 # ИИ-агенты: auto — первый доступный (claude, затем aider); claude/aider — путь к бинарю или auto
 ai_agent=auto
 claude=auto

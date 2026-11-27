@@ -66,10 +66,10 @@ Scanner.LANG_PACKAGES = LANG_PACKAGES
 Scanner.TOOLCHAIN_SET = TOOLCHAIN_SET
 Scanner.LANG_ALIASES = utils.LANG_ALIASES
 
-local function run_capture(argv, c)
+local function run_capture(argv, c, cwd)
     local ctx_obj = c or (grime and grime.ctx)
     if ctx_obj and ctx_obj.capture then
-        return ctx_obj.capture(argv)
+        return ctx_obj.capture(argv, cwd)
     end
     if grime and grime.process and grime.process.capture then
         return grime.process.capture(argv)
@@ -87,47 +87,41 @@ end
 function Scanner.get_project_files(root, c)
     local files = {}
 
-    -- 1. Попытка получить срез через git ls-files
-    local res_git = run_capture({ "git", "-C", root, "ls-files" }, c)
+    -- 1. Попытка получить срез через git ls-files (-z и quotePath=false: имена без экранирования)
+    local res_git = run_capture({ "git", "-c", "core.quotePath=false", "-C", root, "ls-files", "-z" }, c)
     if res_git and res_git.code == 0 and res_git.stdout and #res_git.stdout > 0 then
-        for line in res_git.stdout:gmatch("[^\r\n]+") do
-            local trimmed = line:match("^%s*(.-)%s*$")
-            if #trimmed > 0 then
-                table.insert(files, trimmed)
-            end
+        for entry in res_git.stdout:gmatch("[^%z\r\n]+") do
+            table.insert(files, entry)
         end
         if #files > 0 then
+            table.sort(files)
             return files
         end
     end
 
-    -- 2. Fallback: интеллектуальный обход через find (массив аргументов без шелл-инъекций)
-    local res_find = run_capture({
-        "find", root, "-maxdepth", "5", "-type", "f",
-        "!", "-path", "*/.*",
-        "!", "-path", "*/build/*",
-        "!", "-path", "*/target/*",
-        "!", "-path", "*/node_modules/*",
-        "!", "-path", "*/.venv/*",
-        "!", "-path", "*/venv/*",
-        "!", "-path", "*/bin/*",
-        "!", "-path", "*/obj/*",
-        "!", "-path", "*/dist/*",
-        "!", "-path", "*/__pycache__/*",
-    }, c)
+    -- 2. Fallback: обход через find по относительным путям (корень в скрытом каталоге не ломается).
+    -- Служебные и скрытые подкаталоги отсекаются через -prune по имени.
+    local argv = { "find", ".", "-maxdepth", "5", "(" }
+    local first = true
+    for _, name in ipairs({ ".?*", "build", "target", "node_modules", "venv", "bin", "obj", "dist", "__pycache__" }) do
+        if not first then table.insert(argv, "-o") end
+        first = false
+        table.insert(argv, "-name")
+        table.insert(argv, name)
+    end
+    for _, a in ipairs({ ")", "-prune", "-o", "-type", "f", "-print" }) do
+        table.insert(argv, a)
+    end
+    local res_find = run_capture(argv, c, root)
     if res_find and res_find.code == 0 and res_find.stdout and #res_find.stdout > 0 then
-        local prefix = root:gsub("/+$", "") .. "/"
         for line in res_find.stdout:gmatch("[^\r\n]+") do
-            local rel = line
-            if rel:find(prefix, 1, true) == 1 then
-                rel = rel:sub(#prefix + 1)
-            end
-            local trimmed = rel:match("^%s*(.-)%s*$")
-            if #trimmed > 0 then
-                table.insert(files, trimmed)
+            local rel = line:gsub("^%./", "")
+            if #rel > 0 then
+                table.insert(files, rel)
             end
         end
         if #files > 0 then
+            table.sort(files)
             return files
         end
     end
@@ -218,7 +212,8 @@ function Scanner.scan_project(root, c)
         end
 
         -- Проверка shebang и метаданных # nix: для скриптов (в т.ч. без расширения)
-        if fname ~= "app.lua" and fname ~= "flake.nix" and fname ~= "flake.lock" then
+        -- (только для файлов-скриптов/исходников: не .md/.txt/ассеты/бинарники)
+        if fname ~= "app.lua" and fname ~= "flake.nix" and fname ~= "flake.lock" and utils.is_script_file(fname) then
             local hdr, is_bin = utils.parse_script_header(root .. "/" .. f)
             if hdr and not is_bin then
                 if hdr.lang then
@@ -275,7 +270,12 @@ function Scanner.scan_project(root, c)
     end
 
     -- Дополнительная проверка адаптеров через :detect()
-    for lang, adp in pairs(ADAPTERS) do
+    -- (порядок детерминирован: стабильный хэш эфемерного flake)
+    local adapter_names = {}
+    for lang in pairs(ADAPTERS) do table.insert(adapter_names, lang) end
+    table.sort(adapter_names)
+    for _, lang in ipairs(adapter_names) do
+        local adp = ADAPTERS[lang]
         if not detected_langs_set[lang] and adp.detect and adp:detect(root) then
             register_lang(lang)
         end

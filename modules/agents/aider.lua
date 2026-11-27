@@ -15,14 +15,15 @@ local AiderAgent = BaseAgent.new({
     supports_interactive = true,
 })
 
-local function has_arg(list, target)
-    if type(list) ~= "table" then return false end
-    for _, v in ipairs(list) do
-        if v == target then
-            return true
-        end
+local has_arg = BaseAgent.has_arg
+
+--- Aider в режиме --yes-always автоматически подтверждает и ВЫПОЛНЕНИЕ предложенных shell-команд,
+--- минуя проверки безопасности GRIME (validate_command_security). Поэтому всегда отключаем
+--- предложение shell-команд, если пользователь явно не включил его через passthrough.
+local function disable_shell_suggestions(cmd, extra)
+    if not has_arg(extra, "--suggest-shell-commands") and not has_arg(extra, "--no-suggest-shell-commands") then
+        table.insert(cmd, "--no-suggest-shell-commands")
     end
-    return false
 end
 
 --- Команда быстрого one-shot планирования стека через Aider
@@ -36,13 +37,11 @@ function AiderAgent:build_architect_cmd(opts, ctx)
         "--map-tokens", "0",
         "--exit",
         "--yes-always",
+        "--no-suggest-shell-commands", -- --yes-always не должен исполнять shell в обход GRIME
         "--no-fancy-input",
         "--no-pretty",
     }
-    if opts.model and opts.model ~= "" then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
-    end
+    BaseAgent.append_model(cmd, opts.model)
     table.insert(cmd, "-m")
     table.insert(cmd, opts.prompt or "")
     return cmd
@@ -72,27 +71,11 @@ function AiderAgent:build_headless_cmd(opts, ctx)
         table.insert(cmd, "--no-pretty")
     end
 
-    if opts.model and opts.model ~= "" and not has_arg(extra, "--model") then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
-    end
+    disable_shell_suggestions(cmd, extra)
 
-    if type(opts.read_files) == "table" then
-        for _, rf in ipairs(opts.read_files) do
-            if type(rf) == "string" and rf ~= "" then
-                table.insert(cmd, "--read")
-                table.insert(cmd, rf)
-            end
-        end
-    end
-
-    if type(opts.files) == "table" then
-        for _, f in ipairs(opts.files) do
-            if type(f) == "string" and f ~= "" then
-                table.insert(cmd, f)
-            end
-        end
-    end
+    BaseAgent.append_model(cmd, opts.model, extra)
+    BaseAgent.append_repeated(cmd, "--read", opts.read_files)
+    BaseAgent.append_positional(cmd, opts.files)
 
     local combined_prompt = opts.prompt or ""
     if opts.system_prompt and opts.system_prompt ~= "" then
@@ -105,9 +88,7 @@ function AiderAgent:build_headless_cmd(opts, ctx)
     table.insert(cmd, "-m")
     table.insert(cmd, combined_prompt)
 
-    for _, a in ipairs(extra) do
-        table.insert(cmd, a)
-    end
+    BaseAgent.append_passthrough(cmd, extra)
 
     return cmd
 end
@@ -123,36 +104,23 @@ function AiderAgent:build_interactive_cmd(opts, ctx)
         table.insert(cmd, "--no-git")
     end
 
-    if opts.model and opts.model ~= "" and not has_arg(extra, "--model") then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
+    -- Если пользователь включил автоподтверждение, shell-команды тоже не должны выполняться молча
+    if has_arg(extra, "--yes-always") or has_arg(extra, "--yes") then
+        disable_shell_suggestions(cmd, extra)
     end
 
-    if type(opts.read_files) == "table" then
-        for _, rf in ipairs(opts.read_files) do
-            if type(rf) == "string" and rf ~= "" then
-                table.insert(cmd, "--read")
-                table.insert(cmd, rf)
-            end
-        end
-    end
+    BaseAgent.append_model(cmd, opts.model, extra)
+    BaseAgent.append_repeated(cmd, "--read", opts.read_files)
 
+    -- У aider нет флага --system-prompt: правила GRIME и контекст терминала передаются
+    -- как read-only файл (--read) со временным содержимым, которым владеет вызывающий код
     if opts.tmp_term_file and opts.tmp_term_file ~= "" then
         table.insert(cmd, "--read")
         table.insert(cmd, opts.tmp_term_file)
     end
 
-    if type(opts.files) == "table" then
-        for _, f in ipairs(opts.files) do
-            if type(f) == "string" and f ~= "" then
-                table.insert(cmd, f)
-            end
-        end
-    end
-
-    for _, a in ipairs(extra) do
-        table.insert(cmd, a)
-    end
+    BaseAgent.append_positional(cmd, opts.files)
+    BaseAgent.append_passthrough(cmd, extra)
 
     return cmd
 end

@@ -1,8 +1,8 @@
--- Summary: Управление фоновым сервисом-демоном GRIME и терминальным контекстом
--- Description: Управление фоновым сервисом-демоном GRIME и терминальным контекстом
-description = "Управление фоновым сервисом-демоном GRIME и терминальным контекстом"
+--@grime description: Управление фоновым сервисом-демоном GRIME и терминальным контекстом
+
 
 local ctx = grime.ctx
+local utils = require("languages.utils")
 
 local function print_help()
     print(string.format([[
@@ -30,68 +30,89 @@ local function print_help()
 end
 
 local function get_socket_path()
-    local xdg = os.getenv("XDG_RUNTIME_DIR")
-    if xdg and #xdg > 0 then
-        return xdg .. "/grime.sock"
-    end
-    local uid = "default"
-    local res = ctx.capture({ "id", "-u" })
-    if res and res.code == 0 and res.stdout then
-        local u = res.stdout:match("%d+")
-        if u and #u > 0 then uid = u end
-    end
-    if ctx.exists("/run/user/" .. uid) then
-        return "/run/user/" .. uid .. "/grime.sock"
-    end
-    return "/tmp/grime-" .. uid .. ".sock"
+    return utils.daemon_socket_path(ctx)
 end
 
-local function get_state_file()
-    local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
-    if not ctx.exists(dir) then ctx.mkdir_p(dir) end
-    return dir .. "/state.json"
-end
-
-local function load_persisted_state()
-    local sfile = get_state_file()
-    if ctx.exists(sfile) then
-        local content = grime.fs.read(sfile)
-        if content and #content > 0 then
-            local ok, data = pcall(grime.json.decode, content)
-            if ok and type(data) == "table" then return data end
-        end
-    end
-    return {}
-end
-
-local function write_state_atomic(data)
-    local sfile = get_state_file()
-    local tmp = sfile .. ".tmp." .. tostring(os.time())
-    local f = io.open(tmp, "w")
-    if f then
-        f:write(grime.json.encode(data))
-        f:close()
-        os.rename(tmp, sfile)
-    end
-end
-
-local function save_persisted_key(key, val)
-    local data = load_persisted_state()
-    data[key] = val
-    write_state_atomic(data)
-end
-
-local function remove_persisted_key(key)
-    local data = load_persisted_state()
-    data[key] = nil
-    write_state_atomic(data)
-end
-
+--- Запись ключа в шину состояния (персистентность и flock обеспечивает ядро)
 local function save_bus_key(key, val)
     if grime and grime.bus and grime.bus.set then
         pcall(grime.bus.set, key, val)
     end
-    save_persisted_key(key, val)
+end
+
+local DAEMON_ARG = "--daemon-server"
+local STOP_TIMEOUT_SEC = 3
+
+--- Поиск PID демона по точному совпадению /proc/<pid>/cmdline: `<...>/grime --daemon-server`.
+--- Родительский sh, pgrep и прочие процессы с подстрокой в командной строке не совпадают.
+local function find_daemon_pids()
+    local pids = {}
+    local ok, entries = pcall(grime.fs.list, "/proc")
+    if not ok or type(entries) ~= "table" then return pids end
+    for _, name in ipairs(entries) do
+        if name:match("^%d+$") then
+            local f = io.open("/proc/" .. name .. "/cmdline", "rb")
+            if f then
+                local raw = f:read("*a") or ""
+                f:close()
+                local parts = {}
+                for part in raw:gmatch("([^%z]+)") do table.insert(parts, part) end
+                if #parts == 2 and parts[2] == DAEMON_ARG
+                    and (parts[1]:match("([^/]+)$") == "grime"
+                        or parts[1] == utils.self_exe())
+                    and utils.is_pid_alive(name) then
+                    table.insert(pids, name)
+                end
+            end
+        end
+    end
+    table.sort(pids, function(x, y) return tonumber(x) < tonumber(y) end)
+    return pids
+end
+
+--- Ожидание условия с опросом (до timeout секунд)
+local function wait_until(cond, timeout)
+    local deadline = os.time() + timeout
+    repeat
+        if cond() then return true end
+        os.execute("sleep 0.1")
+    until os.time() > deadline
+    return cond()
+end
+
+local function all_dead(pids)
+    for _, pid in ipairs(pids) do
+        if utils.is_pid_alive(pid) then return false end
+    end
+    return true
+end
+
+--- Остановка процессов демона: SIGTERM, ожидание, при необходимости SIGKILL; сокет удаляется после завершения.
+--- Возвращает true, если все процессы завершены.
+local function stop_daemon(sock)
+    local pids = find_daemon_pids()
+    if #pids == 0 then return true end
+    for _, pid in ipairs(pids) do ctx.capture({ "kill", "-TERM", pid }) end
+    if not wait_until(function() return all_dead(pids) end, STOP_TIMEOUT_SEC) then
+        for _, pid in ipairs(pids) do
+            if utils.is_pid_alive(pid) then ctx.capture({ "kill", "-KILL", pid }) end
+        end
+        wait_until(function() return all_dead(pids) end, 1)
+    end
+    if not all_dead(pids) then return false end
+    if ctx.exists(sock) then ctx.delete(sock, true) end
+    return true
+end
+
+--- Запуск демона в фоне; возвращает PID или nil
+local function start_daemon()
+    utils.spawn_background({ utils.self_exe(), DAEMON_ARG }, ".", nil, nil, ctx)
+    local pids = {}
+    wait_until(function()
+        pids = find_daemon_pids()
+        return #pids > 0
+    end, 2)
+    return pids[1]
 end
 
 local function get_terminal_dump_data()
@@ -100,13 +121,6 @@ local function get_terminal_dump_data()
         local ok, res = pcall(grime.bus.get, "daemon.terminal_dump")
         if ok and res ~= nil then
             val = res
-        end
-    end
-    if val == nil then
-        local persisted = load_persisted_state()
-        val = persisted["daemon.terminal_dump"]
-        if val ~= nil and grime and grime.bus and grime.bus.set then
-            pcall(grime.bus.set, "daemon.terminal_dump", val)
         end
     end
     if type(val) == "string" and (val:sub(1,1) == "{" or val:sub(1,1) == "[") then
@@ -158,7 +172,7 @@ local DAEMON_ACTIONS = {
     ["-help"] = "help", ["--help"] = "help", ["-h"] = "help",
 }
 
-function main()
+local function main()
     local args = ctx.args or {}
     for _, a in ipairs(args) do
         if type(a) == "string" and a:match("^%-") then
@@ -198,11 +212,9 @@ function main()
     local sock = get_socket_path()
 
     if action == "status" then
-        local pgrep = ctx.capture({ "pgrep", "-f", "grime --daemon-server" })
-        local is_running = pgrep.code == 0
-
-        if is_running then
-            local pid = grime.str.trim(pgrep.stdout)
+        local pids = find_daemon_pids()
+        if #pids > 0 then
+            local pid = table.concat(pids, ",")
             grime.ui.success(string.format("Демон grime активен (PID: %s, сокет: %s)", pid, sock))
             ctx.success(pid)
         else
@@ -216,8 +228,7 @@ function main()
             if ok and res then alive = true end
         end
         if not alive then
-            local pgrep = ctx.capture({ "pgrep", "-f", "grime --daemon-server" })
-            alive = (pgrep.code == 0)
+            alive = #find_daemon_pids() > 0
         end
         if alive then
             grime.ui.success("PONG: демон grime активен")
@@ -226,53 +237,41 @@ function main()
             ctx.fail("Демон grime недоступен")
         end
     elseif action == "start" then
-        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
-        if pgrep.code == 0 then
-            local pid = grime.str.trim(pgrep.stdout)
-            grime.ui.warn("Демон grime уже запущен (PID: " .. pid .. ")")
+        local pids = find_daemon_pids()
+        if #pids > 0 then
+            grime.ui.warn("Демон grime уже запущен (PID: " .. table.concat(pids, ",") .. ")")
             ctx.success("already_running")
             return
         end
         ctx.log("Запуск демона grime в фоне...")
-        local res = ctx.run_shell("nohup setsid grime --daemon-server >/dev/null 2>&1 &", ".")
-        os.execute("sleep 0.1")
-        local check = ctx.capture("pgrep -f 'grime --daemon-server'")
-        if check.code == 0 then
-            local pid = grime.str.trim(check.stdout)
+        local pid = start_daemon()
+        if pid then
             grime.ui.success(string.format("Демон grime успешно запущен (PID: %s)", pid))
             ctx.success("started")
         else
             ctx.fail("Не удалось запустить демон grime")
         end
-    elseif action == "stop" or action == "kill" then
-        local pgrep = ctx.capture("pgrep -f 'grime --daemon-server'")
-        if pgrep.code ~= 0 then
+    elseif action == "stop" then
+        if #find_daemon_pids() == 0 then
             grime.ui.warn("Демон grime не был запущен")
             ctx.success("not_running")
             return
         end
         ctx.log("Остановка демона grime...")
-        local res = ctx.run_shell("pkill -f 'grime --daemon-server'", ".")
-        if res == 0 then
-            if ctx.exists(sock) then
-                ctx.delete(sock, true)
-            end
+        if stop_daemon(sock) then
             grime.ui.success("Демон grime остановлен")
             ctx.success("stopped")
         else
             ctx.fail("Не удалось остановить процесс grime --daemon-server")
         end
     elseif action == "restart" then
-        ctx.run_shell("pkill -f 'grime --daemon-server'", ".")
-        if ctx.exists(sock) then
-            ctx.delete(sock, true)
+        -- Старый процесс должен завершиться до запуска нового
+        if not stop_daemon(sock) then
+            ctx.fail("Старый процесс демона не завершился за отведённое время")
+            return
         end
-        os.execute("sleep 0.1")
-        ctx.run_shell("nohup setsid grime --daemon-server >/dev/null 2>&1 &", ".")
-        os.execute("sleep 0.1")
-        local check = ctx.capture("pgrep -f 'grime --daemon-server'")
-        if check.code == 0 then
-            local pid = grime.str.trim(check.stdout)
+        local pid = start_daemon()
+        if pid then
             grime.ui.success(string.format("Демон grime успешно перезапущен (PID: %s)", pid))
             ctx.success("restarted")
         else
@@ -387,13 +386,12 @@ function main()
         local text_out = table.concat(lines, "\n")
         print(text_out)
         ctx.success(grime.json.encode(dump_data))
-    elseif action == "clear" or action == "reset" then
+    elseif action == "clear" then
         if grime and grime.bus and grime.bus.delete then
             pcall(grime.bus.delete, "daemon.terminal_dump")
         elseif grime and grime.bus and grime.bus.set then
             pcall(grime.bus.set, "daemon.terminal_dump", nil)
         end
-        remove_persisted_key("daemon.terminal_dump")
         grime.ui.success("Терминальный контекст успешно очищен")
         ctx.success("cleared")
     else
@@ -403,5 +401,4 @@ end
 
 return {
     main = main,
-    description = description,
 }

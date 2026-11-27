@@ -32,7 +32,6 @@ function CppAdapter:create_default_files(root, ctx)
     local proj_name = root:match("([^/\\]+)$") or "MyGame"
     local tpl_root = (ctx.paths and ctx.paths.templates)
         or (ctx.get_path and ctx.get_path("templates"))
-        or (ctx.templates_root and ctx.templates_root())
         or "./templates"
     tpl_root = ctx.normalize_path(tpl_root)
 
@@ -113,7 +112,8 @@ function CppAdapter:get_target(root, ctx)
         if utils.file_exists(root .. "/build/main") then
             return root .. "/build/main"
         end
-        return BaseAdapter.get_target(self, root) or build_target
+        -- Артефакт ещё не собран: возвращаем ожидаемый путь, а не исходник
+        return build_target
     end
 
     -- Если CMakeLists.txt отсутствует: возвращать прямой бинарник (<root>/<target>)
@@ -130,7 +130,7 @@ function CppAdapter:build(root, ctx)
     -- 1. Если есть CMakeLists.txt -> собирать через cmake + ninja
     if ctx.exists(root .. "/CMakeLists.txt") then
         ctx.log("Компиляция C++ проекта (CMake + Ninja) в " .. root .. "...")
-        local code = ctx.run_shell("cmake -B build -G Ninja && ninja -C build", root)
+        local code = ctx.run_shell(utils.cmake_configure_cmd() .. " && ninja -C build", root)
         return code == 0
     end
 

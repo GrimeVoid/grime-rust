@@ -1,8 +1,12 @@
--- Summary: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)
--- Description: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)
-description = "Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua)"
+--@grime description: Полиглот-оркестратор проектов (C++, Rust, Python, Java, Lua, Bash, Fish)
+--@grime alias: proj
+--@grime default: true
+--@grime path.projects: ~/Projects
+--@grime path.templates: ~/.config/grime/templates
+
 
 local ctx = grime.ctx
+local utils = require("languages.utils")
 
 local ACTION_SYNONYMS = {
     ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list", ["-l"] = "list",
@@ -18,22 +22,17 @@ local ACTION_SYNONYMS = {
 
 local LANGUAGE_ADAPTERS = {
     cpp = require("languages.cpp"),
-    python = require("languages.python"),
     rust = require("languages.rust"),
+    python = require("languages.python"),
     java = require("languages.java"),
     lua = require("languages.lua"),
+    bash = require("languages.bash"),
+    fish = require("languages.fish"),
 }
 
-local LANGUAGE_ALIASES = {
-    cpp = "cpp", ["c++"] = "cpp", c = "cpp",
-    python = "python", py = "python",
-    rust = "rust", rs = "rust",
-    java = "java", jav = "java",
-    lua = "lua", luajit = "lua",
-}
-
+--- Поддерживаемые языки в каноническом порядке (utils.LANG_ORDER)
 local function get_supported_languages()
-    return { "cpp", "python", "rust", "java", "lua" }
+    return utils.LANG_ORDER
 end
 
 local function detect_language(dir)
@@ -46,99 +45,203 @@ local function detect_language(dir)
     return nil
 end
 
+--- Корень проектов с выводом ошибки при отсутствии настройки
 local function get_projects_root()
-    local root = (ctx.paths and ctx.paths.projects)
-        or (ctx.get_path and ctx.get_path("projects"))
-        or (ctx.projects_root and ctx.projects_root())
-    if not root or root == "" then
-        local home = os.getenv("HOME") or ""
-        root = (home ~= "" and (home .. "/Projects")) or "./projects"
+    local root, err = utils.get_projects_root(ctx)
+    if not root then
+        ctx.fail(err)
+        return nil
     end
-    return ctx.normalize_path(root)
+    return root
 end
 
-local function get_templates_root()
-    local root = (ctx.paths and ctx.paths.templates)
-        or (ctx.get_path and ctx.get_path("templates"))
-        or (ctx.templates_root and ctx.templates_root())
-    if not root or root == "" then
-        local home = os.getenv("HOME") or ""
-        root = (home ~= "" and (home .. "/.config/grime/templates")) or "./templates"
-    end
-    return ctx.normalize_path(root)
-end
-
+--- Каталог-«корзина» языка: существующий вариант регистра либо предпочтительное имя для создания
 local function get_language_dir(projects_root, lang)
     projects_root = ctx.normalize_path(projects_root or get_projects_root())
-    local candidates = {
-        projects_root .. "/" .. lang,
-        projects_root .. "/" .. lang:sub(1,1):upper() .. lang:sub(2),
-        projects_root .. "/" .. lang:upper(),
-    }
-    if lang == "cpp" then
-        table.insert(candidates, projects_root .. "/C++")
-        table.insert(candidates, projects_root .. "/c++")
-    end
-    for _, cand in ipairs(candidates) do
+    local names = utils.lang_dir_names(lang)
+    if #names == 0 then names = { lang } end
+    for _, n in ipairs(names) do
+        local cand = projects_root .. "/" .. n
         if ctx.exists(cand) then
             return cand
         end
     end
-    return candidates[1]
+    return projects_root .. "/" .. names[1]
 end
 
-local function find_project_dir(lang_dir, query)
-    if not ctx.exists(lang_dir) then
+--- Краткое описание проекта (grime.json, Cargo.toml, первая строка README) либо ""
+local function project_description(pdir)
+    local function read(path)
+        if not ctx.exists(path) then return nil end
+        local ok, content = pcall(grime.fs.read, path)
+        return ok and type(content) == "string" and content or nil
+    end
+    local function cut(s)
+        s = s:gsub("%s+", " "):match("^%s*(.-)%s*$")
+        if #s > 70 then s = s:sub(1, 70):gsub("[\128-\191]*$", ""):gsub("[\192-\255]$", "") .. "…" end
+        return s
+    end
+    local j = read(pdir .. "/grime.json")
+    local d = j and j:match('"description"%s*:%s*"([^"]*)"')
+    if d and d ~= "" then return cut(d) end
+    local c = read(pdir .. "/Cargo.toml")
+    d = c and c:match('description%s*=%s*"([^"]+)"')
+    if d and d ~= "" then return cut(d) end
+    for _, rn in ipairs({ "README.md", "readme.md", "README" }) do
+        local r = read(pdir .. "/" .. rn)
+        if r then
+            for line in r:gmatch("[^\r\n]+") do
+                local t = line:match("^%s*(.-)%s*$")
+                if #t >= 5 and not t:match("^[#%[<|>%-=]") then return cut(t) end
+            end
+        end
+    end
+    return ""
+end
+
+--- Сбор проектов из корня проектов и extra_roots.
+--- opts = { lang = <язык>|nil, extra_roots = {пути}|nil, no_desc = bool }.
+--- Возвращает массив { name, lang, path, bucket, description }; плоские проекты (без бакета) имеют lang="mixed".
+local function collect_projects(opts)
+    opts = opts or {}
+    local want = opts.lang and (utils.LANG_ALIASES[tostring(opts.lang):lower()] or tostring(opts.lang):lower()) or nil
+    local roots = {}
+    local pr = utils.get_projects_root(ctx)
+    if pr then roots[#roots + 1] = pr end
+    for _, r in ipairs(opts.extra_roots or {}) do
+        if type(r) == "string" and r ~= "" then roots[#roots + 1] = ctx.normalize_path(r) end
+    end
+
+    local list, seen = {}, {}
+    local function add(name, lang, path, bucket)
+        if seen[path] then return end
+        seen[path] = true
+        list[#list + 1] = {
+            name = name, lang = lang, path = path, bucket = bucket,
+            description = opts.no_desc and "" or project_description(path),
+        }
+    end
+    local function entries(dir)
+        local ok, items = pcall(grime.fs.list, dir)
+        return (ok and type(items) == "table") and items or {}
+    end
+
+    for _, root in ipairs(roots) do
+        if ctx.exists(root) and ctx.is_dir(root) then
+            for _, item in ipairs(entries(root)) do
+                local full = root .. "/" .. item
+                if item ~= "" and not item:match("^%.") and ctx.is_dir(full) then
+                    local bucket_lang = utils.LANG_ALIASES[item:lower()]
+                    if bucket_lang then
+                        if not want or want == bucket_lang then
+                            for _, sub in ipairs(entries(full)) do
+                                local pdir = full .. "/" .. sub
+                                if sub ~= "" and not sub:match("^%.") and ctx.is_dir(pdir) then
+                                    add(sub, bucket_lang, ctx.normalize_path(pdir), item)
+                                end
+                            end
+                        end
+                    elseif not want then
+                        add(item, "mixed", ctx.normalize_path(full), nil)
+                    end
+                end
+            end
+        end
+    end
+
+    local order = {}
+    for i, l in ipairs(utils.LANG_ORDER) do order[l] = i end
+    table.sort(list, function(a, b)
+        if a.lang ~= b.lang then
+            local oa, ob = order[a.lang] or 99, order[b.lang] or 99
+            if oa ~= ob then return oa < ob end
+            return a.lang < b.lang
+        end
+        return a.name:lower() < b.name:lower()
+    end)
+    return list
+end
+
+--- Поиск проекта по запросу. opts = { lang, exact, extra_roots }.
+--- Порядок: точное имя, регистронезависимое, префикс, подстрока, fuzzy (0.75).
+--- Возвращает path, lang, name либо nil.
+local function find_project(query, opts)
+    opts = opts or {}
+    if type(query) ~= "string" or not utils.valid_name(query) then
         return nil
     end
+    local cands = collect_projects({ lang = opts.lang, extra_roots = opts.extra_roots, no_desc = true })
+    if #cands == 0 then return nil end
 
-    -- 1. Точное совпадение
-    local exact = lang_dir .. "/" .. query
-    if ctx.exists(exact) then
-        return exact
+    local function result(p)
+        return p.path, (p.lang ~= "mixed" and p.lang) or detect_language(p.path) or "mixed", p.name
     end
 
-    -- Перечисление директорий без вызова шелла
-    local subdirs = {}
-    local entries = (grime and grime.fs and grime.fs.list and grime.fs.list(lang_dir)) or {}
-    for _, line in ipairs(entries) do
-        if line ~= "" and not line:match("^%.") and ctx.exists(lang_dir .. "/" .. line) then
-            table.insert(subdirs, line)
-        end
+    local q = query:lower()
+    for _, p in ipairs(cands) do
+        if p.name == query then return result(p) end
+    end
+    for _, p in ipairs(cands) do
+        if p.name:lower() == q then return result(p) end
+    end
+    if opts.exact then return nil end
+
+    for _, p in ipairs(cands) do
+        if p.name:lower():sub(1, #q) == q then return result(p) end
+    end
+    for _, p in ipairs(cands) do
+        if p.name:lower():find(q, 1, true) then return result(p) end
     end
 
-    -- 2. Точное совпадение без учета регистра
-    for _, name in ipairs(subdirs) do
-        if name:lower() == query:lower() then
-            return lang_dir .. "/" .. name
-        end
-    end
-
-    -- 3. Префикс
-    for _, name in ipairs(subdirs) do
-        if name:lower():find("^" .. query:lower()) then
-            return lang_dir .. "/" .. name
-        end
-    end
-
-    -- 4. Подстрока
-    for _, name in ipairs(subdirs) do
-        if name:lower():find(query:lower(), 1, true) then
-            return lang_dir .. "/" .. name
-        end
-    end
-
-    -- 5. Нечеткий поиск с высоким порогом (порог 0.75)
-    local best, _ = grime.fuzzy.find_best_match(query, subdirs, 0.75)
+    local names = {}
+    for _, p in ipairs(cands) do names[#names + 1] = p.name end
+    local best = grime.fuzzy.find_best_match(query, names, 0.75)
     if best then
-        ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
-        return lang_dir .. "/" .. best
+        for _, p in ipairs(cands) do
+            if p.name == best then
+                ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
+                return result(p)
+            end
+        end
     end
-
     return nil
 end
 
-local function handle_rename(projects_root, args)
+--- В неинтерактивном режиме без --yes — отказ.
+local function confirm_destructive(prompt, assume_yes)
+    if assume_yes then return true end
+    if not os.execute("test -t 0") then
+        ctx.fail("Требуется подтверждение: в неинтерактивном режиме добавьте --yes (-y)")
+        return false
+    end
+    io.stdout:write(prompt .. " [y/N]: ")
+    io.stdout:flush()
+    local ans = io.read()
+    local low = ans and ans:match("^%s*(.-)%s*$"):lower() or ""
+    if low == "y" or low == "yes" or low == "д" or low == "да" then
+        return true
+    end
+    ctx.fail("Действие отменено пользователем")
+    return false
+end
+
+--- Точный поиск проекта строго по имени внутри projects_root: <язык-каталог>/<имя>.
+--- Возвращает список { lang, path }. Без префиксов, подстрок, fuzzy и путей от CWD.
+local function find_exact_projects(projects_root, name, lang_filter)
+    local found, seen = {}, {}
+    local langs = lang_filter and { lang_filter } or get_supported_languages()
+    for _, lang in ipairs(langs) do
+        local lang_dir = get_language_dir(projects_root, lang)
+        local pdir = lang_dir .. "/" .. name
+        if ctx.exists(lang_dir) and ctx.is_dir(pdir) and not seen[pdir] then
+            seen[pdir] = true
+            table.insert(found, { lang = lang, path = ctx.normalize_path(pdir) })
+        end
+    end
+    return found
+end
+
+local function handle_rename(projects_root, args, lang_filter)
     projects_root = ctx.normalize_path(projects_root)
     if not args or #args < 2 then
         ctx.fail("Использование: project -rename <СтароеИмя> <НовоеИмя>")
@@ -146,17 +249,24 @@ local function handle_rename(projects_root, args)
     end
 
     local old_name, new_name = args[1], args[2]
+    for _, n in ipairs({ old_name, new_name }) do
+        local ok, err = utils.valid_name(n)
+        if not ok then
+            ctx.fail(string.format("Недопустимое имя проекта '%s': %s", tostring(n), err))
+            return nil
+        end
+    end
     local renamed_path = nil
 
-    for _, lang in ipairs(get_supported_languages()) do
-        local lang_dir = get_language_dir(projects_root, lang)
-        local old_dir = lang_dir .. "/" .. old_name
-        local new_dir = lang_dir .. "/" .. new_name
-        if ctx.exists(old_dir) then
-            ctx.move(old_dir, new_dir)
-            ctx.log(string.format("Проект %s/%s переименован в %s", lang, old_name, new_name))
-            renamed_path = new_dir
+    for _, found in ipairs(find_exact_projects(projects_root, old_name, lang_filter)) do
+        local new_dir = ctx.normalize_path(get_language_dir(projects_root, found.lang) .. "/" .. new_name)
+        if ctx.exists(new_dir) then
+            ctx.fail(string.format("Проект '%s' (%s) уже существует, переименование отменено", new_name, found.lang))
+            return nil
         end
+        ctx.move(found.path, new_dir)
+        ctx.log(string.format("Проект %s/%s переименован в %s", found.lang, old_name, new_name))
+        renamed_path = new_dir
     end
 
     if not renamed_path then
@@ -214,6 +324,11 @@ local function resolve_project_context(parsed)
                 return action, resolve_abs_path(project_name), lang or "cpp", extra_args
             end
 
+            local name_ok, name_err = utils.valid_name(project_name)
+            if not name_ok then
+                ctx.fail(string.format("Недопустимое имя проекта '%s': %s", project_name, name_err))
+                return nil, nil, nil, nil
+            end
             local target_lang_dir = get_language_dir(projects_root, lang or "cpp")
             local target_dir = target_lang_dir .. "/" .. project_name
             return action, target_dir, lang or "cpp", extra_args
@@ -226,21 +341,17 @@ local function resolve_project_context(parsed)
         end
 
         if lang then
-            local target_lang_dir = get_language_dir(projects_root, lang)
-            local matched = find_project_dir(target_lang_dir, project_name)
+            local matched = find_project(project_name, { lang = lang })
             if matched then
                 return action, matched, lang, extra_args
             end
-            return action, target_lang_dir .. "/" .. project_name, lang, extra_args
+            return action, get_language_dir(projects_root, lang) .. "/" .. project_name, lang, extra_args
         end
 
         -- Ищем по всем поддерживаемым языкам
-        for _, candidate_lang in ipairs(supported_langs) do
-            local candidate_lang_dir = get_language_dir(projects_root, candidate_lang)
-            local matched = find_project_dir(candidate_lang_dir, project_name)
-            if matched then
-                return action, matched, candidate_lang, extra_args
-            end
+        local matched, matched_lang = find_project(project_name)
+        if matched then
+            return action, matched, matched_lang, extra_args
         end
 
         local default_lang = "cpp"
@@ -276,19 +387,13 @@ local function resolve_project_context(parsed)
             return action, target_lang_dir, lang, extra_args
         end
         -- Предохранитель: запрещено трогать корень языка для разрушительных или сборочных действий
-        local act_name = (action == "delete" and "-rm") or ("-" .. action)
-        ctx.fail(string.format("Укажите имя проекта: grime project %s <имя_проекта>", act_name))
+        ctx.fail(string.format("Укажите имя проекта: grime project -%s <имя_проекта>", action))
         return nil, nil, nil, nil
     end
 
     -- 5. Запрос пути без указания проекта -> возвращаем корень проектов
     if action == "path" then
         return action, projects_root, "cpp", extra_args
-    end
-
-    if action == "delete" or action == "clear" then
-        ctx.fail("Укажите имя проекта: grime project -rm <имя_проекта>")
-        return nil, nil, nil, nil
     end
 
     -- 6. Текущая папка вызова
@@ -304,37 +409,124 @@ local function resolve_project_context(parsed)
     return action, default_dir, default_lang, extra_args
 end
 
-local function handle_list(projects_root, parsed, return_path_requested)
+--- Удаление/сброс проекта: только по точному имени внутри projects_root и с подтверждением
+local function handle_destructive(projects_root, parsed, return_path_requested)
     projects_root = ctx.normalize_path(projects_root)
+    local act_name = (parsed.action == "delete") and "-rm" or "--clear"
+    local name = parsed.args[1]
+    if not name then
+        ctx.fail(string.format("Укажите имя проекта: grime project %s <имя_проекта>", act_name))
+        return
+    end
+    local ok, err = utils.valid_name(name)
+    if not ok then
+        ctx.fail(string.format("Недопустимое имя проекта '%s': %s", name, err))
+        return
+    end
+
+    local found = find_exact_projects(projects_root, name, parsed.categories.language)
+    -- Защита: путь строго <root>/<lang-bucket>/<name> (ровно два уровня) и внутри projects_root
+    do
+        local safe = {}
+        for _, f in ipairs(found) do
+            local rel = f.path:sub(1, #projects_root + 1) == (projects_root .. "/") and f.path:sub(#projects_root + 2) or nil
+            local bucket, leaf = nil, nil
+            if rel then bucket, leaf = rel:match("^([^/]+)/([^/]+)$") end
+            if bucket and leaf == name and not rel:find("..", 1, true) then
+                table.insert(safe, f)
+            else
+                ctx.log(string.format("Отказ: путь '%s' не является проектом <корень>/<язык>/<имя> в %s", f.path, projects_root))
+            end
+        end
+        found = safe
+    end
+    if #found == 0 then
+        ctx.fail(string.format("Проект '%s' не найден точно по имени в %s", name, projects_root))
+        return
+    end
+    if #found > 1 then
+        local langs = {}
+        for _, f in ipairs(found) do table.insert(langs, f.lang) end
+        ctx.fail(string.format("Имя '%s' неоднозначно (языки: %s). Укажите язык: grime project %s -<язык> %s",
+            name, table.concat(langs, ", "), act_name, name))
+        return
+    end
+
+    local target = found[1]
+    local verb = (parsed.action == "delete") and "Удалить" or "Сбросить к чистому шаблону"
+    if not confirm_destructive(string.format("%s проект '%s' (%s)?", verb, name, target.path), parsed.flags.yes) then
+        return
+    end
+
+    if parsed.action == "delete" then
+        ctx.delete(target.path)
+        ctx.log(string.format("Проект (%s) успешно удален: %s", target.lang, target.path))
+        if ctx.has_next_step or return_path_requested then
+            ctx.module_return(target.path)
+        end
+        return
+    end
+
+    local adapter = LANGUAGE_ADAPTERS[target.lang]
+    ctx.delete(target.path)
+    ctx.mkdir_p(target.path)
+    adapter:init_project(target.path, ctx)
+    ctx.log(string.format("Проект (%s) сброшен к заводским настройкам: %s", target.lang, target.path))
+    if ctx.has_next_step or return_path_requested then
+        if ctx.set_target_dir then ctx.set_target_dir(target.path) end
+        ctx.module_return(target.path)
+    end
+end
+
+--- Есть ли у цели запуска исполняемый артефакт. Для компилируемых языков исходник
+--- (например, src/main.cpp из entry_files базового адаптера) бинарником не считается.
+local COMPILED_SRC_EXT = { cpp = true, cc = true, cxx = true, c = true, h = true, hpp = true, rs = true, java = true }
+local function has_binary(lang, target)
+    if not target or not ctx.exists(target) then return false end
+    if lang == "cpp" or lang == "rust" or lang == "java" then
+        local ext = target:match("%.([%w]+)$")
+        if ext and COMPILED_SRC_EXT[ext:lower()] then return false end
+    end
+    return true
+end
+
+--- Сборка проекта: на хосте либо в изолированном Nix (флаг --nix или нехватка утилит).
+--- Возвращает ok, via_nix
+local function build_project(adapter, project_dir, parsed)
+    local use_nix = (parsed.flags and parsed.flags.nix) or false
+    local missing_tools = {}
+    local in_nix_shell = os.getenv("IN_NIX_SHELL")
+
+    if not use_nix and not in_nix_shell and adapter.check_dependencies then
+        local ok, missing = adapter:check_dependencies(ctx, project_dir)
+        if not ok then
+            use_nix = true
+            missing_tools = missing
+        end
+    end
+
+    if use_nix and not in_nix_shell then
+        if #missing_tools > 0 then
+            ctx.log(string.format("⚡ [Grime Smart Fallback] На хосте отсутствуют утилиты: %s. Автопереключение сборки в изолированный Nix...", table.concat(missing_tools, ", ")))
+        else
+            ctx.log("⚡ [Grime Nix] Сборка перенаправлена в изолированное Nix-окружение (--nix)...")
+        end
+        return ctx.run_process({ utils.self_exe(), "nix", "build", project_dir }) == 0, true
+    end
+
+    return adapter:build(project_dir, ctx) and true or false, false
+end
+
+local function handle_list(projects_root, parsed, return_path_requested)
     local target_lang = parsed.categories and parsed.categories.language or nil
     local filter = (parsed.args and #parsed.args > 0) and parsed.args[1]:lower() or nil
 
     local list = {}
-    local seen_paths = {}
-
-    local langs_to_scan = target_lang and { target_lang } or get_supported_languages()
-    for _, lang in ipairs(langs_to_scan) do
-        local lang_dir = get_language_dir(projects_root, lang)
-        if ctx.exists(lang_dir) and ctx.is_dir(lang_dir) then
-            local entries = (grime and grime.fs and grime.fs.list and grime.fs.list(lang_dir)) or {}
-            for _, item in ipairs(entries) do
-                if item ~= "" and not item:match("^%.") then
-                    local pdir = ctx.normalize_path(lang_dir .. "/" .. item)
-                    if ctx.is_dir(pdir) and not seen_paths[pdir] then
-                        if not filter or item:lower():find(filter, 1, true) or lang:lower():find(filter, 1, true) then
-                            seen_paths[pdir] = true
-                            table.insert(list, { name = item, lang = lang, path = pdir })
-                        end
-                    end
-                end
-            end
+    for _, p in ipairs(collect_projects({ lang = target_lang, no_desc = true })) do
+        if not filter or p.name:lower():find(filter, 1, true) or p.lang:lower():find(filter, 1, true) then
+            table.insert(list, p)
         end
     end
-
-    table.sort(list, function(a, b)
-        if a.lang ~= b.lang then return a.lang < b.lang end
-        return a.name:lower() < b.name:lower()
-    end)
 
     print(string.format("\n\27[1m📂 Проекты разработки (%d):\27[0m", #list))
     if #list > 0 then
@@ -391,10 +583,12 @@ local function print_help()
                               grime project -path MyGame
     %s--nix, -nix%s                Принудительная сборка/запуск в изолированном Nix Flake
     %s--force, -f%s                Перезаписать непустую директорию при инициализации
+    %s--yes, -y%s                  Подтвердить удаление/сброс без вопроса (-rm, --clear)
     %s-h, --help, help%s           Показать эту справку
 
 %sПОДДЕРЖИВАЕМЫЕ ЯЗЫКИ:%s
-    cpp (-cpp, C++), rust (-rust, -rs), python (-python, -py), java (-java), lua (-lua)
+    cpp (-cpp, C++), rust (-rust, -rs), python (-python, -py), java (-java), lua (-lua),
+    bash (-bash, -sh), fish (-fish)
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime project MyGame -path : cmd nvim CMakeLists.txt
@@ -413,13 +607,14 @@ local function print_help()
     "\27[36m", "\27[0m",
     "\27[33m", "\27[0m",
     "\27[33m", "\27[0m",
+    "\27[33m", "\27[0m",
     "\27[36m", "\27[0m",
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m"
     ))
 end
 
-function main()
+local function main()
     local raw_args = ctx.args or {}
     if #raw_args == 0 and not ctx.pipeline_input and not ctx.input then
         print_help()
@@ -436,6 +631,7 @@ function main()
     end
 
     local projects_root = get_projects_root()
+    if not projects_root then return end
 
     local parsed = ctx.parse_args({
         actions = ACTION_SYNONYMS,
@@ -445,18 +641,39 @@ function main()
             path_requested = { "-p", "--path", "-path" },
             help = { "-h", "--help", "-help" },
             force = { "-f", "--force", "-force" },
+            yes = { "-y", "--yes", "-yes" },
             nix = { "--nix", "-nix" },
         },
         value_flags = {
             lang = { "--lang", "-lang" },
         },
-        categories = { language = LANGUAGE_ALIASES },
+        categories = { language = utils.LANG_ALIASES },
         detect_dir = false,
     })
 
+    -- Действие без дефиса в первой позиции (project init rust Tool, project list): только если дефисного действия нет
+    if not parsed.action and parsed.args and #parsed.args > 0 then
+        local bare = ACTION_SYNONYMS["-" .. tostring(parsed.args[1]):lower()]
+        if bare and bare ~= "help" then
+            parsed.action = bare
+            table.remove(parsed.args, 1)
+        end
+    end
+
+    -- Язык без дефиса в первой позиции (project -init rust Tool, project rust Tool -init):
+    -- считаем языком, если за ним есть имя проекта либо действие init/path (одиночное слово в build/run — имя проекта)
+    if not parsed.categories.language and parsed.args and #parsed.args > 0 then
+        local first = tostring(parsed.args[1]):lower()
+        local canon = utils.LANG_ALIASES[first]
+        if canon and (#parsed.args >= 2 or parsed.action == "init" or parsed.action == "path") then
+            parsed.categories.language = canon
+            table.remove(parsed.args, 1)
+        end
+    end
+
     if parsed.flags.lang and type(parsed.flags.lang) == "string" then
         local l_low = parsed.flags.lang:lower():gsub("^%-+", "")
-        parsed.categories.language = LANGUAGE_ALIASES[l_low] or l_low
+        parsed.categories.language = utils.LANG_ALIASES[l_low] or l_low
     end
 
     if parsed.flags.help or parsed.action == "help" then
@@ -471,11 +688,16 @@ function main()
     end
 
     if parsed.action == "rename" then
-        local renamed = handle_rename(projects_root, parsed.args)
+        local renamed = handle_rename(projects_root, parsed.args, parsed.categories.language)
         if return_path_requested and renamed then
             if ctx.set_target_dir then ctx.set_target_dir(renamed) end
             ctx.module_return(renamed)
         end
+        return
+    end
+
+    if parsed.action == "delete" or parsed.action == "clear" then
+        handle_destructive(projects_root, parsed, return_path_requested)
         return
     end
 
@@ -496,7 +718,7 @@ function main()
         end
     end
 
-    local canonical_lang = LANGUAGE_ALIASES[lang:lower()] or lang
+    local canonical_lang = utils.LANG_ALIASES[lang:lower()] or lang
     local adapter = LANGUAGE_ADAPTERS[canonical_lang]
     if not adapter then
         ctx.fail("адаптер для языка '" .. lang .. "' не найден!")
@@ -537,43 +759,13 @@ function main()
             return
         end
 
-        local use_nix = (parsed.flags and parsed.flags.nix) or false
-        local missing_tools = {}
-
-        if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
-            local ok, missing = adapter:check_dependencies(ctx, project_dir)
-            if not ok then
-                use_nix = true
-                missing_tools = missing
-            end
-        end
-
-        if use_nix and not os.getenv("IN_NIX_SHELL") then
-            if #missing_tools > 0 then
-                ctx.log(string.format("⚡ [Grime Smart Fallback] На хосте отсутствуют утилиты: %s. Автопереключение сборки в изолированный Nix...", table.concat(missing_tools, ", ")))
-            else
-                ctx.log("⚡ [Grime Nix] Сборка перенаправлена в изолированное Nix-окружение (--nix)...")
-            end
-            local code = ctx.run_process({ "grime", "nix", "build", project_dir })
-            if code ~= 0 then
-                ctx.fail("Сборка в изолированном Nix окружении завершилась с ошибкой.")
-                return
-            end
-            ctx.log("Сборка успешно завершена через Nix!")
-            if ctx.has_next_step or return_path_requested then
-                if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
-                local target = adapter:get_target(project_dir)
-                ctx.module_return(return_path_requested and project_dir or (target or project_dir))
-            end
-            return
-        end
-
-        local ok = adapter:build(project_dir, ctx)
+        local ok, via_nix = build_project(adapter, project_dir, parsed)
         if not ok then
-            ctx.fail("Сборка проекта завершилась ошибкой.")
+            ctx.fail(via_nix and "Сборка в изолированном Nix окружении завершилась с ошибкой."
+                or "Сборка проекта завершилась ошибкой.")
             return
         end
-        ctx.log("Сборка успешно завершена!")
+        ctx.log(via_nix and "Сборка успешно завершена через Nix!" or "Сборка успешно завершена!")
         if ctx.has_next_step or return_path_requested then
             if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             local target = adapter:get_target(project_dir)
@@ -587,60 +779,28 @@ function main()
 
         local target = adapter:get_target(project_dir)
         local src_dir = project_dir .. "/" .. adapter.src_dir
-        if not target or ctx.needs_rebuild(src_dir, target) then
+        local via_nix = false
+        if not has_binary(canonical_lang, target) or ctx.needs_rebuild(src_dir, target) then
             ctx.log("Обнаружены изменения в исходниках. Запуск сборки...")
-            local use_nix = (parsed.flags and parsed.flags.nix) or false
-            local missing_tools = {}
-            if not use_nix and not os.getenv("IN_NIX_SHELL") and adapter.check_dependencies then
-                local ok, missing = adapter:check_dependencies(ctx, project_dir)
-                if not ok then
-                    use_nix = true
-                    missing_tools = missing
-                end
+            local ok
+            ok, via_nix = build_project(adapter, project_dir, parsed)
+            if not ok then
+                ctx.fail(via_nix and "Сборка упала в Nix, запуск отменен." or "Сборка упала, запуск отменен.")
+                return
             end
-            if use_nix and not os.getenv("IN_NIX_SHELL") then
-                if #missing_tools > 0 then
-                    ctx.log(string.format("⚡ [Grime Smart Fallback] На хосте отсутствуют утилиты: %s. Автопереключение сборки в изолированный Nix...", table.concat(missing_tools, ", ")))
-                end
-                local code = ctx.run_process({ "grime", "nix", "build", project_dir })
-                if code ~= 0 then
-                    ctx.fail("Сборка упала в Nix, запуск отменен.")
-                    return
-                end
-            else
-                if not adapter:build(project_dir, ctx) then
-                    ctx.fail("Сборка упала, запуск отменен.")
-                    return
-                end
-            end
+            target = adapter:get_target(project_dir)
         end
 
+        if not has_binary(canonical_lang, target) then
+            ctx.fail(string.format("Исполняемый файл проекта не найден в %s (путь запуска: %s). Сборка не создала бинарник в каталоге проекта%s.",
+                project_dir, tostring(target), via_nix and " (сборка через Nix кладёт результат вне проекта)" or ""))
+            return
+        end
         local ret = adapter:run(project_dir, extra_args, ctx)
         if ret and ret ~= 0 then
             ctx.fail(string.format("Выполнение проекта завершилось с ошибкой (код %d).", ret))
             return
         end
-        if ctx.has_next_step or return_path_requested then
-            if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
-            ctx.module_return(project_dir)
-        end
-    elseif action == "delete" then
-        if not ctx.exists(project_dir) then
-            ctx.fail("проект не найден: " .. project_dir)
-            return
-        end
-        ctx.delete(project_dir)
-        ctx.log(string.format("Проект (%s) успешно удален: %s", lang, project_dir))
-        if ctx.has_next_step or return_path_requested then
-            ctx.module_return(project_dir)
-        end
-    elseif action == "clear" then
-        if ctx.exists(project_dir) then
-            ctx.delete(project_dir)
-        end
-        ctx.mkdir_p(project_dir)
-        adapter:init_project(project_dir, ctx)
-        ctx.log(string.format("Проект (%s) сброшен к заводским настройкам: %s", lang, project_dir))
         if ctx.has_next_step or return_path_requested then
             if ctx.set_target_dir then ctx.set_target_dir(project_dir) end
             ctx.module_return(project_dir)
@@ -652,5 +812,7 @@ end
 
 return {
     main = main,
-    description = description,
+    find_project = find_project,
+    collect_projects = collect_projects,
+    build_project = build_project,
 }

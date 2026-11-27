@@ -1,9 +1,10 @@
--- Summary: Полноценное управление Git-репозиториями и версионированием
--- Description: Декларативные операции Git (status, commit, log, diff, snapshot)
+--@grime description: Декларативные операции Git (status, commit, log, diff, snapshot)
+--@grime requires: bin:git
+
 -- Описание: Управление Git (status, commit, log, diff, branch, checkout, init) и программный API
-description = "Декларативные операции Git (status, commit, log, diff, snapshot)"
 
 local ctx = grime.ctx
+local utils = require("languages.utils")
 
 local ANSI = {
     BOLD = "\27[1m",
@@ -18,7 +19,6 @@ local ANSI = {
 }
 
 local M = {}
-M.description = description
 
 local function print_help()
     print(string.format([[
@@ -66,10 +66,15 @@ local function print_help()
 end
 
 --- Проверка, является ли директория git-репозиторием
+--- Положительные результаты кэшируются на время запуска: один вызов git на каталог
+local repo_cache = {}
+
 function M.is_git_repo(dir)
     local target = dir or ctx.target_dir or "."
-    local res = ctx.capture({ "git", "rev-parse", "--is-inside-work-tree" }, target)
-    return res.code == 0
+    if repo_cache[target] then return true end
+    local ok = utils.is_git_repo(target, ctx)
+    if ok then repo_cache[target] = true end
+    return ok
 end
 
 --- Инициализация Git-репозитория
@@ -78,6 +83,12 @@ function M.init(dir)
     if not ctx.exists(target) then
         ctx.mkdir_p(target)
     end
+    -- Идемпотентность: уже существующий репозиторий не переинициализируем
+    if ctx.exists(target .. "/.git") then
+        repo_cache[target] = true
+        return { success = true, already = true, message = "Репозиторий уже инициализирован" }
+    end
+    repo_cache[target] = nil
     local res = ctx.capture({ "git", "init" }, target)
     if res.code == 0 then
         return { success = true, message = grime.str.trim(res.stdout or "Репозиторий инициализирован") }
@@ -136,14 +147,17 @@ function M.status(dir)
 end
 
 --- Добавление файлов в индекс (git add)
-function M.add(dir, files)
+--- opts.intent = true: git add -N (intent-to-add; без файлов — весь каталог ".")
+function M.add(dir, files, opts)
     local target = dir or ctx.target_dir or "."
     if not M.is_git_repo(target) then
         return nil, "Директория '" .. target .. "' не является Git-репозиторием"
     end
+    local intent = type(opts) == "table" and opts.intent
     local cmd = { "git", "add" }
+    if intent then table.insert(cmd, "-N") end
     if not files or #files == 0 then
-        table.insert(cmd, "-A")
+        table.insert(cmd, intent and "." or "-A")
     else
         for _, f in ipairs(files) do
             table.insert(cmd, f)
@@ -154,6 +168,20 @@ function M.add(dir, files)
         return nil, "Ошибка git add: " .. grime.str.trim(res.stderr or "")
     end
     return { success = true, files = files }
+end
+
+--- Сброс (git reset [--hard] [target]). opts = { hard = bool }. Возвращает ok(bool), вывод
+function M.reset(dir, target_ref, opts)
+    local target = dir or ctx.target_dir or "."
+    if not M.is_git_repo(target) then
+        return false, "Директория '" .. target .. "' не является Git-репозиторием"
+    end
+    local cmd = { "git", "reset" }
+    if type(opts) == "table" and opts.hard then table.insert(cmd, "--hard") end
+    if target_ref and target_ref ~= "" then table.insert(cmd, target_ref) end
+    local res = ctx.capture(cmd, target)
+    local out = grime.str.trim((res.stdout or "") .. (res.stderr or ""))
+    return res.code == 0, out
 end
 
 --- Фиксация изменений (git add + git commit)
@@ -281,7 +309,7 @@ function M.branch(dir, name)
 end
 
 --- Переключение ветки
-function M.checkout(dir, branch)
+function M.checkout(dir, branch, create)
     local target = dir or ctx.target_dir or "."
     if not M.is_git_repo(target) then
         return nil, "Директория '" .. target .. "' не является Git-репозиторием"
@@ -291,7 +319,10 @@ function M.checkout(dir, branch)
         return nil, "Укажите имя ветки для переключения: checkout <branch>"
     end
 
-    local res = ctx.capture({ "git", "checkout", branch }, target)
+    local cmd = { "git", "checkout" }
+    if create then table.insert(cmd, "-b") end
+    table.insert(cmd, branch)
+    local res = ctx.capture(cmd, target)
     if res.code == 0 then
         return { success = true, message = grime.str.trim((res.stdout or "") .. " " .. (res.stderr or "")) }
     else
@@ -419,7 +450,7 @@ function M.main()
         return
     end
 
-    if subcmd ~= "init" and not M.is_git_repo(target_dir) then
+    if not M.is_git_repo(target_dir) then
         ctx.fail("Каталог не является Git-репозиторием: " .. tostring(target_dir))
         return
     end
@@ -621,13 +652,17 @@ function M.main()
 
     if subcmd == "checkout" then
         local bname = pos_args[1]
+        local create = false
         for i, a in ipairs(args) do
-            if a == "-b" and args[i + 1] then
-                bname = args[i + 1]
+            if a == "-b" and i ~= action_idx then
+                create = true
+                if args[i + 1] and not tostring(args[i + 1]):match("^%-") then
+                    bname = args[i + 1]
+                end
                 break
             end
         end
-        local res, err = M.checkout(target_dir, bname)
+        local res, err = M.checkout(target_dir, bname, create)
         if not res then
             ctx.fail(err)
             return
@@ -695,11 +730,6 @@ function M.main()
     end
 
     ctx.fail("Неизвестная команда git: '" .. tostring(subcmd) .. "'. Используйте 'grime git --help' для справки.")
-end
-
--- Если модуль запускается как оркестрируемый скрипт
-function main()
-    M.main()
 end
 
 return M

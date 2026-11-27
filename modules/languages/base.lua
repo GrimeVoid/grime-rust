@@ -13,6 +13,13 @@ function BaseAdapter.new(opts)
     self.extensions = opts.extensions or {}
     self.build_files = opts.build_files or {}
     self.entry_files = opts.entry_files or {}
+    -- Компилируемые языки: исходник не является исполняемой целью (get_target не возвращает точки входа)
+    local compiled_langs = { cpp = true, rust = true, java = true }
+    if opts.compiled ~= nil then
+        self.compiled = opts.compiled and true or false
+    else
+        self.compiled = compiled_langs[self.name] or false
+    end
     return self
 end
 
@@ -75,7 +82,8 @@ function BaseAdapter:get_target(root)
         return root .. "/main"
     end
 
-    -- 4. Точки входа
+    -- 4. Точки входа (только для интерпретируемых языков: исходник и есть цель)
+    if self.compiled then return nil end
     for _, ef in ipairs(self.entry_files) do
         local p_src = root .. "/" .. self.src_dir .. "/" .. ef
         if grime.fs.exists(p_src) then return p_src end
@@ -86,21 +94,13 @@ function BaseAdapter:get_target(root)
     return nil
 end
 
+--- Применение шаблона. Подстановка {{...}} выполняется только в новых текстовых файлах;
+--- уже существующие файлы не трогаются без extra.force == true, бинарные пропускаются всегда
 function BaseAdapter:apply_template(root, ctx, extra)
-    local tpl_root = (ctx.paths and ctx.paths.templates)
-        or (ctx.get_path and ctx.get_path("templates"))
-        or (ctx.templates_root and ctx.templates_root())
-        or "./templates"
-    local tpl_dir = ctx.normalize_path(tpl_root) .. "/" .. self.name
-    if not ctx.exists(tpl_dir) then
-        local home_dir = os.getenv("HOME") or ""
-        local dotfiles_tpl = home_dir .. "/dotfiles/grime/templates/" .. self.name
-        if home_dir ~= "" and ctx.exists(dotfiles_tpl) then
-            tpl_dir = dotfiles_tpl
-        else
-            return false
-        end
-    end
+    local tpl_root = utils.get_named_path("templates", nil, ctx)
+    if tpl_root == "" then return false end
+    local tpl_dir = tpl_root .. "/" .. self.name
+    if not ctx.exists(tpl_dir) then return false end
 
     local proj_name = root:match("([^/\\]+)$") or "app"
     local snake_name = proj_name:lower():gsub("[%s%-]", "_")
@@ -110,6 +110,16 @@ function BaseAdapter:apply_template(root, ctx, extra)
     local desc = "Grime application " .. proj_name
     if type(extra) == "string" and extra ~= "" then
         desc = extra:gsub("\n", " "):gsub('"', '\\"')
+    end
+
+    local force = type(extra) == "table" and extra.force == true
+    -- Запоминаем уже существующие файлы, чтобы не подставлять в них переменные
+    local preexisting = {}
+    if not force and ctx.capture then
+        local pre = ctx.capture({ "find", root, "-type", "f" })
+        if pre and pre.code == 0 and pre.stdout then
+            for file in pre.stdout:gmatch("[^\r\n]+") do preexisting[file] = true end
+        end
     end
 
     -- Рекурсивно копируем файлы из директории шаблона в root
@@ -126,22 +136,25 @@ function BaseAdapter:apply_template(root, ctx, extra)
     }
     if type(extra) == "table" then
         for k, v in pairs(extra) do
-            replacements[k] = tostring(v)
+            if k ~= "force" then replacements[k] = tostring(v) end
         end
     end
 
     -- Подстановка переменных во всех текстовых файлах
     local function substitute_file(filepath)
-        local f = io.open(filepath, "r")
+        if preexisting[filepath] then return end
+        local f = io.open(filepath, "rb")
         if not f then return end
         local content = f:read("*all")
         f:close()
         if not content then return end
+        -- Бинарные файлы не трогаем
+        if content:sub(1, 8192):find("\0", 1, true) then return end
 
         local new_content = content
         for k, v in pairs(replacements) do
             local safe_v = tostring(v):gsub("%%", "%%%%")
-            new_content = new_content:gsub(k, safe_v)
+            new_content = new_content:gsub(utils.escape_pattern(k), safe_v)
         end
 
         if new_content ~= content then
@@ -177,8 +190,8 @@ function BaseAdapter:init_project(root, ctx, description)
     if not ctx.exists(gjson) then
         local f = io.open(gjson, "w")
         if f then
-            local data = string.format('{\n  "name": %q,\n  "language": %q,\n  "description": %q\n}\n', proj_name, self.name, desc)
-            f:write(data)
+            local data = grime.json.encode({ name = proj_name, language = self.name, description = desc })
+            f:write(data .. "\n")
             f:close()
         end
     end
@@ -213,6 +226,16 @@ function BaseAdapter:run(root, extra_args, ctx)
     if not cmd then
         ctx.log("Ошибка: исполняемый файл или точка входа для " .. self.name .. " не найдена в " .. root .. "!")
         return 1
+    end
+
+    -- Компилируемый язык: путь артефакта обязан существовать и не быть исходником
+    if self.compiled and cmd[1]:find("/", 1, true) then
+        local is_src = cmd[1]:match("%.([%w]+)$")
+        is_src = is_src and ({ cpp = true, cc = true, cxx = true, c = true, h = true, hpp = true, rs = true, java = true })[is_src:lower()]
+        if is_src or not ctx.exists(cmd[1]) then
+            ctx.log("Ошибка: артефакт не собран (" .. cmd[1] .. "): выполните build для проекта " .. root)
+            return 1
+        end
     end
 
     ctx.log("Запуск: " .. table.concat(cmd, " "))

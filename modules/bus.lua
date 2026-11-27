@@ -1,6 +1,5 @@
--- Summary: Управление шиной состояния (StateBus) и событиями (EventBus)
--- Description: Управление шиной состояния (StateBus) и событиями (EventBus)
-description = "Управление шиной состояния (StateBus) и событиями (EventBus)"
+--@grime description: Управление шиной состояния (StateBus) и событиями (EventBus)
+
 
 local ctx = grime.ctx
 
@@ -8,14 +7,14 @@ local function print_help()
     print(string.format([[
 %s%sGrime Bus%s — Управление разделяемым состоянием (StateBus) и событиями (EventBus)
 
-%sИСПОЛЬЗОВАНИЕ (все команды поддерживаются с '-' / '--' и без):%s
-    grime bus <get|-g|--get> <ключ>
-    grime bus <set|-s|--set> <ключ> <значение>
-    grime bus <has|--has> <ключ>
-    grime bus <rm|-d|--rm|--delete> <ключ>
-    grime bus <list|-l|--list|--keys> [префикс]
-    grime bus <emit|-e|--emit> <событие> [json_данные]
-    grime bus <help|-h|--help>
+%sИСПОЛЬЗОВАНИЕ (все команды поддерживаются с '-' / '--' и без дефиса):%s
+    grime bus <get|-get|-g|--get> <ключ>
+    grime bus <set|-set|-s|--set> <ключ> <значение>
+    grime bus <has|-has|--has> <ключ>
+    grime bus <rm|-rm|-d|--rm|--delete> <ключ>
+    grime bus <list|-list|-l|--list|--keys> [префикс]
+    grime bus <emit|-emit|-e|--emit> <событие> [json_данные]
+    grime bus <help|-help|-h|--help>
 
 %sОПИСАНИЕ:%s
     Предоставляет интерфейс командной строки для чтения и записи разделяемого
@@ -31,52 +30,6 @@ local function print_help()
     "\27[1m", "\27[0m",
     "\27[1m", "\27[0m"
     ))
-end
-
-local function get_state_file()
-    local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
-    if not ctx.exists(dir) then ctx.mkdir_p(dir) end
-    return dir .. "/state.json"
-end
-
-local function load_persisted_state()
-    local sfile = get_state_file()
-    if ctx.exists(sfile) then
-        local content = grime.fs.read(sfile)
-        if content and #content > 0 then
-            local ok, data = pcall(grime.json.decode, content)
-            if ok and type(data) == "table" then return data end
-        end
-    end
-    return {}
-end
-
-local function write_state_atomic(data)
-    local sfile = get_state_file()
-    local tmp = sfile .. ".tmp." .. tostring(os.time())
-    local f = io.open(tmp, "w")
-    if f then
-        f:write(grime.json.encode(data))
-        f:close()
-        os.rename(tmp, sfile)
-    end
-end
-
-local function save_persisted_key(key, val)
-    if key:match("^pipeline%.") then return end
-    local data = load_persisted_state()
-    data[key] = val
-    write_state_atomic(data)
-end
-
-local function remove_persisted_key(key)
-    local data = load_persisted_state()
-    if data[key] ~= nil then
-        data[key] = nil
-        write_state_atomic(data)
-        return true
-    end
-    return false
 end
 
 local function normalize_bus_key(key)
@@ -98,7 +51,7 @@ local BUS_ACTIONS = {
     help = "help", h = "help",
 }
 
-function main()
+local function main()
     local args = ctx.args or {}
     if #args == 0 then
         print_help()
@@ -116,13 +69,14 @@ function main()
         end
     end
 
-    local raw_action = args[1] or ""
-    if not grime.args.is_flag(raw_action) then
-        ctx.fail("Действие шины bus обязано начинаться с дефиса (-get, -set, -rm, -has, -list, -emit)")
+    -- Действие принимается и с дефисами, и без них (get / -get / --get)
+    local raw_action = tostring(args[1] or "")
+    local clean_action = grime.args.strip_dashes(raw_action):lower()
+    local action = BUS_ACTIONS[clean_action]
+    if not action then
+        ctx.fail("Неизвестная команда bus: " .. raw_action .. " (get, set, has, rm, list, emit)")
         return
     end
-    local clean_action = grime.args.strip_dashes(raw_action)
-    local action = BUS_ACTIONS[clean_action] or clean_action
 
     if action == "help" then
         print_help()
@@ -142,18 +96,6 @@ function main()
             return
         end
         local ok, val = pcall(grime.bus.get, key)
-        if (not ok or val == nil) and not key:match("^pipeline%.") then
-            local persisted = load_persisted_state()
-            if persisted[key] ~= nil then
-                val = persisted[key]
-                pcall(grime.bus.set, key, val)
-                ok = true
-            elseif raw_key and persisted[raw_key] ~= nil then
-                val = persisted[raw_key]
-                pcall(grime.bus.set, key, val)
-                ok = true
-            end
-        end
 
         if not ok then
             ctx.fail("Не удалось прочитать ключ '" .. key .. "' из шины: " .. tostring(val))
@@ -185,7 +127,6 @@ function main()
 
         local ok, err = pcall(grime.bus.set, key, val)
         if ok then
-            save_persisted_key(key, val)
             ctx.log(string.format("Установлено: %s = %s", key, tostring(val_str)))
             ctx.success(val_str)
         else
@@ -199,13 +140,6 @@ function main()
             return
         end
         local ok, exists = pcall(grime.bus.has, key)
-        if (not ok or not exists) and not key:match("^pipeline%.") then
-            local persisted = load_persisted_state()
-            if persisted[key] ~= nil or (raw_key and persisted[raw_key] ~= nil) then
-                exists = true
-                ok = true
-            end
-        end
         if not ok then
             ctx.fail("Не удалось проверить ключ '" .. key .. "' в шине: " .. tostring(exists))
             return
@@ -221,10 +155,6 @@ function main()
         if grime.bus.delete then
             pcall(grime.bus.delete, key)
         end
-        remove_persisted_key(key)
-        if raw_key and raw_key ~= key then
-            remove_persisted_key(raw_key)
-        end
         ctx.log("Ключ '" .. key .. "' удален из шины")
         ctx.success(key)
     elseif action == "list" then
@@ -234,12 +164,6 @@ function main()
             local ok, klist = pcall(grime.bus.keys, prefix)
             if ok and type(klist) == "table" then
                 for _, k in ipairs(klist) do keys_map[k] = true end
-            end
-        end
-        local persisted = load_persisted_state()
-        for k, _ in pairs(persisted) do
-            if not prefix or k:sub(1, #prefix) == prefix then
-                keys_map[k] = true
             end
         end
         local keys = {}
@@ -279,12 +203,9 @@ function main()
         else
             ctx.fail("Не удалось опубликовать событие '" .. event_name .. "': " .. tostring(err))
         end
-    else
-        ctx.fail("Неизвестная команда bus: " .. raw_action)
     end
 end
 
 return {
     main = main,
-    description = description,
 }

@@ -14,19 +14,6 @@ local ClaudeAgent = BaseAgent.new({
     supports_interactive = true,
 })
 
---- Добавление уникальных директорий через --add-dir
-local function append_unique_dirs(cmd, dirs)
-    if type(dirs) ~= "table" then return end
-    local seen = {}
-    for _, dir in ipairs(dirs) do
-        if type(dir) == "string" and dir ~= "" and not seen[dir] then
-            seen[dir] = true
-            table.insert(cmd, "--add-dir")
-            table.insert(cmd, dir)
-        end
-    end
-end
-
 --- Формирование текстового блока со списком целевых и read-only файлов
 local function build_files_context_block(files, read_files)
     local blocks = {}
@@ -71,10 +58,7 @@ function ClaudeAgent:build_architect_cmd(opts, ctx)
         "--output-format", "text",
         "--disable-slash-commands",
     }
-    if opts.model and opts.model ~= "" then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
-    end
+    BaseAgent.append_model(cmd, opts.model)
     return cmd
 end
 
@@ -118,18 +102,10 @@ function ClaudeAgent:build_headless_cmd(opts, ctx)
         table.insert(cmd, table.concat(opts.allowed_tools, ","))
     end
 
-    append_unique_dirs(cmd, opts.read_dirs)
+    BaseAgent.append_repeated(cmd, "--add-dir", opts.read_dirs)
 
-    if opts.model and opts.model ~= "" then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
-    end
-
-    if type(opts.passthrough_args) == "table" then
-        for _, a in ipairs(opts.passthrough_args) do
-            table.insert(cmd, a)
-        end
-    end
+    BaseAgent.append_model(cmd, opts.model)
+    BaseAgent.append_passthrough(cmd, opts.passthrough_args)
 
     return cmd
 end
@@ -146,23 +122,16 @@ function ClaudeAgent:build_interactive_cmd(opts, ctx)
         table.insert(cmd, opts.system_prompt)
     end
 
-    if opts.model and opts.model ~= "" then
-        table.insert(cmd, "--model")
-        table.insert(cmd, opts.model)
-    end
+    BaseAgent.append_model(cmd, opts.model)
 
     if opts.permission_mode and opts.permission_mode ~= "" then
         table.insert(cmd, "--permission-mode")
         table.insert(cmd, opts.permission_mode)
     end
 
-    append_unique_dirs(cmd, opts.read_dirs)
+    BaseAgent.append_repeated(cmd, "--add-dir", opts.read_dirs)
 
-    if type(opts.passthrough_args) == "table" then
-        for _, a in ipairs(opts.passthrough_args) do
-            table.insert(cmd, a)
-        end
-    end
+    BaseAgent.append_passthrough(cmd, opts.passthrough_args)
 
     -- Позиционный стартовый контекст/промпт (объединяется в один аргумент [prompt])
     local start_parts = {}

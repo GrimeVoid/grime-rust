@@ -185,8 +185,11 @@ function JavaAdapter:get_run_command(root, extra_args)
         return cmd
     end
 
-    local target = self:get_target(root)
-    if not target then
+    -- Без maven/gradle: запускается класс Main из bin/ (get_target исходники не возвращает —
+    -- язык компилируемый, поэтому наличие цели проверяем по скомпилированному классу или исходнику)
+    local has_class = utils.file_exists(root .. "/bin/Main.class")
+    local has_source = utils.file_exists(root .. "/src/Main.java") or utils.file_exists(root .. "/Main.java")
+    if not (has_class or has_source) then
         return nil
     end
 

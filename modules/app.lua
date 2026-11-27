@@ -1,26 +1,27 @@
--- Summary: Управление жизненным циклом локальных микроприложений (Grime Apps)
--- Description: Управление жизненным циклом локальных микроприложений (Grime Apps)
-description = "Управление жизненным циклом локальных микроприложений (Grime Apps)"
+--@grime description: Управление жизненным циклом локальных микроприложений (Grime Apps)
+--@grime requires: module:project, module:git, module:nix, module:ai, module:log
+--@grime chain: passthrough
+--@grime path.apps: ~/.config/grime/apps
+
 
 local utils = require("languages.utils")
-local BaseAdapter = require("languages.base")
-local scanner = require("languages.scanner")
 local ai = require("ai")
 local git = require("git")
 local log = require("log")
 
 -- Модульные переменные file-scope
 local ctx = grime.ctx
-local ui = grime.ui
-local str = grime.str
-local fs = grime.fs
 local HOME = os.getenv("HOME") or ""
 local ANSI = utils.ANSI
-local utf8_len = utils.utf8_len
 local pad_utf8 = utils.pad_utf8
+local is_pid_alive = utils.is_pid_alive
 
--- Защита от дублирования вызова ctx.fail в рамках одного запуска шага
+-- Защита от дублирования вызова ctx.fail в рамках одного запуска шага.
+-- Флаг сбрасывается в начале main() и при внешнем вызове reset_failed() (например, из pkg через require("app")).
 local has_failed = false
+local function reset_failed()
+    has_failed = false
+end
 local function fail_once(msg)
     if not has_failed then
         has_failed = true
@@ -32,45 +33,7 @@ local function get_apps_root()
     return utils.get_apps_root(ctx)
 end
 
-if grime and not grime.call then
-    grime.call = function(...)
-        local args = { ... }
-        local cmd = { "grime" }
-        for _, a in ipairs(args) do
-            if type(a) == "table" then
-                for _, sub in ipairs(a) do table.insert(cmd, tostring(sub)) end
-            else
-                table.insert(cmd, tostring(a))
-            end
-        end
-        return ctx.run_process(cmd)
-    end
-end
-
-if grime and not grime.capture then
-    grime.capture = function(...)
-        local args = { ... }
-        local cmd = { "grime" }
-        for _, a in ipairs(args) do
-            if type(a) == "table" then
-                for _, sub in ipairs(a) do table.insert(cmd, tostring(sub)) end
-            else
-                table.insert(cmd, tostring(a))
-            end
-        end
-        return ctx.capture(cmd)
-    end
-end
-
-local LANG_ALIASES = utils.LANG_ALIASES or {
-    cpp = "cpp", ["c++"] = "cpp", cxx = "cpp", c = "cpp",
-    python = "python", py = "python", python3 = "python",
-    rust = "rust", rs = "rust",
-    java = "java", jav = "java",
-    lua = "lua", luajit = "lua",
-    bash = "bash", sh = "bash", shell = "bash",
-    fish = "fish",
-}
+local LANG_ALIASES = utils.LANG_ALIASES
 
 local ACTION_MAP = {
     -- list
@@ -110,6 +73,7 @@ local ACTION_MAP = {
     -- test
     ["-test"] = "test", ["--test"] = "test", ["-t"] = "test",
     -- rm
+    ["-flake"] = "flake", ["--flake"] = "flake",
     ["-rm"] = "rm", ["--rm"] = "rm", ["-remove"] = "rm", ["--remove"] = "rm",
     ["-delete"] = "rm", ["--delete"] = "rm", ["-del"] = "rm", ["--del"] = "rm",
     -- help
@@ -135,65 +99,69 @@ local SUBCMD_WORDS = {
     ["rollback"] = "rollback", ["revert"] = "rollback",
     ["help"] = "help",
     ["test"] = "test",
+    ["flake"] = "flake",
 }
 
-local function get_state_file()
-    local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
-    if not ctx.exists(dir) then ctx.mkdir_p(dir) end
-    return dir .. "/state.json"
-end
-
-local function load_persisted_state()
-    local sfile = get_state_file()
-    if ctx.exists(sfile) then
-        local content = grime.fs.read(sfile)
-        if content and #content > 0 then
-            local ok, data = pcall(grime.json.decode, content)
-            if ok and type(data) == "table" then return data end
-        end
-    end
-    return {}
-end
-
+-- Всё состояние идёт только через grime.bus: ядро пишет state.json под flock, прямой записи из Lua нет.
 local function bus_set(key, val)
     if grime and grime.bus and grime.bus.set then
         pcall(grime.bus.set, key, val)
     end
-    local data = load_persisted_state()
-    data[key] = val
-    local sfile = get_state_file()
-    local f = io.open(sfile, "w")
-    if f then
-        f:write(grime.json.encode(data))
-        f:close()
+end
+
+--- Пакетная запись нескольких ключей: items — массив пар { ключ, значение }.
+--- Если ядро предоставляет grime.bus.set_many — одна атомарная запись; иначе по ключам,
+--- пропуская неизменившиеся значения (лишние записи под flock не нужны).
+local function bus_set_many(items)
+    if not (grime and grime.bus and grime.bus.set) then return end
+    if grime.bus.set_many then
+        local tbl = {}
+        for _, kv in ipairs(items) do tbl[kv[1]] = kv[2] end
+        if pcall(grime.bus.set_many, tbl) then return end
+    end
+    for _, kv in ipairs(items) do
+        local ok, cur = pcall(grime.bus.get, kv[1])
+        if not (ok and cur == kv[2]) then
+            pcall(grime.bus.set, kv[1], kv[2])
+        end
     end
 end
 
 local function bus_get(key)
     if grime and grime.bus and grime.bus.get then
         local ok, val = pcall(grime.bus.get, key)
-        if ok and val ~= nil then return val end
+        if ok then return val end
     end
-    local data = load_persisted_state()
-    return data[key]
+    return nil
 end
 
-local function load_manifest(app_dir, app_name)
-    local mpath = app_dir .. "/app.lua"
-    if not ctx.is_file(mpath) then return nil, "Манифест app.lua не найден: " .. mpath end
-    local chunk, err = loadfile(mpath, "t")
-    if not chunk then return nil, "Ошибка синтаксиса манифеста: " .. tostring(err) end
-    local ok, res = pcall(chunk)
-    if not ok then return nil, "Ошибка выполнения манифеста: " .. tostring(res) end
-    local m = type(res) == "table" and res or {}
-    m.name = m.name or app_name
-    m.description = m.description or ""
-    m.type = m.type or m.lang or "generic"
-    if not m.artifact and type(m.run) == "string" and not m.run:find(" ") then
-        m.artifact = m.run:gsub("^%./", "")
+--- Пауза в миллисекундах (ctx.sleep при наличии, иначе внешний sleep через ядро)
+local function sleep_ms(ms)
+    if ctx.sleep then
+        ctx.sleep(ms)
+    else
+        ctx.capture({ "sleep", string.format("%.2f", ms / 1000) })
     end
-    m.run = m.run or m.artifact
-    return m
+end
+
+--- Размер файла в байтах (nil при ошибке)
+local function file_size(path)
+    local res = ctx.capture({ "stat", "-c", "%s", path })
+    if res.code == 0 then return tonumber(grime.str.trim(res.stdout or "")) end
+    return nil
+end
+
+--- Экранирование строки для Nix-литерала в двойных кавычках (включая защиту от ${ интерполяции)
+local function nix_quote(s)
+    s = tostring(s or "")
+    s = s:gsub("[\\\"\n\r\t]", { ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" })
+    s = s:gsub("%${", "\\${")
+    return '"' .. s .. '"'
+end
+
+--- Имя файла, безопасное для подстановки в bash-скрипт и Nix installPhase без экранирования
+local function is_plain_filename(name)
+    return type(name) == "string" and name:match("^[%w_%.%+%-]+$") ~= nil and name:sub(1, 1) ~= "-"
 end
 
 local function to_cmd_str(cmd)
@@ -201,6 +169,64 @@ local function to_cmd_str(cmd)
     local q = {}
     for _, t in ipairs(cmd) do table.insert(q, utils.shell_escape(t)) end
     return table.concat(q, " ")
+end
+
+local find_app_name, resolve_app_name -- определены ниже
+
+--- Разбор команды (строка или таблица) в массив токенов
+local function cmd_to_tokens(target)
+    local tokens = {}
+    if type(target) == "table" then
+        for _, c in ipairs(target) do table.insert(tokens, c) end
+    elseif type(target) == "string" then
+        for w in target:gmatch("%S+") do table.insert(tokens, w) end
+    end
+    return tokens
+end
+
+--- Выполнение команды с подачей payload на stdin через приватный временный файл
+local function capture_with_input(cmd_str, payload, cwd, env)
+    if not payload or payload == "" then
+        return ctx.capture(cmd_str, cwd, env)
+    end
+    local res, err = utils.with_tempfile(payload, function(tmp)
+        return ctx.capture(string.format("%s < %s", cmd_str, utils.shell_escape(tmp)), cwd, env)
+    end, ctx)
+    return res or { code = 1, stdout = "", stderr = tostring(err or "не удалось передать stdin") }
+end
+
+--- Приложение со скомпилированным артефактом, привязанным в apps_root без собственного flake.nix
+local function has_local_binding(m, dir)
+    return m._local_artifact ~= nil
+        and ctx.exists(dir .. "/" .. m._local_artifact)
+        and not ctx.is_file(dir .. "/flake.nix")
+end
+
+--- Токены запуска привязанного локального артефакта + аргументы
+local function local_binding_tokens(m, run_args)
+    local tokens = cmd_to_tokens(m._local_run or ("./" .. m._local_artifact))
+    for _, a in ipairs(run_args or {}) do table.insert(tokens, a) end
+    return tokens
+end
+
+--- Проверка имени приложения и поиск каталога: возвращает app_name, dir либо nil (ошибка уже сообщена)
+local function require_app_dir(apps_root, raw_name, usage)
+    if not raw_name or raw_name == "" then
+        fail_once(usage)
+        return nil
+    end
+    local ok, why = utils.valid_name(raw_name)
+    if not ok then
+        fail_once(string.format("Недопустимое имя приложения '%s': %s", raw_name, why))
+        return nil
+    end
+    local app_name = resolve_app_name(apps_root, raw_name)
+    local dir = apps_root .. "/" .. app_name
+    if not ctx.exists(dir) then
+        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
+        return nil
+    end
+    return app_name, dir
 end
 
 local function to_rel_path(base_dir, full_path)
@@ -213,120 +239,9 @@ local function to_rel_path(base_dir, full_path)
     return full_path
 end
 
-local EXT_TO_LANG = {
-    [".py"] = "python",
-    [".lua"] = "lua",
-    [".sh"] = "bash", [".bash"] = "bash",
-    [".fish"] = "fish",
-    [".rs"] = "rust",
-    [".cpp"] = "cpp", [".cc"] = "cpp", [".cxx"] = "cpp", [".c"] = "cpp",
-    [".java"] = "java",
-    [".go"] = "go",
-    [".js"] = "nodejs", [".ts"] = "nodejs",
-}
-
-local BUILD_MANIFEST_LANG = {
-    ["Cargo.toml"] = "rust",
-    ["CMakeLists.txt"] = "cpp",
-    ["Makefile"] = "cpp",
-    ["meson.build"] = "cpp",
-    ["pom.xml"] = "java",
-    ["build.gradle"] = "java",
-    ["build.gradle.kts"] = "java",
-    ["pyproject.toml"] = "python",
-    ["go.mod"] = "go",
-    ["build.zig"] = "zig",
-}
-
-local IGNORED_ENTRY_FILES = {
-    ["app.lua"] = true,
-    ["flake.nix"] = true,
-    ["flake.lock"] = true,
-    ["app.log"] = true,
-    ["app.pid"] = true,
-    ["app.sock"] = true,
-    ["README.md"] = true,
-    ["readme.md"] = true,
-    ["grime.json"] = true,
-    ["meta.json"] = true,
-    ["Cargo.lock"] = true,
-    [".gitignore"] = true,
-    [".grime_app.json"] = true,
-    [".grime_link.json"] = true,
-}
-
---- Поиск главного файла скрипта/исходника/бинарника в директории приложения
+--- Поиск главного файла скрипта/исходника/бинарника в директории приложения (общая логика в utils)
 local function find_main_entry(work_dir, app_name, explicit_entry)
-    if not work_dir or not ctx.exists(work_dir) then return nil, false, nil end
-
-    if explicit_entry and explicit_entry ~= "" then
-        local rel = to_rel_path(work_dir, explicit_entry)
-        if ctx.is_file(work_dir .. "/" .. rel) then
-            local _, is_bin = utils.parse_script_header(work_dir .. "/" .. rel)
-            return rel, is_bin, nil
-        end
-    end
-
-    local priority_files = {
-        "main.py", "main.lua", "main.fish", "main.sh", "main.bash",
-        "main.rs", "main.cpp", "main.c", "Main.java", "main.go",
-        "src/main.py", "src/main.lua", "src/main.fish", "src/main.sh", "src/main.bash",
-        "src/main.rs", "src/main.cpp", "src/main.c", "src/Main.java",
-    }
-    if app_name and app_name ~= "" then
-        for _, ext in ipairs({ ".py", ".lua", ".fish", ".sh", ".bash", ".rs", ".cpp", ".c", ".go", "" }) do
-            table.insert(priority_files, app_name .. ext)
-            table.insert(priority_files, "src/" .. app_name .. ext)
-        end
-    end
-
-    for _, rel in ipairs(priority_files) do
-        local full = work_dir .. "/" .. rel
-        if ctx.is_file(full) then
-            local _, is_bin = utils.parse_script_header(full)
-            return rel, is_bin, nil
-        end
-    end
-
-    -- Проверяем сборочные манифесты
-    local found_build = nil
-    for _, bname in ipairs({ "Cargo.toml", "CMakeLists.txt", "meson.build", "Makefile", "build.zig", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "pyproject.toml" }) do
-        if ctx.is_file(work_dir .. "/" .. bname) then
-            found_build = bname
-            break
-        end
-    end
-
-    -- Ищем исходник, скрипт или исполняемый файл в корне или src/
-    local scan_dirs = { { dir = work_dir, prefix = "" } }
-    if ctx.is_dir(work_dir .. "/src") then
-        table.insert(scan_dirs, { dir = work_dir .. "/src", prefix = "src/" })
-    end
-
-    for _, sd in ipairs(scan_dirs) do
-        local items = (grime.fs and grime.fs.list and grime.fs.list(sd.dir)) or {}
-        table.sort(items)
-        for _, item in ipairs(items) do
-            if not item:match("^%.") and not IGNORED_ENTRY_FILES[item] and not BUILD_MANIFEST_LANG[item] then
-                local full = sd.dir .. "/" .. item
-                if ctx.is_file(full) then
-                    local ext = item:match("(%.[%a%d_]+)$")
-                    if ext and EXT_TO_LANG[ext:lower()] then
-                        return sd.prefix .. item, false, found_build
-                    end
-                    local hdr, is_bin = utils.parse_script_header(full)
-                    if is_bin or (hdr and hdr.shebang) then
-                        return sd.prefix .. item, is_bin, found_build
-                    end
-                end
-            end
-        end
-    end
-
-    if found_build then
-        return nil, false, found_build
-    end
-    return nil, false, nil
+    return utils.find_main_entry(work_dir, nil, { app_name = app_name, explicit_entry = explicit_entry })
 end
 
 --- Определение, является ли директория валидным приложением GRIME (с app.lua или Zero-Manifest)
@@ -342,60 +257,12 @@ local function is_valid_app_dir(app_dir)
     return (entry_rel ~= nil or found_build ~= nil)
 end
 
-local function extract_nix_packages(app_dir, m)
-    local scan = scanner.scan_project(app_dir, ctx)
-    local all_pkgs = {}
-    local seen = {}
-
-    local function add(p)
-        if type(p) == "string" and #p > 0 and not seen[p] then
-            seen[p] = true
-            table.insert(all_pkgs, p)
-        end
-    end
-
-    -- 1. Базовый авто-тулчейн и # nix: зависимости от сканера
-    for _, p in ipairs(scan.toolchain or {}) do
-        add(p)
-    end
-    for _, p in ipairs(scan.special_dependencies or {}) do
-        add(p)
-    end
-
-    -- 2. Пользовательские специальные экстра-зависимости (библиотеки)
-    if m then
-        local function add_list(list)
-            if type(list) == "table" then
-                for _, v in ipairs(list) do
-                    if type(v) == "string" and #v > 0 then add(v) end
-                end
-            elseif type(list) == "string" then
-                for s in list:gmatch("%S+") do add(s) end
-            end
-        end
-
-        add_list(m.special_dependencies)
-        add_list(m.dependencies)
-        add_list(m.extra_packages)
-        if type(m.nix) == "table" then
-            add_list(m.nix.special_dependencies)
-            add_list(m.nix.dependencies)
-            add_list(m.nix.packages)
-        elseif type(m.nix) == "string" then
-            add_list(m.nix)
-        end
-    end
-
-    return utils.split_packages(all_pkgs, scanner)
-end
-
+--- Синхронизация flake.nix приложения: git init + генерация (при отсутствии/устаревании) + git add -N
 local function ensure_flake(app_dir, m, app_name)
     if not app_dir or not ctx.exists(app_dir) then return false end
-    if not ctx.exists(app_dir .. "/.git") then
-        pcall(function() ctx.capture({ "git", "init" }, app_dir) end)
-    end
+    git.init(app_dir)
     local flake_path = app_dir .. "/flake.nix"
-    if ctx.is_file(flake_path) or ctx.exists(flake_path) then
+    if ctx.exists(flake_path) then
         local current_flake = nil
         local f = io.open(flake_path, "r")
         if f then
@@ -414,59 +281,39 @@ local function ensure_flake(app_dir, m, app_name)
             end
         end
         if not missing_in_flake then
-            pcall(function() ctx.capture({ "git", "add", "-N", "flake.nix" }, app_dir) end)
+            pcall(git.add, app_dir, { "flake.nix" }, { intent = true })
             return true
         end
         ctx.log(string.format("⚡ [Grime Flake] Обнаружены новые зависимости '%s', синхронизация flake.nix...", app_name or (m and m.name) or "app"))
     end
 
     local name = app_name or (m and m.name) or app_dir:match("([^/]+)$") or "app"
-    local native_pkgs, lib_pkgs = extract_nix_packages(app_dir, m)
-    local content = utils.generate_flake_nix(name, native_pkgs, lib_pkgs)
-
-    local f = io.open(flake_path, "w")
-    if f then
-        f:write(content)
-        f:close()
-        pcall(function()
-            ctx.capture({ "git", "add", "-N", "flake.nix" }, app_dir)
-        end)
-        ctx.log(string.format("⚡ [Grime Flake] Синхронизирован flake.nix для '%s' (native: %s%s)",
-            name,
-            table.concat(native_pkgs, ", "),
-            #lib_pkgs > 0 and (", libs: " .. table.concat(lib_pkgs, ", ")) or ""
-        ))
-        return true
+    local pk = utils.collect_nix_packages(app_dir, m, nil, nil, ctx)
+    if not utils.write_flake(app_dir, name, pk.native, pk.libs, { ctx = ctx, git_add = true }) then
+        return false
     end
-    return false
+    ctx.log(string.format("⚡ [Grime Flake] Синхронизирован flake.nix для '%s' (native: %s%s)",
+        name,
+        table.concat(pk.native, ", "),
+        #pk.libs > 0 and (", libs: " .. table.concat(pk.libs, ", ")) or ""
+    ))
+    return true
 end
 
 local function get_nix_env(app_name, app_dir, extra_env)
-    local xdg = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
     local socket_path = os.getenv("GRIME_SOCKET")
     if not socket_path or #socket_path == 0 then
-        if ctx.exists(xdg .. "/grime.sock") then
-            socket_path = xdg .. "/grime.sock"
-        else
-            local uid_res = ctx.capture and ctx.capture("id -u")
-            local uid = uid_res and uid_res.stdout and uid_res.stdout:match("%d+") or "1000"
-            if ctx.exists("/run/user/" .. uid .. "/grime.sock") then
-                socket_path = "/run/user/" .. uid .. "/grime.sock"
-            elseif ctx.exists("/tmp/grime-" .. uid .. ".sock") then
-                socket_path = "/tmp/grime-" .. uid .. ".sock"
-            else
-                socket_path = xdg .. "/grime.sock"
-            end
-        end
+        socket_path = utils.daemon_socket_path(ctx)
     end
 
     local env = {
         GRIME_SOCKET = socket_path,
         GRIME_APP_NAME = app_name,
         GRIME_APP_DIR = app_dir,
-        GRIME_STATE_BUS = ((os.getenv("HOME") or "") .. "/.config/grime/state.json"),
-        XDG_RUNTIME_DIR = xdg,
-        HOME = os.getenv("HOME") or "",
+        GRIME_STATE_BUS = os.getenv("GRIME_STATE_FILE")
+            or (((ctx.config_dir and ctx.config_dir()) or (HOME .. "/.config/grime")) .. "/state.json"),
+        XDG_RUNTIME_DIR = os.getenv("XDG_RUNTIME_DIR") or "/tmp",
+        HOME = HOME,
         USER = os.getenv("USER") or "user",
         TERM = os.getenv("TERM") or "xterm-256color",
     }
@@ -478,80 +325,57 @@ local function get_nix_env(app_name, app_dir, extra_env)
     return env
 end
 
---- Получение эфемерного Flake для сборки внешних проектов без засорения их репозитория
-local function get_ephemeral_compile_flake(work_dir, m)
-    local native_pkgs, lib_pkgs = extract_nix_packages(work_dir, m)
-    local sig = work_dir .. "|" .. table.concat(native_pkgs, ",") .. "|" .. table.concat(lib_pkgs, ",")
-    local h = 5381
-    for i = 1, #sig do
-        h = ((h * 33) + sig:byte(i)) % 4294967296
-    end
-    local cache_dir = HOME .. "/.cache/grime/compile_flakes/" .. string.format("%08x", h)
-    ctx.mkdir_p(cache_dir)
-    local flake_path = cache_dir .. "/flake.nix"
-    local name = (m and m.name) or work_dir:match("([^/]+)$") or "app"
-    local content = utils.generate_flake_nix(name, native_pkgs, lib_pkgs)
-    local f = io.open(flake_path, "w")
-    if f then
-        f:write(content)
-        f:close()
-    end
-    return cache_dir
+--- Каталог вне apps_root без собственного flake.nix: сборку ведём в эфемерном flake (кэш grime), чужой репозиторий не засоряем
+local function needs_ephemeral_flake(dir)
+    if ctx.is_file(dir .. "/flake.nix") then return false end
+    local norm_apps = ctx.normalize_path(get_apps_root()) .. "/"
+    return (ctx.normalize_path(dir) .. "/"):sub(1, #norm_apps) ~= norm_apps
 end
 
-local function exec_cmd(m, cmd, dir, env, flake_dir_override)
+--- Команда в nix develop: flake каталога приложения (ensure_flake) либо эфемерный flake для внешних проектов
+local function exec_cmd(m, cmd, dir, env)
     local app_dir = dir or (ctx.paths and ctx.paths.apps)
     local app_name = (m and m.name) or (app_dir and app_dir:match("([^/]+)$")) or "app"
-    local flake_ref = flake_dir_override
-    if not flake_ref then
+    local flake_ref = nil
+    if app_dir and needs_ephemeral_flake(app_dir) then
+        local err
+        flake_ref, err = require("nix").ephemeral_flake_dir(app_dir,
+            { kind = "compile", packages = m and m.special_dependencies, name = app_name })
+        if not flake_ref then
+            fail_once(err or "Не удалось создать эфемерный flake")
+            return 1
+        end
+    else
         ensure_flake(app_dir, m, app_name)
     end
-
-    local nix_env = get_nix_env(app_name, app_dir, env)
-    local cmd_str = to_cmd_str(cmd)
-    local proc = flake_ref
-        and { "nix", "develop", flake_ref, "--command", "sh", "-c", cmd_str }
-        or { "nix", "develop", "--command", "sh", "-c", cmd_str }
-    return ctx.run_process(proc, dir, nix_env)
+    local proc = utils.develop_cmd(flake_ref, { "sh", "-c", to_cmd_str(cmd) })
+    return ctx.run_process(proc, dir, get_nix_env(app_name, app_dir, env))
 end
 
---- Выполнение сборки через языковой адаптер с автоматическим переключением в Nix Flake при нехватке тулчейна
-local function run_adapter_build(adapter, build_dir, manifest, allow_host_fast)
-    local has_local_flake = ctx.is_file(build_dir .. "/flake.nix")
+--- Единое решение «хост или nix» для сборки: хост допустим без flake.nix и special_dependencies при наличии тулчейна
+local function can_build_on_host(m, build_dir, toolchain_ok)
+    local has_spec_deps = m and m.special_dependencies and #m.special_dependencies > 0
+    return toolchain_ok and not has_spec_deps and not ctx.is_file(build_dir .. "/flake.nix")
+end
+
+--- Сборка через языковой адаптер: на хосте либо (при нехватке тулчейна) внутри Nix Flake
+local function run_adapter_build(adapter, build_dir, manifest)
     local deps_ok = true
     if adapter.check_dependencies then
         deps_ok = adapter:check_dependencies(ctx, build_dir)
     end
-    local has_spec_deps = manifest and manifest.special_dependencies and #manifest.special_dependencies > 0
-
-    if deps_ok and not has_spec_deps and (allow_host_fast or not has_local_flake) then
-        local ok = adapter:build(build_dir, ctx)
-        return ok and 0 or 1
+    if can_build_on_host(manifest, build_dir, deps_ok) then
+        return adapter:build(build_dir, ctx) and 0 or 1
     end
-
-    local flake_ref = nil
-    if not has_local_flake then
-        local apps_root = get_apps_root()
-        local norm_apps = ctx.normalize_path(apps_root) .. "/"
-        local norm_dir = ctx.normalize_path(build_dir)
-        if norm_dir:sub(1, #norm_apps) == norm_apps then
-            ensure_flake(build_dir, manifest, manifest and manifest.name)
-        else
-            flake_ref = get_ephemeral_compile_flake(build_dir, manifest)
-        end
-    end
-
     local nix_ctx = setmetatable({
         run_shell = function(cmd_str, cwd)
-            return exec_cmd(manifest, cmd_str, cwd or build_dir, nil, flake_ref)
+            return exec_cmd(manifest, cmd_str, cwd or build_dir)
         end,
         run_process = function(argv, cwd, env)
-            return exec_cmd(manifest, argv, cwd or build_dir, env, flake_ref)
+            return exec_cmd(manifest, argv, cwd or build_dir, env)
         end,
     }, { __index = ctx })
-
-    local ok = adapter:build(build_dir, nix_ctx)
-    return ok and 0 or 1
+    return adapter:build(build_dir, nix_ctx) and 0 or 1
 end
 
 --- Поиск собранного исполняемого артефакта в проекте (включая CMake/Cargo/Meson/Zig)
@@ -614,6 +438,11 @@ local function find_compiled_binary(work_dir, app_name, m)
     return fallback_bin
 end
 
+--- Интерпретатор языка по таблице shebang'ов (#!/usr/bin/env <interp>)
+local function default_interpreter(lang)
+    return (utils.SHEBANGS[lang] or ""):match("env%s+(%S+)") or lang
+end
+
 local function load_manifest(app_dir, app_name, opts)
     opts = opts or {}
     local mpath = app_dir .. "/app.lua"
@@ -653,12 +482,12 @@ local function load_manifest(app_dir, app_name, opts)
 
     local lang = opts.lang
         or (hdr and hdr.lang)
-        or (found_build and BUILD_MANIFEST_LANG[found_build])
+        or (found_build and utils.BUILD_MANIFEST_LANG[found_build])
         or nil
 
     if not lang and entry_rel then
         local ext = entry_rel:match("(%.[%a%d_]+)$")
-        if ext then lang = EXT_TO_LANG[ext:lower()] end
+        if ext then lang = utils.EXT_TO_LANG[ext:lower()] end
     end
     if not lang and link_meta and link_meta.lang then
         lang = link_meta.lang
@@ -682,7 +511,7 @@ local function load_manifest(app_dir, app_name, opts)
 
     if hdr and hdr.shebang and entry_rel then
         -- 1. Скрипт с Shebang (#!)
-        local interp = hdr.interp or ({ python = "python3", lua = "luajit", bash = "bash", fish = "fish" })[lang] or lang
+        local interp = hdr.interp or default_interpreter(lang)
         m.artifact = entry_rel
         m._is_script = true
         m.run = entry_rel:find("%s") and { interp, entry_rel } or (interp .. " " .. entry_rel)
@@ -696,7 +525,7 @@ local function load_manifest(app_dir, app_name, opts)
         -- 3a. Скрипт без явного shebang
         local ok_adp, adapter = pcall(require, "languages." .. lang)
         if ok_adp and adapter then m._adapter = adapter end
-        local default_interp = ({ python = "python3", lua = "luajit", bash = "bash", fish = "fish" })[lang] or lang
+        local default_interp = default_interpreter(lang)
         if not entry_rel and ok_adp and adapter and adapter.get_target then
             local t = adapter:get_target(work_dir)
             if t then entry_rel = to_rel_path(work_dir, t) end
@@ -893,11 +722,7 @@ local function build_app(app_name, m, app_dir)
         end
         code = (type(res) == "number") and res or (res == false and 1 or 0)
     else
-        local flake_override = nil
-        if build_dir ~= app_dir and not ctx.is_file(build_dir .. "/flake.nix") then
-            flake_override = get_ephemeral_compile_flake(build_dir, m)
-        end
-        code = exec_cmd(m, m.build, build_dir, env, flake_override)
+        code = exec_cmd(m, m.build, build_dir, env)
     end
 
     if code ~= 0 then
@@ -910,7 +735,7 @@ local function build_app(app_name, m, app_dir)
         local found = find_compiled_binary(build_dir, app_name, m)
         if found then
             m.artifact = found
-            if not m._is_script and (type(m.run) ~= "string" or m.run == "") then
+            if not m._is_script and (m.run == nil or m.run == "") then
                 m.run = "./" .. found
             end
         elseif m.type == "rust" then
@@ -930,69 +755,69 @@ local function build_app(app_name, m, app_dir)
         fail_once(string.format("Сборка завершилась, но артефакт '%s' не найден!", m.artifact))
         return false
     end
-    bus_set("app." .. app_name .. ".build_status", "ready")
+    local prefix = "app." .. app_name .. "."
+    local state = {
+        { prefix .. "build_status", "ready" },
+        { prefix .. "last_built_time", os.date("%Y-%m-%d %H:%M:%S") },
+    }
     if m.artifact and m.artifact ~= "" then
-        bus_set("app." .. app_name .. ".artifact", m.artifact)
+        table.insert(state, { prefix .. "artifact", m.artifact })
         local apath = build_dir .. "/" .. m.artifact
-        if ctx.exists(apath) then
-            local stat_res = ctx.capture({ "stat", "-c", "%s", apath })
-            if stat_res.code == 0 then
-                local size = tonumber(grime.str.trim(stat_res.stdout))
-                bus_set("app." .. app_name .. ".artifact_size", size)
-            end
-        end
+        local size = ctx.exists(apath) and file_size(apath) or nil
+        if size then table.insert(state, { prefix .. "artifact_size", size }) end
     end
-    bus_set("app." .. app_name .. ".last_built_time", os.date("%Y-%m-%d %H:%M:%S"))
+    bus_set_many(state)
     ctx.log(string.format("✓ Приложение '%s' успешно собрано.", app_name))
     return true
 end
 
+--- Токены запуска приложения. При отсутствии run/artifact возвращает nil, сообщение об ошибке
 local function resolve_cmd_tokens(m, run_args)
     local target = m.run or m.artifact
-    local tokens = {}
-    if type(target) == "table" then
-        for _, c in ipairs(target) do table.insert(tokens, c) end
+    if type(target) ~= "table" and (type(target) ~= "string" or target == "") then
+        return nil, string.format(
+            "У приложения '%s' не задана команда запуска (нет run/artifact; возможно, оно ещё не собрано или найден только flake.nix)",
+            tostring(m.name or "?"))
+    end
+    local tokens
+    if type(target) == "string" and not target:find(" ") and not target:find("^/") and not target:find("^%.") then
+        tokens = { "./" .. target }
     else
-        if not target:find(" ") and not target:find("^/") and not target:find("^%.") then
-            table.insert(tokens, "./" .. target)
-        else
-            for w in target:gmatch("%S+") do table.insert(tokens, w) end
+        tokens = cmd_to_tokens(target)
+    end
+    for _, a in ipairs(run_args or {}) do table.insert(tokens, a) end
+    return tokens
+end
+
+--- Фоновый запуск приложения: pid-файл, статус в StateBus, журнал. tokens — массив argv
+local function start_background(app_name, app_dir, tokens, cwd, env, label)
+    local log_file = app_dir .. "/app.log"
+    ctx.log(label)
+    local pid = utils.spawn_background(tokens, cwd, log_file, env, ctx)
+    if pid then
+        local pf = io.open(app_dir .. "/app.pid", "w")
+        if pf then
+            pf:write(pid .. "\n")
+            pf:close()
         end
     end
-    for _, a in ipairs(run_args) do table.insert(tokens, a) end
-    return tokens
+    local prefix = "app." .. app_name .. "."
+    bus_set_many({ { prefix .. "status", "running" }, { prefix .. "pid", pid or "?" } })
+    ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log_file))
+    return 0
 end
 
 local function run_app(app_name, m, app_dir, run_args, is_detach)
     local exec_dir = app_dir
-    if m._local_artifact and ctx.exists(app_dir .. "/" .. m._local_artifact) and not ctx.is_file(app_dir .. "/flake.nix") then
+    if has_local_binding(m, app_dir) then
         -- Привязанный скомпилированный артефакт в apps_root/<name>/<bin> запускается напрямую
-        local local_tokens = {}
-        local ltarget = m._local_run or ("./" .. m._local_artifact)
-        if type(ltarget) == "table" then
-            for _, c in ipairs(ltarget) do table.insert(local_tokens, c) end
-        else
-            for w in ltarget:gmatch("%S+") do table.insert(local_tokens, w) end
-        end
-        for _, a in ipairs(run_args) do table.insert(local_tokens, a) end
+        local local_tokens = local_binding_tokens(m, run_args)
 
         if is_detach or m.detached then
-            local log_file = app_dir .. "/app.log"
-            local cmd_str = to_cmd_str(local_tokens)
-            ctx.log(string.format("Запуск '%s' в фоновом режиме...", app_name))
-            local res = ctx.capture(string.format("nohup setsid %s > %s 2>&1 < /dev/null & echo $!", cmd_str, utils.shell_escape(log_file)), app_dir)
-            local pid = res.stdout and res.stdout:match("%d+") or nil
-            if pid then
-                local pf = io.open(app_dir .. "/app.pid", "w")
-                if pf then pf:write(pid .. "\n"); pf:close() end
-            end
-            bus_set("app." .. app_name .. ".status", "running")
-            bus_set("app." .. app_name .. ".pid", pid or "?")
-            ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log_file))
-            return 0
+            return start_background(app_name, app_dir, local_tokens, app_dir, nil,
+                string.format("Запуск '%s' в фоновом режиме...", app_name))
         elseif ctx.has_next_step then
-            local cmd_str = to_cmd_str(local_tokens)
-            local res = ctx.capture(cmd_str, app_dir)
+            local res = ctx.capture(to_cmd_str(local_tokens), app_dir)
             if res.code ~= 0 then return res.code end
             ctx.success(res.stdout or "")
             return 0
@@ -1020,50 +845,25 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
     end
 
     local env = get_nix_env(app_name, exec_dir)
-    local cmd_tokens = resolve_cmd_tokens(m, run_args)
+    local cmd_tokens, tok_err = resolve_cmd_tokens(m, run_args)
+    if not cmd_tokens then
+        fail_once(tok_err)
+        return 1
+    end
     local raw_cmd_str = to_cmd_str(cmd_tokens)
-    local nix_cmd_str = string.format("nix develop --command sh -c %s", utils.shell_escape(raw_cmd_str))
+    local nix_tokens = utils.develop_cmd(nil, { "sh", "-c", raw_cmd_str })
 
     if is_detach or m.detached then
-        local log_file = app_dir .. "/app.log"
-        ctx.log(string.format("Запуск '%s' в изолированном Nix Flake (фоновый режим)...", app_name))
-        local res = ctx.capture(string.format("nohup setsid %s > %s 2>&1 < /dev/null & echo $!", nix_cmd_str, utils.shell_escape(log_file)), exec_dir, env)
-        local pid = res.stdout and res.stdout:match("%d+") or nil
-        if pid then
-            local pf = io.open(app_dir .. "/app.pid", "w")
-            if pf then
-                pf:write(pid .. "\n")
-                pf:close()
-            end
-        end
-        if grime and grime.bus and grime.bus.set then
-            pcall(grime.bus.set, "app." .. app_name .. ".status", "running")
-            pcall(grime.bus.set, "app." .. app_name .. ".pid", pid or "?")
-        end
-        ctx.log(string.format("✓ Приложение запущено в фоне (PID: %s). Лог: %s", pid or "?", log_file))
-        return 0
+        return start_background(app_name, app_dir, nix_tokens, exec_dir, env,
+            string.format("Запуск '%s' в изолированном Nix Flake (фоновый режим)...", app_name))
     end
 
-    if ctx.has_next_step and not is_detach and not m.detached then
-        local run_cmd = nix_cmd_str
-        local tmp_file = nil
-        local cur_payload = ctx.input or ctx.pipeline_input
-        if cur_payload and cur_payload ~= "" then
-            tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
-            local f = io.open(tmp_file, "w")
-            if f then f:write(cur_payload); f:close() end
-            run_cmd = string.format("%s < %s", nix_cmd_str, utils.shell_escape(tmp_file))
-        end
-
-        local res = ctx.capture(run_cmd, exec_dir, env)
-        if tmp_file then ctx.delete(tmp_file, true) end
-
+    if ctx.has_next_step then
+        local res = capture_with_input(to_cmd_str(nix_tokens), ctx.input or ctx.pipeline_input, exec_dir, env)
         if res.code ~= 0 then
             return res.code
         end
-
-        local out = res.stdout or ""
-        ctx.success(out)
+        ctx.success(res.stdout or "")
         return 0
     end
 
@@ -1071,8 +871,9 @@ local function run_app(app_name, m, app_dir, run_args, is_detach)
 end
 
 --- Нечеткий и префиксный поиск приложения в apps_root по аналогии с project.lua
-local function find_app_name(apps_root, raw_name)
+function find_app_name(apps_root, raw_name)
     if not raw_name or raw_name == "" then return nil end
+    if not utils.valid_name(raw_name) then return nil end
     if not ctx.exists(apps_root) then return nil end
 
     -- 1. Точное совпадение
@@ -1123,51 +924,29 @@ local function find_app_name(apps_root, raw_name)
     return nil
 end
 
-local function resolve_app_name(apps_root, raw_name)
+function resolve_app_name(apps_root, raw_name)
     if not raw_name or raw_name == "" then return raw_name end
     return find_app_name(apps_root, raw_name) or raw_name
 end
 
---- Выполнение цепочки приложений через разделитель '->' (App Chaining)
+--- Выполнение цепочки приложений через разделитель ':' (App Chaining)
 local function run_chain(apps_root, segments)
     local cur_payload = ctx.input or ctx.pipeline_input or ""
     local last_output = cur_payload
 
     for _, seg in ipairs(segments) do
-        local name = resolve_app_name(apps_root, seg[1])
-        local dir = apps_root .. "/" .. name
-        if not ctx.exists(dir) then
-            fail_once(string.format("Приложение '%s' в цепочке не найдено в %s", name, apps_root))
-            return 1
-        end
+        local name, dir = require_app_dir(apps_root, seg[1], "Не указано имя приложения в цепочке")
+        if not name then return 1 end
         local m, err = load_manifest(dir, name)
         if not m then fail_once(err); return 1 end
 
-        if m._local_artifact and ctx.exists(dir .. "/" .. m._local_artifact) and not ctx.is_file(dir .. "/flake.nix") then
-            local local_tokens = {}
-            local ltarget = m._local_run or ("./" .. m._local_artifact)
-            if type(ltarget) == "table" then
-                for _, c in ipairs(ltarget) do table.insert(local_tokens, c) end
-            else
-                for w in ltarget:gmatch("%S+") do table.insert(local_tokens, w) end
-            end
-            for i = 2, #seg do table.insert(local_tokens, seg[i]) end
-            local run_cmd = to_cmd_str(local_tokens)
-            local tmp_file = nil
-            if cur_payload and cur_payload ~= "" then
-                tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
-                local f = io.open(tmp_file, "w")
-                if f then f:write(cur_payload); f:close() end
-                run_cmd = string.format("%s < %s", run_cmd, utils.shell_escape(tmp_file))
-            end
-            local res = ctx.capture(run_cmd, dir)
-            if tmp_file then ctx.delete(tmp_file, true) end
-            if res.code ~= 0 then
-                fail_once(string.format("Приложение '%s' в цепочке завершилось с кодом %d: %s", name, res.code, res.stderr or ""))
-                return res.code
-            end
-            last_output = res.stdout or ""
-            cur_payload = last_output
+        local rargs = {}
+        for i = 2, #seg do table.insert(rargs, seg[i]) end
+
+        local res
+        if has_local_binding(m, dir) then
+            local run_cmd = to_cmd_str(local_binding_tokens(m, rargs))
+            res = capture_with_input(run_cmd, cur_payload, dir)
         else
             ensure_flake(dir, m, name)
 
@@ -1178,62 +957,57 @@ local function run_chain(apps_root, segments)
                 end
             end
 
-            local rargs = {}
-            for i = 2, #seg do table.insert(rargs, seg[i]) end
-            local cmd_tokens = resolve_cmd_tokens(m, rargs)
-            local raw_cmd_str = to_cmd_str(cmd_tokens)
-            local nix_cmd_str = string.format("nix develop --command sh -c %s", utils.shell_escape(raw_cmd_str))
-
-            local env = get_nix_env(name, dir)
-            local run_cmd = nix_cmd_str
-            local tmp_file = nil
-            if cur_payload and cur_payload ~= "" then
-                tmp_file = string.format("/tmp/.grime_chain_in_%d_%d.tmp", os.time(), math.random(10000, 99999))
-                local f = io.open(tmp_file, "w")
-                if f then f:write(cur_payload); f:close() end
-                run_cmd = string.format("%s < %s", nix_cmd_str, utils.shell_escape(tmp_file))
-            end
-
-            local res = ctx.capture(run_cmd, dir, env)
-            if tmp_file then ctx.delete(tmp_file, true) end
-
-            if res.code ~= 0 then
-                fail_once(string.format("Приложение '%s' в цепочке завершилось с кодом %d: %s", name, res.code, res.stderr or ""))
-                return res.code
-            end
-
-            last_output = res.stdout or ""
-            cur_payload = last_output
+            local cmd_tokens, tok_err = resolve_cmd_tokens(m, rargs)
+            if not cmd_tokens then fail_once(tok_err); return 1 end
+            local nix_cmd_str = to_cmd_str(utils.develop_cmd(nil, { "sh", "-c", to_cmd_str(cmd_tokens) }))
+            res = capture_with_input(nix_cmd_str, cur_payload, dir, get_nix_env(name, dir))
         end
 
-        if grime and grime.bus then
-            grime.bus.set("app.last_output", last_output)
-            grime.bus.set("app." .. name .. ".output", last_output)
+        if res.code ~= 0 then
+            fail_once(string.format("Приложение '%s' в цепочке завершилось с кодом %d: %s", name, res.code, res.stderr or ""))
+            return res.code
         end
+        last_output = res.stdout or ""
+        cur_payload = last_output
+
+        bus_set_many({ { "app.last_output", last_output }, { "app." .. name .. ".output", last_output } })
     end
 
     ctx.module_return(last_output)
     return 0
 end
 
-local function list_apps(apps_root, return_path_requested)
-    local dirs = {}
-    local entries = (grime.fs and grime.fs.list and grime.fs.list(apps_root)) or {}
-    for _, item in ipairs(entries) do
-        if item ~= "" and not item:match("^%.") and is_valid_app_dir(apps_root .. "/" .. item) then
-            table.insert(dirs, item)
+--- Список приложений за один проход: для каждого каталога манифест загружается ровно один раз.
+--- Побочных эффектов нет (flake.nix не создаётся, git не вызывается). Экспортируется (list, pkg).
+--- Возвращает массив { name, path, m, err }; каталоги без манифеста/исходников пропускаются.
+local function collect_apps(apps_root)
+    local names = (grime.fs and grime.fs.list and grime.fs.list(apps_root)) or {}
+    table.sort(names)
+    local apps = {}
+    for _, item in ipairs(names) do
+        local dir = apps_root .. "/" .. item
+        if item ~= "" and not item:match("^%.") and ctx.is_dir(dir) then
+            local m, err = load_manifest(dir, item)
+            -- Битый app.lua показываем как повреждённый; остальное без манифеста — не приложение
+            if m or ctx.is_file(dir .. "/app.lua") then
+                table.insert(apps, { name = item, path = dir, m = m, err = err })
+            end
         end
     end
-    table.sort(dirs)
-    if #dirs == 0 then
+    return apps
+end
+
+local function list_apps(apps_root, return_path_requested)
+    local apps = collect_apps(apps_root)
+    if #apps == 0 then
         print(string.format("В каталоге %s нет установленных приложений.\nИспользуйте 'grime app -new <имя>' для создания.", apps_root))
         return
     end
 
     if ctx.has_next_step or return_path_requested then
         local out_items = {}
-        for _, d in ipairs(dirs) do
-            table.insert(out_items, return_path_requested and (apps_root .. "/" .. d) or d)
+        for _, a in ipairs(apps) do
+            table.insert(out_items, return_path_requested and a.path or a.name)
         end
         ctx.module_return(table.concat(out_items, "\n"))
         if ctx.has_next_step then
@@ -1246,19 +1020,16 @@ local function list_apps(apps_root, return_path_requested)
     print(string.format(ANSI.BOLD .. fmt .. ANSI.RESET, "Имя", "Тип", "Окружение", "Статус", "Описание"))
     print(string.rep("─", 90))
 
-    for _, name in ipairs(dirs) do
-        local app_dir = apps_root .. "/" .. name
-        local m, err = load_manifest(app_dir, name)
+    for _, a in ipairs(apps) do
+        local name, app_dir, m = a.name, a.path, a.m
         if not m then
-            print(string.format(fmt, name, "unknown", ANSI.PURPLE .. "nix:flake" .. ANSI.RESET, ANSI.RED .. "Поврежден манифест" .. ANSI.RESET, err or ""))
+            print(string.format(fmt, name, "unknown", ANSI.PURPLE .. "nix:flake" .. ANSI.RESET, ANSI.RED .. "Поврежден манифест" .. ANSI.RESET, a.err or ""))
         else
-            if not (m._local_artifact and not ctx.is_file(app_dir .. "/flake.nix")) then
-                ensure_flake(app_dir, m, name)
-            end
             local sc, slabel = check_artifact_status(app_dir, m)
             local st_col = (sc == "built" or sc == "ready") and (ANSI.GREEN .. slabel .. ANSI.RESET)
                 or (sc == "needs_rebuild" and (ANSI.YELLOW .. slabel .. ANSI.RESET) or (ANSI.RED .. slabel .. ANSI.RESET))
-            local env_label = ctx.is_file(app_dir .. "/flake.nix")
+            -- flake.nix создаётся при первом запуске/сборке (ensure_flake), здесь только читаем состояние
+            local env_label = (ctx.is_file(app_dir .. "/flake.nix") or not m._local_artifact)
                 and (ANSI.PURPLE .. "nix:flake" .. ANSI.RESET)
                 or (ANSI.CYAN .. "bin:local" .. ANSI.RESET)
             local desc = (m.description or ""):gsub("\n", " ")
@@ -1277,7 +1048,26 @@ local function list_apps(apps_root, return_path_requested)
     print()
 end
 
+--- Явная синхронизация flake.nix (git init + генерация + git add -N) для приложения
+local function flake_app(apps_root, raw_name)
+    local app_name, dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -flake <app_name>")
+    if not app_name then return end
+    local m, err = load_manifest(dir, app_name)
+    if not m then fail_once(err); return end
+    if ensure_flake(dir, m, app_name) then
+        ctx.log(string.format("✓ flake.nix приложения '%s' актуален.", app_name))
+        if ctx.has_next_step then ctx.module_return(dir) end
+    else
+        fail_once(string.format("Не удалось синхронизировать flake.nix для '%s'", app_name))
+    end
+end
+
 local function rm_app(apps_root, app_name)
+    local ok_name, why = utils.valid_name(app_name)
+    if not ok_name then
+        fail_once(string.format("Недопустимое имя приложения '%s': %s", tostring(app_name), why))
+        return
+    end
     local app_dir = apps_root .. "/" .. app_name
     if not ctx.exists(app_dir) then fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root)); return end
 
@@ -1293,26 +1083,14 @@ local function rm_app(apps_root, app_name)
     end
 
     if ctx.delete(app_dir, true) then
-        local prefix = "app." .. app_name .. "."
-        if grime and grime.bus and grime.bus.remove then
-            for _, suffix in ipairs({ "artifact", "artifact_size", "build_status", "bundle_size", "last_built_time", "last_bundled_time", "last_snapshot", "snapshot_time", "status", "pid", "output", "source_dir", "bin_path" }) do
-                pcall(grime.bus.remove, prefix .. suffix)
-            end
-        end
-        local data = load_persisted_state()
-        local changed = false
-        for k, _ in pairs(data) do
-            if type(k) == "string" and k:sub(1, #prefix) == prefix then
-                data[k] = nil
-                changed = true
-            end
-        end
-        if changed then
-            local sfile = get_state_file()
-            local f = io.open(sfile, "w")
-            if f then
-                f:write(grime.json.encode(data))
-                f:close()
+        -- Удаляем ключи состояния именно этого приложения (приложения с точкой в имени не затрагиваем)
+        if grime and grime.bus and grime.bus.keys and grime.bus.delete then
+            local prefix = "app." .. app_name .. "."
+            local ok, keys = pcall(grime.bus.keys, prefix)
+            for _, k in ipairs(ok and keys or {}) do
+                if not k:sub(#prefix + 1):find(".", 1, true) then
+                    pcall(grime.bus.delete, k)
+                end
             end
         end
         ctx.log(string.format("✓ Приложение '%s' успешно удалено.", app_name))
@@ -1368,6 +1146,12 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
         return
     end
 
+    local name_ok, name_why = utils.valid_name(app_name)
+    if not name_ok then
+        fail_once(string.format("Недопустимое имя приложения '%s': %s", app_name, name_why))
+        return
+    end
+
     local user_prompt = table.concat(prompt_tokens, " ")
     if user_prompt == "" then
         local pipe_in = ctx.pipeline_input or ctx.input
@@ -1403,19 +1187,11 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
         ctx.log(string.format("Архитектор подключил зависимости Nix: %s", table.concat(stack_plan.special_dependencies, ", ")))
     end
 
-    if ai.scaffold_app then
-        ai.scaffold_app(app_dir, app_name, lang, user_prompt, stack_plan)
-    else
-        -- Минималистичный fallback скаффолдинга без app.lua
-        ctx.mkdir_p(app_dir)
-        local ok_adp, adp = pcall(require, "languages." .. lang)
-        if ok_adp and adp and adp.create_default_files then
-            if lang == "rust" or lang == "cpp" or lang == "java" then
-                ctx.mkdir_p(app_dir .. "/src")
-            end
-            adp:create_default_files(app_dir, ctx, user_prompt)
-        end
+    if type(ai.scaffold_app) ~= "function" then
+        fail_once("Модуль ai не экспортирует scaffold_app: обновите modules/ai.lua")
+        return
     end
+    ai.scaffold_app(app_dir, app_name, lang, user_prompt, stack_plan)
 
     local m = load_manifest(app_dir, app_name, { lang = lang })
     if m and stack_plan.special_dependencies and #stack_plan.special_dependencies > 0 then
@@ -1423,9 +1199,7 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
     end
     ensure_flake(app_dir, m, app_name)
 
-    if not ctx.exists(app_dir .. "/.git") then
-        git.init(app_dir)
-    end
+    git.init(app_dir)
     git.commit(app_dir, "init: zero-manifest flake scaffold", true)
     log.info(string.format("Создано приложение '%s' (стек: %s) с инициализацией Git и flake scaffold", app_name, lang), "app")
 
@@ -1446,16 +1220,8 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
 end
 
 local function commit_app(apps_root, raw_name, msg_param)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -commit <app_name> [сообщение]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -commit <app_name> [сообщение]")
+    if not app_name then return end
 
     local msg = msg_param
     if not msg or #msg == 0 then
@@ -1483,16 +1249,8 @@ local function commit_app(apps_root, raw_name, msg_param)
 end
 
 local function log_app(apps_root, raw_name, limit_param)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -log <app_name> [n]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -log <app_name> [n]")
+    if not app_name then return end
 
     local limit = tonumber(limit_param) or 10
     local commits, err = git.log(app_dir, limit)
@@ -1528,16 +1286,8 @@ local function log_app(apps_root, raw_name, limit_param)
 end
 
 local function snapshot_app(apps_root, raw_name, msg_suffix)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -snapshot <app_name> [сообщение]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -snapshot <app_name> [сообщение]")
+    if not app_name then return end
 
     if not git.is_git_repo(app_dir) then
         git.init(app_dir)
@@ -1556,9 +1306,11 @@ local function snapshot_app(apps_root, raw_name, msg_suffix)
     end
 
     local ts = os.date("%Y-%m-%d %H:%M:%S")
-    bus_set("app." .. app_name .. ".snapshot_time", ts)
-    bus_set("app." .. app_name .. ".last_snapshot", res.hash or "HEAD")
-    bus_set("app.last_snapshot_app", app_name)
+    bus_set_many({
+        { "app." .. app_name .. ".snapshot_time", ts },
+        { "app." .. app_name .. ".last_snapshot", res.hash or "HEAD" },
+        { "app.last_snapshot_app", app_name },
+    })
 
     if res.no_changes then
         grime.ui.log(string.format("Приложение '%s': рабочее дерево чисто, снимок не потребовал новых коммитов (зафиксирован в StateBus: %s).", app_name, ts))
@@ -1571,16 +1323,8 @@ local function snapshot_app(apps_root, raw_name, msg_suffix)
 end
 
 local function diff_app(apps_root, raw_name, file_param)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -diff <app_name> [файл]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -diff <app_name> [файл]")
+    if not app_name then return end
 
     print(string.format("\n%s══════════════════════════════════════════════════════════════════════%s", ANSI.BOLD, ANSI.RESET))
     print(string.format("%s⚡ [Grime Dual Audit] Двойной аудит приложения '%s'%s", ANSI.BOLD, app_name, ANSI.RESET))
@@ -1615,8 +1359,7 @@ local function diff_app(apps_root, raw_name, file_param)
     if not art_path or not ctx.exists(art_path) then
         print(string.format("  %sПриложение '%s' ещё не собрано (артефакт отсутствует)%s", ANSI.YELLOW, app_name, ANSI.RESET))
     else
-        local stat_res = ctx.capture({ "stat", "-c", "%s", art_path })
-        local cur_size = stat_res.code == 0 and tonumber(grime.str.trim(stat_res.stdout)) or nil
+        local cur_size = file_size(art_path)
         local prev_size = tonumber(bus_get("app." .. app_name .. ".artifact_size"))
         local size_str = cur_size and string.format("%.2f KB (%d байт)", cur_size / 1024, cur_size) or "неизвестно"
 
@@ -1636,7 +1379,7 @@ local function diff_app(apps_root, raw_name, file_param)
         end
 
         -- Анализ замыканий Nix (diff-closures)
-        local has_nix = (ctx.capture({ "which", "nix" }).code == 0)
+        local has_nix = utils.has_binary("nix", ctx)
         if has_nix then
             local current_store_path = nil
             if ctx.exists(app_dir .. "/result") then
@@ -1704,16 +1447,8 @@ local function diff_app(apps_root, raw_name, file_param)
 end
 
 local function status_app(apps_root, raw_name)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -status <app_name>")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -status <app_name>")
+    if not app_name then return end
 
     local st, err = git.status(app_dir)
     if not st then
@@ -1751,16 +1486,8 @@ local function status_app(apps_root, raw_name)
 end
 
 local function bundle_app(apps_root, raw_name)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -bundle <app_name>")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -bundle <app_name>")
+    if not app_name then return end
 
     local m, err = load_manifest(app_dir, app_name)
     if not m then
@@ -1801,6 +1528,15 @@ local function bundle_app(apps_root, raw_name)
     pcall(os.remove, out_link)
     pcall(os.remove, out_link .. ".standalone")
 
+    if not is_plain_filename(app_name) then
+        fail_once(string.format("Имя приложения '%s' содержит символы, недопустимые для упаковки (разрешены буквы, цифры, _ . + -)", app_name))
+        return
+    end
+    if art_file and not is_plain_filename(art_file:match("([^/]+)$") or "") then
+        fail_once(string.format("Имя артефакта '%s' содержит символы, недопустимые для упаковки", art_file))
+        return
+    end
+
     ctx.log(string.format("⚡ [Grime App Bundle] Упаковка приложения '%s' через Nix Bundle в %s...", app_name, dist_dir))
 
     ensure_flake(app_dir, m, app_name)
@@ -1812,8 +1548,8 @@ local function bundle_app(apps_root, raw_name)
     end
 
     local pkgs_prelude = string.format(
-        'let flake = builtins.getFlake ("path:" + %q); nixpkgs = flake.inputs.nixpkgs or (builtins.getFlake "nixpkgs"); pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};',
-        app_dir_abs
+        'let flake = builtins.getFlake ("path:" + %s); nixpkgs = flake.inputs.nixpkgs or (builtins.getFlake "nixpkgs"); pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};',
+        nix_quote(app_dir_abs)
     )
 
     local bundle_cmd = nil
@@ -1823,7 +1559,7 @@ local function bundle_app(apps_root, raw_name)
 
         local let_bindings = {
             pkgs_prelude,
-            string.format("art = /. + %q;", art_abs),
+            string.format("art = /. + %s;", nix_quote(art_abs)),
         }
         local copy_commands = {}
         local entry_script = nil
@@ -1834,9 +1570,13 @@ local function bundle_app(apps_root, raw_name)
                 local spath = app_dir .. "/" .. s
                 if ctx.exists(spath) and ctx.is_file(spath) and ctx.normalize_path(spath) ~= art_abs then
                     local sname = s:match("([^/]+)$") or s
-                    table.insert(scripts, { name = sname, path = ctx.normalize_path(spath) })
-                    if (sname:match("%.py$") or sname:match("%.lua$") or sname:match("%.sh$")) and not entry_script then
-                        entry_script = sname
+                    if is_plain_filename(sname) then
+                        table.insert(scripts, { name = sname, path = ctx.normalize_path(spath) })
+                        if (sname:match("%.py$") or sname:match("%.lua$") or sname:match("%.sh$")) and not entry_script then
+                            entry_script = sname
+                        end
+                    else
+                        ctx.log(string.format("Пропущен файл с недопустимым для упаковки именем: %s", sname))
                     end
                 end
             end
@@ -1845,7 +1585,7 @@ local function bundle_app(apps_root, raw_name)
         if #scripts == 0 then
             local entries = (grime.fs and grime.fs.list and grime.fs.list(app_dir)) or {}
             for _, fname in ipairs(entries) do
-                if fname:match("%.py$") or fname:match("%.sh$") then
+                if (fname:match("%.py$") or fname:match("%.sh$")) and is_plain_filename(fname) then
                     local fpath = ctx.normalize_path(app_dir .. "/" .. fname)
                     if ctx.is_file(fpath) and fpath ~= art_abs then
                         table.insert(scripts, { name = fname, path = fpath })
@@ -1859,7 +1599,7 @@ local function bundle_app(apps_root, raw_name)
 
         for idx, sc in ipairs(scripts) do
             local var_name = "src_" .. tostring(idx)
-            table.insert(let_bindings, string.format("%s = /. + %q;", var_name, sc.path))
+            table.insert(let_bindings, string.format("%s = /. + %s;", var_name, nix_quote(sc.path)))
             table.insert(copy_commands, string.format("cp -p ${%s} $out/libexec/%s\n    chmod +x $out/libexec/%s", var_name, sc.name, sc.name))
         end
 
@@ -1876,7 +1616,7 @@ local function bundle_app(apps_root, raw_name)
         local nix_expr = string.format([[
 %s
 in pkgs.stdenv.mkDerivation {
-  pname = %q;
+  pname = %s;
   version = "1.0.0";
   dontUnpack = true;
   nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -1909,24 +1649,24 @@ EOF
     chmod +x $out/bin/%s
     wrapProgram $out/bin/%s --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 pkgs.coreutils pkgs.bash ]}
   '';
-  meta.mainProgram = %q;
+  meta.mainProgram = %s;
 }
 ]],
             table.concat(let_bindings, "\n  "),
-            app_name,
+            nix_quote(app_name),
             art_name, art_name,
             table.concat(copy_commands, "\n    "),
             app_name,
             art_name, art_name,
             run_cmd_line,
             app_name, app_name, app_name,
-            app_name
+            nix_quote(app_name)
         )
         bundle_cmd = { "nix", "bundle", "--expr", nix_expr, "-o", out_link, "--impure" }
     elseif art_file and ctx.is_file(art_file) then
         local art_abs = ctx.normalize_path(art_file)
-        local nix_expr = string.format([[%s art = /. + %q; in pkgs.stdenv.mkDerivation { pname = %q; version = "1.0.0"; dontUnpack = true; installPhase = ''mkdir -p $out/bin; cp -p ${art} $out/bin/%s; chmod +x $out/bin/%s''; meta.mainProgram = %q; }]],
-            pkgs_prelude, art_abs, app_name, app_name, app_name, app_name)
+        local nix_expr = string.format([[%s art = /. + %s; in pkgs.stdenv.mkDerivation { pname = %s; version = "1.0.0"; dontUnpack = true; installPhase = ''mkdir -p $out/bin; cp -p ${art} $out/bin/%s; chmod +x $out/bin/%s''; meta.mainProgram = %s; }]],
+            pkgs_prelude, nix_quote(art_abs), nix_quote(app_name), app_name, app_name, nix_quote(app_name))
         bundle_cmd = { "nix", "bundle", "--expr", nix_expr, "-o", out_link, "--impure" }
     else
         bundle_cmd = { "nix", "bundle", ".", "-o", out_link }
@@ -1947,13 +1687,14 @@ EOF
     end
 
     if ctx.exists(out_link) then
-        local stat_res = ctx.capture({ "stat", "-c", "%s", out_link })
-        if stat_res.code == 0 then
-            local size = tonumber(grime.str.trim(stat_res.stdout))
-            bus_set("app." .. app_name .. ".artifact_size", size)
-            bus_set("app." .. app_name .. ".bundle_size", size)
+        local prefix = "app." .. app_name .. "."
+        local state = { { prefix .. "last_bundled_time", os.date("%Y-%m-%d %H:%M:%S") } }
+        local size = file_size(out_link)
+        if size then
+            table.insert(state, { prefix .. "artifact_size", size })
+            table.insert(state, { prefix .. "bundle_size", size })
         end
-        bus_set("app." .. app_name .. ".last_bundled_time", os.date("%Y-%m-%d %H:%M:%S"))
+        bus_set_many(state)
     end
 
     grime.ui.success(string.format("✓ Приложение '%s' успешно упаковано в автономный бинарник: %s", app_name, out_link))
@@ -1964,16 +1705,8 @@ EOF
 end
 
 local function rollback_app(apps_root, raw_name, target_commit)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -rollback <app_name> [commit]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local app_dir = apps_root .. "/" .. app_name
-    if not ctx.exists(app_dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", app_name, apps_root))
-        return
-    end
+    local app_name, app_dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -rollback <app_name> [commit]")
+    if not app_name then return end
 
     if not git.is_git_repo(app_dir) then
         fail_once(string.format("Директория приложения '%s' не является Git-репозиторием", app_name))
@@ -1982,23 +1715,35 @@ local function rollback_app(apps_root, raw_name, target_commit)
 
     local target = target_commit or "HEAD~1"
     ctx.log(string.format("Откат приложения '%s' на ревизию %s...", app_name, target))
-    local res = ctx.capture({ "git", "reset", "--hard", target }, app_dir)
-    if res.code ~= 0 then
-        fail_once(string.format("Ошибка отката приложения '%s': %s", app_name, res.stderr or res.stdout or ""))
+    local reset_ok, reset_out = git.reset(app_dir, target, { hard = true })
+    if not reset_ok then
+        fail_once(string.format("Ошибка отката приложения '%s': %s", app_name, reset_out or ""))
         return
     end
 
     local cur_log = git.log(app_dir, 1)
-    local log_msg = (#cur_log > 0) and string.format("[%s] %s", cur_log[1].hash, cur_log[1].message) or target
+    local log_msg = (type(cur_log) == "table" and #cur_log > 0) and string.format("[%s] %s", cur_log[1].hash, cur_log[1].message) or target
     log.info(string.format("Откат приложения '%s' на %s", app_name, log_msg), "app")
     grime.ui.success(string.format("✓ Репозиторий приложения '%s' успешно откатан на %s", app_name, log_msg))
     ctx.success(log_msg)
 end
 
-local function is_pid_alive(pid)
-    if not pid or not tostring(pid):match("^%d+$") then return false end
-    local res = ctx.capture(string.format("kill -0 %s 2>/dev/null && echo alive", pid))
-    return (res.stdout and res.stdout:match("alive") ~= nil) or ctx.exists("/proc/" .. pid)
+--- Чтение pid фонового приложения: возвращает pid (строка) или nil, путь к pid-файлу
+local function read_app_pid(dir)
+    local pid_file = dir .. "/app.pid"
+    if not ctx.exists(pid_file) then
+        pid_file = dir .. "/.app.pid"
+    end
+    local pid = nil
+    if ctx.exists(pid_file) then
+        local f = io.open(pid_file, "r")
+        if f then
+            pid = f:read("*l")
+            f:close()
+            if pid then pid = pid:match("^%s*(%d+)%s*$") end
+        end
+    end
+    return pid, pid_file
 end
 
 local function get_process_info(pid)
@@ -2032,19 +1777,7 @@ local function ps_apps(apps_root)
 
     for _, name in ipairs(dirs) do
         local app_dir = apps_root .. "/" .. name
-        local pid_file = app_dir .. "/app.pid"
-        if not ctx.exists(pid_file) then
-            pid_file = app_dir .. "/.app.pid"
-        end
-        local pid = nil
-        if ctx.exists(pid_file) then
-            local f = io.open(pid_file, "r")
-            if f then
-                pid = f:read("*l")
-                f:close()
-                if pid then pid = pid:match("^%s*(%d+)%s*$") end
-            end
-        end
+        local pid, pid_file = read_app_pid(app_dir)
 
         local alive = false
         if pid then
@@ -2060,7 +1793,7 @@ local function ps_apps(apps_root)
             local sock_file = app_dir .. "/app.sock"
             local has_sock = ctx.exists(sock_file)
             local sock_status = has_sock and "сокет активен" or "фоновый процесс"
-            local bus_status = (grime and grime.bus and grime.bus.get) and grime.bus.get("app." .. name .. ".status") or nil
+            local bus_status = bus_get("app." .. name .. ".status")
             table.insert(running, {
                 name = name,
                 pid = pid,
@@ -2114,17 +1847,18 @@ local function ps_apps(apps_root)
     io.stdout:write(string.format("\27[90mДля остановки: \27[36mgrime app -stop <имя>\27[0m (или \27[36mgrime app -stop <имя> -9\27[0m)\n\n"))
 end
 
+--- Отправка сигнала процессу, его потомкам и группе процессов (pid проверен как число)
+local function signal_app(pid, sig)
+    ctx.capture(string.format("pkill %s -P %s 2>/dev/null; kill %s -- -%s 2>/dev/null; kill %s %s 2>/dev/null",
+        sig, pid, sig, pid, sig, pid))
+end
+
+local STOP_TIMEOUT_MS = 5000
+local STOP_POLL_MS = 100
+
 local function stop_app(apps_root, raw_name, force)
-    if not raw_name or raw_name == "" then
-        fail_once("Укажите имя приложения: grime app -stop <app_name> [-9/-force]")
-        return
-    end
-    local app_name = resolve_app_name(apps_root, raw_name)
-    local dir = apps_root .. "/" .. app_name
-    if not ctx.exists(dir) then
-        fail_once(string.format("Приложение '%s' не найдено в %s", raw_name, apps_root))
-        return
-    end
+    local app_name, dir = require_app_dir(apps_root, raw_name, "Укажите имя приложения: grime app -stop <app_name> [-9/-force]")
+    if not app_name then return end
 
     local m, _ = load_manifest(dir, app_name)
     if m and type(m.stop) == "function" then
@@ -2132,40 +1866,25 @@ local function stop_app(apps_root, raw_name, force)
         if not ok then ctx.log("Предупреждение при выполнении m.stop: " .. tostring(err)) end
     end
 
-    local pid_file = dir .. "/app.pid"
-    if not ctx.exists(pid_file) then
-        pid_file = dir .. "/.app.pid"
-    end
-    local pid = nil
-    if ctx.exists(pid_file) then
-        local f = io.open(pid_file, "r")
-        if f then
-            pid = f:read("*l")
-            f:close()
-            if pid then pid = pid:match("^%s*(%d+)%s*$") end
-        end
-    end
-
-    local sig = force and "-KILL" or "-TERM"
-    local stopped = false
+    local pid, pid_file = read_app_pid(dir)
 
     if pid and is_pid_alive(pid) then
-        ctx.capture(string.format("pkill %s -P %s 2>/dev/null; kill %s -- -%s 2>/dev/null; kill %s %s 2>/dev/null", sig, pid, sig, pid, sig, pid))
-        for _ = 1, 5 do
-            if not is_pid_alive(pid) then
-                stopped = true
-                break
-            end
-            if ctx.sleep then ctx.sleep(50) else os.execute("sleep 0.05") end
+        -- Мягкая остановка: SIGTERM и ожидание до STOP_TIMEOUT_MS; SIGKILL — при -force сразу, иначе после таймаута
+        signal_app(pid, force and "-KILL" or "-TERM")
+        local waited = 0
+        while is_pid_alive(pid) and waited < (force and 1000 or STOP_TIMEOUT_MS) do
+            sleep_ms(STOP_POLL_MS)
+            waited = waited + STOP_POLL_MS
         end
-        if not stopped then
-            ctx.capture(string.format("pkill -KILL -P %s 2>/dev/null; kill -9 -- -%s 2>/dev/null; kill -9 %s 2>/dev/null", pid, pid, pid))
-            stopped = not is_pid_alive(pid)
+        if is_pid_alive(pid) and not force then
+            ctx.log(string.format("Процесс %s не завершился за %d с, отправляю SIGKILL...", pid, STOP_TIMEOUT_MS // 1000))
+            signal_app(pid, "-KILL")
+            sleep_ms(300)
         end
-        if stopped or not is_pid_alive(pid) then
+        if not is_pid_alive(pid) then
             ctx.log(string.format("✓ Фоновое приложение '%s' (PID: %s) успешно остановлено.", app_name, pid))
         else
-            fail_once(string.format("Не удалось остановить процесс %s для '%s'. Попробуйте с флагом -force / -9.", pid, app_name))
+            fail_once(string.format("Не удалось остановить процесс %s для '%s'.", pid, app_name))
         end
     else
         ctx.log(string.format("Приложение '%s' не было запущено.", app_name))
@@ -2175,9 +1894,7 @@ local function stop_app(apps_root, raw_name, force)
     local sock_file = dir .. "/app.sock"
     if ctx.exists(sock_file) then ctx.delete(sock_file, true) end
 
-    if grime and grime.bus and grime.bus.set then
-        grime.bus.set("app." .. app_name .. ".status", "stopped")
-    end
+    bus_set("app." .. app_name .. ".status", "stopped")
 
     if ctx.has_next_step then
         ctx.success(dir)
@@ -2274,138 +1991,6 @@ local function print_help()
     ))
 end
 
-local SHEBANG_BY_LANG = {
-    python = "#!/usr/bin/env python3",
-    lua    = "#!/usr/bin/env luajit",
-    bash   = "#!/usr/bin/env bash",
-    fish   = "#!/usr/bin/env fish",
-    nodejs = "#!/usr/bin/env node",
-}
-
---- Гарантирует наличие shebang (#!) в первой строке скрипта
-local function ensure_script_shebang(filepath, lang)
-    local f = io.open(filepath, "rb")
-    if not f then return false end
-    local content = f:read("*a") or ""
-    f:close()
-
-    -- Пропускаем бинарные файлы
-    if content:sub(1, 4) == "\127ELF" or content:sub(1, 512):find("\0", 1, true) then
-        return false
-    end
-
-    -- Убираем UTF-8 BOM, если присутствует
-    local bom_stripped = false
-    if content:sub(1, 3) == "\239\187\191" then
-        content = content:sub(4)
-        bom_stripped = true
-    end
-
-    if content:sub(1, 2) == "#!" then
-        if bom_stripped then
-            local wf = io.open(filepath, "wb")
-            if wf then wf:write(content); wf:close() end
-        end
-        return true
-    end
-
-    local ext = filepath:match("(%.[%a%d_]+)$")
-    local inferred = (ext and EXT_TO_LANG[ext:lower()]) or lang
-    local sb = SHEBANG_BY_LANG[(inferred or ""):lower()]
-    if not sb then
-        return false
-    end
-
-    local wf = io.open(filepath, "wb")
-    if wf then
-        wf:write(sb .. "\n" .. content)
-        wf:close()
-        ctx.log(string.format("Добавлен shebang '%s' в %s", sb, filepath))
-        return true
-    end
-    return false
-end
-
---- Поиск директории проекта в проектных каталогах GRIME
-local function find_project_by_name(query)
-    if not query or query == "" then return nil end
-    local roots = {}
-    local seen_r = {}
-    local function add_root(r)
-        if r and r ~= "" then
-            local nr = ctx.normalize_path(r)
-            if ctx.is_dir(nr) and not seen_r[nr] then
-                seen_r[nr] = true
-                table.insert(roots, nr)
-            end
-        end
-    end
-    add_root(utils.get_projects_root(ctx))
-    if HOME ~= "" then
-        add_root(HOME .. "/Archive/_Programing_")
-        add_root(HOME .. "/Projects")
-    end
-
-    local buckets = { "cpp", "C++", "rust", "python", "java", "lua", "bash", "fish" }
-    local candidates = {}
-    for _, root in ipairs(roots) do
-        -- 1. Точное совпадение в корне и бакетах
-        if ctx.is_dir(root .. "/" .. query) then
-            return ctx.normalize_path(root .. "/" .. query)
-        end
-        for _, b in ipairs(buckets) do
-            local p = root .. "/" .. b .. "/" .. query
-            if ctx.is_dir(p) then
-                return ctx.normalize_path(p)
-            end
-        end
-        -- Собираем список подпроектов для нечёткого поиска
-        local items = (grime.fs and grime.fs.list and grime.fs.list(root)) or {}
-        for _, item in ipairs(items) do
-            if not item:match("^%.") and ctx.is_dir(root .. "/" .. item) then
-                local full = root .. "/" .. item
-                local is_bucket = false
-                for _, b in ipairs(buckets) do
-                    if item == b then is_bucket = true; break end
-                end
-                if is_bucket then
-                    local subs = (grime.fs and grime.fs.list and grime.fs.list(full)) or {}
-                    for _, sub in ipairs(subs) do
-                        if not sub:match("^%.") and ctx.is_dir(full .. "/" .. sub) then
-                            table.insert(candidates, { name = sub, path = full .. "/" .. sub })
-                        end
-                    end
-                else
-                    table.insert(candidates, { name = item, path = full })
-                end
-            end
-        end
-    end
-
-    local qlow = query:lower()
-    for _, c in ipairs(candidates) do
-        if c.name:lower() == qlow then return ctx.normalize_path(c.path) end
-    end
-    for _, c in ipairs(candidates) do
-        if c.name:lower():sub(1, #qlow) == qlow then return ctx.normalize_path(c.path) end
-    end
-    for _, c in ipairs(candidates) do
-        if c.name:lower():find(qlow, 1, true) then return ctx.normalize_path(c.path) end
-    end
-    local names = {}
-    for _, c in ipairs(candidates) do table.insert(names, c.name) end
-    local best = grime.fuzzy and grime.fuzzy.find_best_match and grime.fuzzy.find_best_match(query, names, 0.75)
-    if best then
-        for _, c in ipairs(candidates) do
-            if c.name == best then
-                ctx.log(string.format("Проект '%s' не найден, выбран похожий: '%s'", query, best))
-                return ctx.normalize_path(c.path)
-            end
-        end
-    end
-    return nil
-end
-
 --- Проверка наличия всех необходимых бинарников команды на хосте
 local function has_command_bins_on_host(cmd_str)
     if type(cmd_str) ~= "string" or cmd_str == "" then return false end
@@ -2414,6 +1999,24 @@ local function has_command_bins_on_host(cmd_str)
         return false
     end
     return utils.has_binary(first, ctx)
+end
+
+--- Запись bash-обёртки запуска Java-артефакта рядом с приложением (имена экранируются).
+--- mode "-jar": target — путь к jar относительно каталога обёртки;
+--- mode "-cp": target — каталог classpath относительно обёртки, main_class — запускаемый класс (имя артефакта)
+local function write_java_launcher(dest_path, mode, target, main_class)
+    local body
+    if mode == "-jar" then
+        body = string.format('exec java -jar "$APP_DIR"/%s "$@"', utils.shell_escape(target))
+    else
+        body = string.format('exec java -cp "$APP_DIR"/%s %s "$@"', utils.shell_escape(target), utils.shell_escape(main_class or "Main"))
+    end
+    local wf = io.open(dest_path, "w")
+    if wf then
+        wf:write('#!/usr/bin/env bash\nAPP_DIR="$(dirname "$(readlink -f "$0")")"\n' .. body .. "\n")
+        wf:close()
+    end
+    ctx.capture({ "chmod", "+x", dest_path })
 end
 
 --- Компиляция (и/или установка в apps + ~/.local/bin) аппа, папки или проекта
@@ -2434,6 +2037,14 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
     if not target_arg or target_arg == "" then
         fail_once("Использование: grime app -compile <имя_аппа | путь | имя_проекта> [имя_команды]")
         return 1
+    end
+
+    if custom_name then
+        local name_ok, name_why = utils.valid_name(custom_name)
+        if not name_ok then
+            fail_once(string.format("Недопустимое имя команды '%s': %s", custom_name, name_why))
+            return 1
+        end
     end
 
     local target_dir = nil
@@ -2470,7 +2081,8 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
 
     -- 3. Проверяем среди проектов grime project
     if not target_dir and not looks_like_path then
-        target_dir = find_project_by_name(target_arg)
+        local proj_path = require("project").find_project(target_arg)
+        target_dir = proj_path and ctx.normalize_path(proj_path) or nil
     end
 
     if not target_dir or not ctx.is_dir(target_dir) then
@@ -2497,19 +2109,11 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
             end
             code = (type(res) == "number") and res or (res == false and 1 or 0)
         else
-            local has_local_flake = ctx.is_file(target_dir .. "/flake.nix")
-            local has_spec_deps = m.special_dependencies and #m.special_dependencies > 0
-            local fast_host = (not has_local_flake) and (not has_spec_deps) and has_command_bins_on_host(m.build)
-            if fast_host then
+            if can_build_on_host(m, target_dir, has_command_bins_on_host(m.build)) then
                 code = ctx.run_process({ "sh", "-c", m.build }, target_dir)
             else
-                local flake_override = nil
-                local norm_apps = ctx.normalize_path(apps_root) .. "/"
-                if not has_local_flake and target_dir:sub(1, #norm_apps) ~= norm_apps then
-                    flake_override = get_ephemeral_compile_flake(target_dir, m)
-                end
                 local env = get_nix_env(initial_name, target_dir, { GRIME_APP_NAME = initial_name })
-                code = exec_cmd(m, m.build, target_dir, env, flake_override)
+                code = exec_cmd(m, m.build, target_dir, env)
             end
         end
 
@@ -2555,6 +2159,12 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
         end
     end
 
+    local final_ok, final_why = utils.valid_name(final_name)
+    if not final_ok then
+        fail_once(string.format("Недопустимое итоговое имя команды '%s': %s", final_name, final_why))
+        return 1
+    end
+
     -- Подготовка скрипта: добавляем shebang при отсутствии и ставим chmod +x
     local is_script = m._is_script
         or abs_compiled:match("%.py$")
@@ -2563,7 +2173,7 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
         or abs_compiled:match("%.bash$")
         or abs_compiled:match("%.fish$")
     if is_script then
-        ensure_script_shebang(abs_compiled, m.type)
+        utils.ensure_shebang(abs_compiled, m.type, ctx)
     end
     ctx.capture({ "chmod", "+x", abs_compiled })
 
@@ -2574,94 +2184,68 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
     local dest_bin_path = nil
     local dest_file_name = nil
     local norm_target = ctx.normalize_path(target_dir)
+    local in_place = (norm_target == dest_app_dir)
+    local is_jar = abs_compiled:match("%.jar$") ~= nil
+    local is_class = abs_compiled:match("%.class$") ~= nil
 
-    if norm_target ~= dest_app_dir then
-        if abs_compiled:match("%.jar$") then
-            local jar_dst = dest_app_dir .. "/" .. art_base
-            ctx.capture({ "cp", "-f", abs_compiled, jar_dst })
-            dest_file_name = final_name
-            dest_bin_path = dest_app_dir .. "/" .. dest_file_name
-            local wf = io.open(dest_bin_path, "w")
-            if wf then
-                wf:write(string.format("#!/usr/bin/env bash\nexec java -jar \"$(dirname \"$(readlink -f \"$0\")\")/%s\" \"$@\"\n", art_base))
-                wf:close()
-            end
-            ctx.capture({ "chmod", "+x", dest_bin_path })
-        elseif abs_compiled:match("%.class$") then
+    if is_jar or is_class then
+        -- Java-артефакт: копируем (если апп во внешнем каталоге) и пишем единую bash-обёртку запуска
+        local launch_target
+        if in_place then
+            launch_target = is_jar and compiled_rel or (compiled_rel:match("^(.*)/[^/]+$") or ".")
+        elseif is_jar then
+            ctx.capture({ "cp", "-f", abs_compiled, dest_app_dir .. "/" .. art_base })
+            launch_target = art_base
+        else
             local bin_sub = dest_app_dir .. "/bin"
             ctx.mkdir_p(bin_sub)
-            local class_dir = abs_compiled:match("^(.*)/[^/]+$") or target_dir
-            ctx.copy(class_dir, bin_sub)
-            dest_file_name = final_name
-            dest_bin_path = dest_app_dir .. "/" .. dest_file_name
-            local wf = io.open(dest_bin_path, "w")
-            if wf then
-                wf:write("#!/usr/bin/env bash\nexec java -cp \"$(dirname \"$(readlink -f \"$0\")\")/bin\" Main \"$@\"\n")
-                wf:close()
-            end
-            ctx.capture({ "chmod", "+x", dest_bin_path })
-        else
-            local ext = abs_compiled:match("(%.[%a%d_]+)$") or ""
-            dest_file_name = (is_script and ext ~= "") and (final_name .. ext) or final_name
-            dest_bin_path = dest_app_dir .. "/" .. dest_file_name
-            ctx.capture({ "cp", "-f", abs_compiled, dest_bin_path })
-            ctx.capture({ "chmod", "+x", dest_bin_path })
+            ctx.copy(abs_compiled:match("^(.*)/[^/]+$") or target_dir, bin_sub)
+            launch_target = "bin"
+        end
+        dest_file_name = final_name
+        dest_bin_path = dest_app_dir .. "/" .. dest_file_name
+        write_java_launcher(dest_bin_path, is_jar and "-jar" or "-cp", launch_target,
+            (not is_jar) and (art_base:gsub("%.class$", "")) or nil)
+    elseif in_place then
+        dest_bin_path = abs_compiled
+        dest_file_name = compiled_rel
+        ctx.capture({ "chmod", "+x", dest_bin_path })
+    else
+        local ext = abs_compiled:match("(%.[%a%d_]+)$") or ""
+        dest_file_name = (is_script and ext ~= "") and (final_name .. ext) or final_name
+        dest_bin_path = dest_app_dir .. "/" .. dest_file_name
+        ctx.capture({ "cp", "-f", abs_compiled, dest_bin_path })
+        ctx.capture({ "chmod", "+x", dest_bin_path })
 
-            -- Копируем сопутствующие .so библиотеки из директории бинарника, если они есть
-            local art_dir = abs_compiled:match("^(.*)/[^/]+$")
-            if art_dir and ctx.is_dir(art_dir) then
-                local sibs = (grime.fs and grime.fs.list and grime.fs.list(art_dir)) or {}
-                for _, s in ipairs(sibs) do
-                    if s:match("%.so$") or s:match("%.so%.") then
-                        ctx.capture({ "cp", "-f", art_dir .. "/" .. s, dest_app_dir .. "/" .. s })
-                    end
+        -- Копируем сопутствующие .so библиотеки из директории бинарника, если они есть
+        local art_dir = abs_compiled:match("^(.*)/[^/]+$")
+        if art_dir and ctx.is_dir(art_dir) then
+            local sibs = (grime.fs and grime.fs.list and grime.fs.list(art_dir)) or {}
+            for _, sib in ipairs(sibs) do
+                if sib:match("%.so$") or sib:match("%.so%.") then
+                    ctx.capture({ "cp", "-f", art_dir .. "/" .. sib, dest_app_dir .. "/" .. sib })
                 end
             end
         end
+    end
 
-        -- Сохраняем привязку к исходникам в .grime_app.json (если нет app.lua)
-        if not ctx.is_file(dest_app_dir .. "/app.lua") and grime and grime.json and grime.json.encode then
-            local meta_tbl = {
-                name = final_name,
-                source_dir = norm_target,
-                artifact = dest_file_name,
-                source_artifact = compiled_rel,
-                lang = m.type,
-                run = "./" .. dest_file_name,
-                bin_link = HOME .. "/.local/bin/" .. final_name,
-                description = m.description or ("Скомпилированное приложение " .. final_name),
-                special_dependencies = m.special_dependencies or {},
-            }
-            local mf = io.open(dest_app_dir .. "/.grime_app.json", "w")
-            if mf then
-                mf:write(grime.json.encode(meta_tbl))
-                mf:close()
-            end
-        end
-    else
-        -- Апп уже находится в dest_app_dir
-        if abs_compiled:match("%.jar$") then
-            dest_file_name = final_name
-            dest_bin_path = dest_app_dir .. "/" .. dest_file_name
-            local wf = io.open(dest_bin_path, "w")
-            if wf then
-                wf:write(string.format("#!/usr/bin/env bash\nexec java -jar \"$(dirname \"$(readlink -f \"$0\")\")/%s\" \"$@\"\n", compiled_rel))
-                wf:close()
-            end
-            ctx.capture({ "chmod", "+x", dest_bin_path })
-        elseif abs_compiled:match("%.class$") then
-            dest_file_name = final_name
-            dest_bin_path = dest_app_dir .. "/" .. dest_file_name
-            local wf = io.open(dest_bin_path, "w")
-            if wf then
-                wf:write("#!/usr/bin/env bash\nexec java -cp \"$(dirname \"$(readlink -f \"$0\")\")/bin\" Main \"$@\"\n")
-                wf:close()
-            end
-            ctx.capture({ "chmod", "+x", dest_bin_path })
-        else
-            dest_bin_path = abs_compiled
-            dest_file_name = compiled_rel
-            ctx.capture({ "chmod", "+x", dest_bin_path })
+    -- Сохраняем привязку к исходникам в .grime_app.json (если нет app.lua)
+    if not in_place and not ctx.is_file(dest_app_dir .. "/app.lua") and grime and grime.json and grime.json.encode then
+        local meta_tbl = {
+            name = final_name,
+            source_dir = norm_target,
+            artifact = dest_file_name,
+            source_artifact = compiled_rel,
+            lang = m.type,
+            run = "./" .. dest_file_name,
+            bin_link = HOME .. "/.local/bin/" .. final_name,
+            description = m.description or ("Скомпилированное приложение " .. final_name),
+            special_dependencies = m.special_dependencies or {},
+        }
+        local mf = io.open(dest_app_dir .. "/.grime_app.json", "w")
+        if mf then
+            mf:write(grime.json.encode(meta_tbl))
+            mf:close()
         end
     end
 
@@ -2676,11 +2260,14 @@ local function compile_or_install_app(apps_root, args, _is_install, explicit_lan
     end
 
     -- Регистрируем состояние в StateBus
-    bus_set("app." .. final_name .. ".source_dir", norm_target)
-    bus_set("app." .. final_name .. ".artifact", dest_bin_path)
-    bus_set("app." .. final_name .. ".bin_path", bin_link)
-    bus_set("app." .. final_name .. ".build_status", "ready")
-    bus_set("app." .. final_name .. ".last_built_time", os.date("%Y-%m-%d %H:%M:%S"))
+    local state_prefix = "app." .. final_name .. "."
+    bus_set_many({
+        { state_prefix .. "source_dir", norm_target },
+        { state_prefix .. "artifact", dest_bin_path },
+        { state_prefix .. "bin_path", bin_link },
+        { state_prefix .. "build_status", "ready" },
+        { state_prefix .. "last_built_time", os.date("%Y-%m-%d %H:%M:%S") },
+    })
 
     ctx.log(string.format("✓ Артефакт размещён: %s", dest_bin_path))
     ctx.log(string.format("✓ Системная команда зарегистрирована: %s -> %s", bin_link, dest_bin_path))
@@ -2727,8 +2314,8 @@ local function run_existing_app(apps_root, filtered, extra_args, is_detach, expl
 end
 local run_or_create = run_existing_app
 
-function main()
-    has_failed = false
+local function main()
+    reset_failed()
     local apps_root = get_apps_root()
     local is_detach, force = false, false
     local wants_help = false
@@ -2825,6 +2412,11 @@ function main()
         if target_query and target_query ~= "" then
             local matched_name = find_app_name(apps_root, target_query)
             local resolved_name = matched_name or target_query
+            local name_ok, name_why = utils.valid_name(resolved_name)
+            if not name_ok then
+                fail_once(string.format("Недопустимое имя приложения '%s': %s", resolved_name, name_why))
+                return 1
+            end
             local cand_dir = ctx.normalize_path(apps_root .. "/" .. resolved_name)
             local link_meta = utils.read_app_link_meta(cand_dir)
             if link_meta and link_meta.source_dir and ctx.is_dir(link_meta.source_dir) then
@@ -2872,13 +2464,8 @@ function main()
     elseif subcmd == "compile" or subcmd == "install" then
         return compile_or_install_app(apps_root, filtered, subcmd == "install", explicit_lang, path_requested)
     elseif subcmd == "build" then
-        if not filtered[1] then fail_once("Укажите имя приложения: grime app -build <app_name>"); return 1 end
-        local app_name = resolve_app_name(apps_root, filtered[1])
-        local dir = apps_root .. "/" .. app_name
-        if not ctx.exists(dir) then
-            fail_once(string.format("Приложение '%s' не найдено в %s", filtered[1], apps_root))
-            return 1
-        end
+        local app_name, dir = require_app_dir(apps_root, filtered[1], "Укажите имя приложения: grime app -build <app_name>")
+        if not app_name then return 1 end
         local m, err = load_manifest(dir, app_name)
         if not m then fail_once(err or "Конфигурация приложения не найдена"); return 1 end
         local ok = build_app(app_name, m, dir)
@@ -2915,9 +2502,8 @@ function main()
         diff_app(apps_root, filtered[1], filtered[2])
         return 0
     elseif subcmd == "status" then
-        if not filtered[1] then fail_once("Укажите имя приложения: grime app -status <app_name>"); return 1 end
-        local app_name = resolve_app_name(apps_root, filtered[1])
-        local dir = apps_root .. "/" .. app_name
+        local app_name, dir = require_app_dir(apps_root, filtered[1], "Укажите имя приложения: grime app -status <app_name>")
+        if not app_name then return 1 end
         local m, _ = load_manifest(dir, app_name)
         if m and type(m.status) == "function" then
             m.status(dir, m)
@@ -2926,9 +2512,8 @@ function main()
         status_app(apps_root, filtered[1])
         return 0
     elseif subcmd == "test" then
-        if not filtered[1] then fail_once("Укажите имя приложения: grime app -test <app_name>"); return 1 end
-        local app_name = resolve_app_name(apps_root, filtered[1])
-        local dir = apps_root .. "/" .. app_name
+        local app_name, dir = require_app_dir(apps_root, filtered[1], "Укажите имя приложения: grime app -test <app_name>")
+        if not app_name then return 1 end
         local m, err = load_manifest(dir, app_name)
         if not m then fail_once(err or "Конфигурация приложения не найдена"); return 1 end
         if type(m.test) == "function" then
@@ -2955,9 +2540,12 @@ function main()
         rollback_app(apps_root, filtered[1], filtered[2])
         return 0
     elseif subcmd == "rm" then
-        if not filtered[1] then fail_once("Укажите имя приложения: grime app -rm <app_name>"); return 1 end
-        local app_name = resolve_app_name(apps_root, filtered[1])
+        local app_name = require_app_dir(apps_root, filtered[1], "Укажите имя приложения: grime app -rm <app_name>")
+        if not app_name then return 1 end
         rm_app(apps_root, app_name)
+        return 0
+    elseif subcmd == "flake" then
+        flake_app(apps_root, filtered[1])
         return 0
     elseif subcmd == "run" then
         if not filtered[1] then
@@ -2993,7 +2581,6 @@ function main()
 end
 
 return {
-    description = description,
     main = main,
     get_apps_root = get_apps_root,
     find_app_name = find_app_name,
@@ -3016,4 +2603,7 @@ return {
     bundle_app = bundle_app,
     rollback_app = rollback_app,
     run_or_create = run_or_create,
+    flake_app = flake_app,
+    reset_failed = reset_failed,
+    collect_apps = collect_apps,
 }

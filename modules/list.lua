@@ -1,12 +1,13 @@
+--@grime description: Единый реестр модулей GRIME, приложений и проектов разработки
+--@grime requires: module:app?, module:project?
+--@grime alias: ls, modules
+
 --[[
     Grime List Module (Unified Inventory: Modules, Apps & Projects)
     Единый каталог установленных декларативных модулей GRIME,
     локальных микроприложений (Grime Apps) и проектов пользователя.
 ]]
 
--- Summary: Единый реестр модулей GRIME, приложений и проектов разработки
--- Description: Единый реестр модулей GRIME, приложений и проектов разработки
-description = "Единый реестр модулей GRIME, приложений и проектов разработки"
 
 local utils = require("languages.utils")
 
@@ -86,59 +87,12 @@ local function parse_json_description(content)
     return nil
 end
 
---- Динамическое извлечение описания модуля GRIME
-local function get_module_description(mod_path)
-    -- 1. Быстрый поиск регулярными выражениями без загрузки файла в Lua
-    local content = get_file_content(mod_path)
-    if content then
-        local d = content:match('M%.description%s*=%s*["\'](.-)["\']')
-            or content:match('description%s*=%s*["\'](.-)["\']')
-            or content:match('%-%-%s*[Dd]escription:%s*([^\r\n]+)')
-            or content:match('%-%-%s*[Ss]ummary:%s*([^\r\n]+)')
-            or content:match('%-%-%s*Описание:%s*([^\r\n]+)')
-        if d and d ~= "" then
-            return (str and str.trim and str.trim(d)) or d:match("^%s*(.-)%s*$")
-        end
+--- Описание модуля GRIME из реестра ядра (аннотация `--@grime description:`)
+local function get_module_description(name)
+    local meta = grime.modules and grime.modules.get(name)
+    if meta and type(meta.description) == "string" and meta.description ~= "" then
+        return meta.description
     end
-
-    -- 2. Если по regex не нашли, безопасный запуск в изолированном окружении
-    local env = {
-        grime = { ctx = {}, fs = {}, ui = {}, str = {}, bus = {}, events = {}, process = {} },
-        require = function() return {} end,
-        string = string,
-        table = table,
-        math = math,
-        os = { getenv = os.getenv },
-        type = type,
-        tostring = tostring,
-        tonumber = tonumber,
-        pcall = pcall,
-        xpcall = xpcall,
-        setmetatable = setmetatable,
-        getmetatable = getmetatable,
-        pairs = pairs,
-        ipairs = ipairs,
-        next = next,
-        select = select,
-        rawget = rawget,
-        rawset = rawset,
-        error = function() end,
-        print = function() end,
-    }
-    env._G = env
-
-    local chunk = loadfile(mod_path, "t", env)
-    if chunk then
-        local ok, ret = pcall(chunk)
-        if ok then
-            if type(ret) == "table" and type(ret.description) == "string" and ret.description ~= "" then
-                return ret.description
-            elseif type(env.description) == "string" and env.description ~= "" then
-                return env.description
-            end
-        end
-    end
-
     return "Декларативный модуль GRIME"
 end
 
@@ -148,30 +102,14 @@ local function get_app_info(app_dir)
     local desc = ""
     local app_file = app_dir .. "/app.lua"
 
-    local app_content = get_file_content(app_file)
-    if app_content then
-        desc = app_content:match('description%s*=%s*["\'](.-)["\']') or ""
-        lang = app_content:match('type%s*=%s*["\'](.-)["\']')
-            or app_content:match('lang%s*=%s*["\'](.-)["\']')
-            or "custom"
-
-        if desc == "" then
-            local chunk = loadfile(app_file, "t", {
-                os = { getenv = os.getenv },
-                string = string,
-                table = table,
-                type = type,
-                tostring = tostring,
-                tonumber = tonumber,
-            })
-            if chunk then
-                local ok, m = pcall(chunk)
-                if ok and type(m) == "table" then
-                    lang = tostring(m.type or m.lang or lang or "custom")
-                    desc = tostring(m.description or desc or "")
-                end
-            end
-        end
+    -- Манифест читается в песочнице (быстро, без загрузки тяжёлого app.lua)
+    local manifest
+    if ctx.exists(app_file) then
+        manifest = utils.load_manifest_sandboxed(app_file)
+    end
+    if manifest then
+        lang = tostring(manifest.type or manifest.lang or "custom")
+        desc = tostring(manifest.description or "")
     else
         -- Zero-Manifest App: проверяем мета-файл привязки или синтезируем через app.load_manifest / scanner
         local link_meta = utils.read_app_link_meta(app_dir)
@@ -198,6 +136,7 @@ local function get_app_info(app_dir)
             end
         end
 
+        -- Определение стека сканером (общие адаптеры языков) только если манифест не помог
         if lang == "custom" then
             local ok_scan, scanner = pcall(require, "languages.scanner")
             if ok_scan and scanner and scanner.scan_project then
@@ -353,119 +292,59 @@ local function get_project_description(pdir)
     return "(нет описания)"
 end
 
-local function get_modules_dir()
-    local cfg = (ctx.config_dir and ctx.config_dir()) or (HOME .. "/.config/grime")
-    return cfg .. "/modules"
-end
-
 local function collect_modules(filter)
-    local mod_dir = get_modules_dir()
-    if not ctx.exists(mod_dir) then return {} end
-    local ok, items = pcall(fs.list, mod_dir)
-    if not ok or type(items) ~= "table" then return {} end
-
     local list = {}
-    for _, item in ipairs(items) do
-        local name = item:match("^([%w_%-]+)%.lua$")
-        if name then
-            local mod_path = mod_dir .. "/" .. item
-            local desc = get_module_description(mod_path)
-            if not filter or name:lower():find(filter, 1, true) or desc:lower():find(filter, 1, true) then
-                table.insert(list, {
-                    name = name,
-                    desc = desc,
-                    path = mod_path,
-                })
-            end
+    for _, meta in ipairs((grime.modules and grime.modules.list()) or {}) do
+        local desc = get_module_description(meta.name)
+        if not filter or meta.name:lower():find(filter, 1, true) or desc:lower():find(filter, 1, true) then
+            table.insert(list, {
+                name = meta.name,
+                desc = desc,
+                path = meta.path,
+            })
         end
     end
     table.sort(list, function(a, b) return a.name < b.name end)
     return list
 end
 
+--- Приложения: перечисление делегировано app.collect_apps (единый источник правды), здесь только фильтр и описание
 local function collect_apps(filter)
-    local apps_root = utils.get_apps_root(ctx)
+    local apps_root = utils.get_named_path("apps", HOME .. "/.config/grime/apps", ctx)
     if not ctx.exists(apps_root) then return {} end
-    local ok, items = pcall(fs.list, apps_root)
-    if not ok or type(items) ~= "table" then return {} end
+    local ok_app, app_mod = pcall(require, "app")
+    if not ok_app or type(app_mod) ~= "table" or type(app_mod.collect_apps) ~= "function" then return {} end
 
     local list = {}
-    for _, item in ipairs(items) do
-        local app_dir = apps_root .. "/" .. item
-        if not item:match("^%.") and ctx.is_dir(app_dir) then
-            local lang, desc = get_app_info(app_dir)
-            if not filter or item:lower():find(filter, 1, true) or lang:lower():find(filter, 1, true) or desc:lower():find(filter, 1, true) then
-                table.insert(list, {
-                    name = item,
-                    lang = lang,
-                    desc = desc,
-                    path = app_dir,
-                })
-            end
+    for _, a in ipairs(app_mod.collect_apps(apps_root)) do
+        local lang, desc = get_app_info(a.path)
+        if not filter or a.name:lower():find(filter, 1, true) or lang:lower():find(filter, 1, true) or desc:lower():find(filter, 1, true) then
+            table.insert(list, { name = a.name, lang = lang, desc = desc, path = a.path })
         end
     end
-    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    table.sort(list, function(x, y) return x.name:lower() < y.name:lower() end)
     return list
 end
 
+--- Проекты пользователя: сбор делегирован модулю project (единый источник правды)
 local function collect_projects(filter)
-    local projects_root = (ctx.paths and ctx.paths.projects)
-        or (ctx.get_path and ctx.get_path("projects"))
-        or (ctx.projects_root and ctx.projects_root())
-    if not projects_root or projects_root == "" then
-        projects_root = HOME .. "/Projects"
+    local ok, project = pcall(require, "project")
+    if not ok or type(project) ~= "table" or type(project.collect_projects) ~= "function" then
+        error("модуль project не экспортирует collect_projects: обновите modules/project.lua", 0)
     end
-    projects_root = ctx.normalize_path(projects_root)
-    if not ctx.exists(projects_root) then return {} end
-
-    local ok, items = pcall(fs.list, projects_root)
-    if not ok or type(items) ~= "table" then return {} end
-
-    local lang_buckets = { cpp = true, ["C++"] = true, rust = true, python = true, java = true, lua = true, bash = true, fish = true }
     local list = {}
-
-    for _, item in ipairs(items) do
-        if not item:match("^%.") then
-            local full = projects_root .. "/" .. item
-            if ctx.is_dir(full) then
-                if lang_buckets[item] then
-                    local ok_sub, subs = pcall(fs.list, full)
-                    if ok_sub and type(subs) == "table" then
-                        for _, sub in ipairs(subs) do
-                            local pdir = full .. "/" .. sub
-                            if not sub:match("^%.") and ctx.is_dir(pdir) then
-                                local norm_lang = (item == "C++") and "cpp" or item
-                                local desc = get_project_description(pdir)
-                                if not filter
-                                    or sub:lower():find(filter, 1, true)
-                                    or norm_lang:lower():find(filter, 1, true)
-                                    or desc:lower():find(filter, 1, true)
-                                then
-                                    table.insert(list, {
-                                        name = sub,
-                                        lang = norm_lang,
-                                        desc = desc,
-                                        path = pdir,
-                                    })
-                                end
-                            end
-                        end
-                    end
-                else
-                    local desc = get_project_description(full)
-                    if not filter
-                        or item:lower():find(filter, 1, true)
-                        or desc:lower():find(filter, 1, true)
-                    then
-                        table.insert(list, {
-                            name = item,
-                            lang = "mixed",
-                            desc = desc,
-                            path = full,
-                        })
-                    end
-                end
-            end
+    for _, p in ipairs(project.collect_projects({}) or {}) do
+        local desc = p.description
+        if type(desc) ~= "string" or desc == "" then
+            desc = get_project_description(p.path)
+        end
+        local lang = p.lang or "mixed"
+        if not filter
+            or p.name:lower():find(filter, 1, true)
+            or lang:lower():find(filter, 1, true)
+            or desc:lower():find(filter, 1, true)
+        then
+            table.insert(list, { name = p.name, lang = lang, desc = desc, path = p.path })
         end
     end
     table.sort(list, function(a, b)
@@ -475,7 +354,7 @@ local function collect_projects(filter)
     return list
 end
 
-function main()
+local function main()
     local args = ctx.args or {}
     local section = "all"
     local filter = nil
@@ -560,7 +439,6 @@ end
 
 return {
     main = main,
-    description = description,
     get_module_description = get_module_description,
     get_app_info = get_app_info,
     get_project_description = get_project_description,

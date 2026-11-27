@@ -29,6 +29,59 @@ function BaseAgent.new(spec)
     return self
 end
 
+--- Проверка наличия точного значения в списке аргументов
+function BaseAgent.has_arg(list, target)
+    if type(list) ~= "table" then return false end
+    for _, v in ipairs(list) do
+        if v == target then
+            return true
+        end
+    end
+    return false
+end
+
+--- Общий helper: добавляет `flag value` для каждого уникального непустого значения списка
+--- (используется для --read у aider и --add-dir у claude)
+function BaseAgent.append_repeated(cmd, flag, values)
+    if type(values) ~= "table" then return end
+    local seen = {}
+    for _, v in ipairs(values) do
+        if type(v) == "string" and v ~= "" and not seen[v] then
+            seen[v] = true
+            table.insert(cmd, flag)
+            table.insert(cmd, v)
+        end
+    end
+end
+
+--- Общий helper: добавляет уникальные непустые строки позиционными аргументами (файлы для редактирования)
+function BaseAgent.append_positional(cmd, values)
+    if type(values) ~= "table" then return end
+    local seen = {}
+    for _, v in ipairs(values) do
+        if type(v) == "string" and v ~= "" and not seen[v] then
+            seen[v] = true
+            table.insert(cmd, v)
+        end
+    end
+end
+
+--- Общий helper: добавляет `--model <m>`, если модель задана и не переопределена в passthrough
+function BaseAgent.append_model(cmd, model, extra)
+    if type(model) == "string" and model ~= "" and not BaseAgent.has_arg(extra, "--model") then
+        table.insert(cmd, "--model")
+        table.insert(cmd, model)
+    end
+end
+
+--- Общий helper: дописывает passthrough-аргументы в конец команды
+function BaseAgent.append_passthrough(cmd, extra)
+    if type(extra) ~= "table" then return end
+    for _, a in ipairs(extra) do
+        table.insert(cmd, a)
+    end
+end
+
 --- Разрешение пути/имени бинарника агента из конфигурации (по умолчанию self.default_bin)
 function BaseAgent:resolve_binary(ctx)
     local c = ctx or (grime and grime.ctx)

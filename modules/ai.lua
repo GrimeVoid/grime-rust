@@ -1,6 +1,6 @@
--- Summary: Универсальный ИИ-оркестратор агентов (Claude Code, Aider)
--- Description: Универсальный ИИ-оркестратор агентов (Claude Code, Aider)
-description = "Универсальный ИИ-оркестратор агентов (Claude Code, Aider)"
+--@grime description: Универсальный ИИ-оркестратор агентов (Claude Code, Aider)
+--@grime requires: module:project, module:git
+
 
 local ctx = grime.ctx
 local utils = require("languages.utils")
@@ -53,7 +53,7 @@ local GRIME_MODULE_STANDARD = [[
      (Модуль `languages/argparse.lua` упразднён и перенесён в нативное ядро).
    - Общие утилиты, цвета, проверка бинарников и путей:
      `local utils = require("languages.utils")`
-     Переиспользуй: `utils.ANSI`, `utils.utf8_len`, `utils.pad_utf8`, `utils.has_binary(bin, ctx)`, `utils.shell_escape(s)`, `utils.normalize_path(p, cwd, ctx)`, `utils.classify_paths(cmd, args, cwd, ctx)`, `utils.get_apps_root(ctx)`, `utils.get_projects_root(ctx)`, `utils.generate_flake_nix(...)`, `utils.generate_app_manifest(...)`.
+     Переиспользуй: `utils.ANSI`, `utils.utf8_len`, `utils.pad_utf8`, `utils.has_binary(bin, ctx)`, `utils.shell_escape(s)`, `utils.normalize_path(p, cwd, ctx)`, `utils.classify_paths(cmd, args, cwd, ctx)`, `utils.get_apps_root(ctx)`, `utils.get_projects_root(ctx)`, `utils.generate_flake_nix(...)`, `utils.write_flake(dir, name, native, libs, opts)`, `utils.ensure_shebang(path, lang, ctx)`.
    - Для языковых адаптеров (`modules/languages/<lang>.lua`):
      Наследуйся от `local BaseAdapter = require("languages.base")` через `setmetatable(BaseAdapter.new({...}), LangAdapter)`.
    - Для адаптеров ИИ-агентов (`modules/agents/<agent>.lua`):
@@ -78,16 +78,14 @@ local GRIME_MODULE_STANDARD = [[
 3. СТРУКТУРА ФАЙЛА МОДУЛЯ:
    - Первые строки файла:
      ```lua
-     -- Summary: Краткое описание модуля
-     -- Description: Полное описание модуля
-     description = "Краткое описание модуля"
+     --@grime description: Краткое описание модуля
+     --@grime alias: короткое_имя   (необязательно)
      ```
    - Все флаги, действия и подкоманды в модуле и в `print_help()` строго обязаны начинаться со знака минус (`-` или `--`), например `-list`, `--list`, `-path`, `--path`, `-p`, `-help`, `--help`, `-h`. Любые токены без минуса трактуются исключительно как позиционные аргументы.
    - В конце файла обязательно возвращать таблицу:
      ```lua
      return {
          main = main,
-         description = description,
      }
      ```
 ]]
@@ -105,14 +103,8 @@ local function resolve_grime_bin()
     if env_bin and env_bin ~= "" then
         return env_bin
     end
-    local home = os.getenv("HOME") or ""
-    if home ~= "" then
-        local local_bin = home .. "/.local/bin/grime"
-        if ctx.exists(local_bin) then
-            return local_bin
-        end
-    end
-    return "grime"
+    -- Самозапуск в том же окружении: путь текущего бинаря ядра
+    return utils.self_exe()
 end
 
 --- Приведение строки к нижнему регистру с поддержкой UTF-8 кириллицы (А-Я, Ё) и ASCII (A-Z)
@@ -346,14 +338,22 @@ local function heuristic_stack_from_prompt(user_prompt)
         if low:find(kw, 1, true) then return "lua" end
     end
 
-    local cpp_keywords = { "opengl", "vulkan", "raylib", "sdl", "шейдер", "shader", "3d", "рендер", "render", "движок", "игр", "game", "физик", "симуляц" }
+    -- Короткие ASCII-ключи ищем только как отдельные слова, чтобы не срабатывать на подстроки ("3d" и т.п.)
+    local cpp_keywords = { "opengl", "vulkan", "raylib", "шейдер", "shader", "рендер", "render", "движок", "игр", "game", "физик", "симуляц" }
     for _, kw in ipairs(cpp_keywords) do
         if low:find(kw, 1, true) then return "cpp" end
     end
+    for _, kw in ipairs({ "sdl", "sdl2", "3d" }) do
+        if has_word_token(low, kw) then return "cpp" end
+    end
 
-    local java_keywords = { "банк", "бухгалтер", "склад", "инвентар", "магазин", "заказ", "платеж", "предприят", "enterprise", "crm", "erp", "реестр", "библиотек" }
+    -- "библиотек" (обычное слово) исключено: не является признаком Java; crm/erp — только отдельные слова
+    local java_keywords = { "банк", "бухгалтер", "склад", "инвентар", "магазин", "заказ", "платеж", "предприят", "enterprise", "реестр" }
     for _, kw in ipairs(java_keywords) do
         if low:find(kw, 1, true) then return "java" end
+    end
+    for _, kw in ipairs({ "crm", "erp" }) do
+        if has_word_token(low, kw) then return "java" end
     end
 
     local rust_keywords = { "демон", "daemon", "сокет", "socket", "прокси", "proxy", "шифрован", "крипто", "crypto", "бенчмарк", "benchmark", "монитор систем", "сниффер", "многопоточ" }
@@ -389,7 +389,7 @@ local function heuristic_nix_packages(user_prompt, lang)
             add_pkg("cmake")
         end
     end
-    if low:find("sdl2", 1, true) or low:find("sdl", 1, true) then
+    if has_word_token(low, "sdl2") or has_word_token(low, "sdl") then
         add_pkg("SDL2")
         if target_lang == "cpp" or target_lang == "" then
             add_pkg("pkg-config")
@@ -411,7 +411,7 @@ local function heuristic_nix_packages(user_prompt, lang)
             add_pkg("pkg-config")
         end
     end
-    if low:find("openssl", 1, true) or low:find("ssl", 1, true) or low:find("tls", 1, true) or low:find("крипто", 1, true) then
+    if low:find("openssl", 1, true) or has_word_token(low, "ssl") or has_word_token(low, "tls") or low:find("крипто", 1, true) then
         add_pkg("openssl")
         if target_lang == "cpp" or target_lang == "rust" or target_lang == "" then
             add_pkg("pkg-config")
@@ -419,7 +419,7 @@ local function heuristic_nix_packages(user_prompt, lang)
     end
 
     -- 3. TUI и терминальные интерфейсы
-    if low:find("ncurses", 1, true) or low:find("curses", 1, true) or low:find("tui", 1, true) then
+    if low:find("ncurses", 1, true) or low:find("curses", 1, true) or has_word_token(low, "tui") then
         add_pkg("ncurses")
         if target_lang == "cpp" or target_lang == "" then
             add_pkg("pkg-config")
@@ -439,7 +439,7 @@ local function heuristic_nix_packages(user_prompt, lang)
         if low:find("boost", 1, true) then
             add_pkg("boost")
         end
-        if low:find("fmt", 1, true) then
+        if has_word_token(low, "fmt") then
             add_pkg("fmt")
         end
         if low:find("spdlog", 1, true) then
@@ -462,7 +462,7 @@ local function heuristic_nix_packages(user_prompt, lang)
         if low:find("flask", 1, true) then
             add_pkg("python3Packages.flask")
         end
-        if low:find("rich", 1, true) then
+        if has_word_token(low, "rich") then
             add_pkg("python3Packages.rich")
         end
         if low:find("pytest", 1, true) or low:find("тест", 1, true) then
@@ -471,7 +471,7 @@ local function heuristic_nix_packages(user_prompt, lang)
         if low:find("numpy", 1, true) then
             add_pkg("python3Packages.numpy")
         end
-        if low:find("pillow", 1, true) or low:find("pil", 1, true) then
+        if low:find("pillow", 1, true) or has_word_token(low, "pil") then
             add_pkg("python3Packages.pillow")
         end
         if low:find("pygame", 1, true) then
@@ -635,7 +635,7 @@ local function plan_app_stack(user_prompt, preferred_lang, app_name, preferred_a
     -- Предметная эвристика как надежная база для пакетов
     local heur_pkgs = heuristic_nix_packages(user_prompt or "", target_lang or "python")
 
-    -- Запрос к ИИ-Архитектору через адаптер (в изолированной директории /tmp)
+    -- Запрос к ИИ-Архитектору через адаптер (в приватном временном каталоге)
     local agent = agents.resolve(preferred_agent, ctx)
     if agent and agent:is_available(ctx) and user_prompt and user_prompt ~= "" then
         local lang_instruction = explicit
@@ -675,7 +675,29 @@ SUMMARY: <краткое описание архитектурного реше�
         local cmd = agent:build_architect_cmd({ prompt = architect_prompt }, ctx)
         if cmd and #cmd > 0 then
             ctx.log(string.format("%s-Архитектор проектирует стек технологий и Nix-зависимости...", agent.name))
-            local cres = ctx.capture(cmd, "/tmp")
+            -- Aider оставляет в cwd служебные .aider.*: запускаем в приватном временном каталоге и удаляем его
+            local arch_dir, arch_owned = "", false
+            if grime.ephemeral and grime.ephemeral.dir then
+                local ok_d, d = pcall(grime.ephemeral.dir, "grime-arch")
+                if ok_d and d then arch_dir, arch_owned = d, true end
+            else
+                local mk = ctx.capture({ "mktemp", "-d", "-t", "grime-arch.XXXXXXXX" })
+                arch_dir = (mk.code == 0 and mk.stdout and mk.stdout:match("^%s*(.-)%s*$")) or ""
+                arch_owned = arch_dir ~= ""
+            end
+            if arch_dir == "" then
+                arch_dir = "/tmp"
+                ctx.warn("Не удалось создать временный каталог архитектора, используется /tmp")
+            end
+            local cap_ok, cres = pcall(ctx.capture, cmd, arch_dir)
+            -- Каталог эфемерный (ядро удалит в конце конвейера), но служебные файлы агента чистим сразу
+            if arch_owned then
+                pcall(ctx.delete, arch_dir, true)
+            end
+            if not cap_ok then
+                ctx.warn("Ошибка запуска архитектора: " .. tostring(cres))
+                cres = nil
+            end
             if cres and cres.code == 0 and cres.stdout and cres.stdout ~= "" then
                 local cleaned_out = agent:clean_output(cres.stdout, cres.stderr)
                 local raw_for_parse = (cleaned_out and cleaned_out ~= "") and cleaned_out or cres.stdout
@@ -744,19 +766,6 @@ local function get_terminal_dump()
             val = res
         end
     end
-    if val == nil then
-        local dir = (ctx.config_dir and ctx.config_dir()) or ((os.getenv("HOME") or "") .. "/.config/grime")
-        local sfile = dir .. "/state.json"
-        if ctx.exists(sfile) then
-            local content = grime.fs.read(sfile)
-            if content and #content > 0 then
-                local ok, data = pcall(grime.json.decode, content)
-                if ok and type(data) == "table" and data["daemon.terminal_dump"] ~= nil then
-                    val = data["daemon.terminal_dump"]
-                end
-            end
-        end
-    end
     if type(val) == "string" and (val:sub(1, 1) == "{" or val:sub(1, 1) == "[") then
         local ok, parsed = pcall(grime.json.decode, val)
         if ok and type(parsed) == "table" then
@@ -804,19 +813,6 @@ local function format_terminal_context(term_data)
     return table.concat(parts, "\n")
 end
 
---- Проверка, является ли директория частью Git-репозитория
-local function is_git_repo(dir)
-    if not dir or dir == "" then return false end
-    if ctx.exists(dir .. "/.git") then
-        return true
-    end
-    local res = ctx.capture({ "git", "-C", dir, "rev-parse", "--is-inside-work-tree" })
-    if res.code == 0 and res.stdout and res.stdout:match("true") then
-        return true
-    end
-    return false
-end
-
 --- Разрешение пути или проекта по имени
 local function resolve_dir_or_project(arg)
     if not arg or arg == "" or arg:match("^%-") then
@@ -833,59 +829,20 @@ local function resolve_dir_or_project(arg)
         return norm_arg
     end
 
-    -- 2. Проверяем в projects_root
-    local projects_root = utils.get_projects_root(ctx)
-    if projects_root and ctx.exists(projects_root) then
-        for _, lang in ipairs({ "cpp", "python", "rust", "java", "lua", "C++" }) do
-            local cand = projects_root .. "/" .. lang .. "/" .. arg
-            if ctx.is_dir(cand) then
-                return cand
-            end
-        end
-        local direct = projects_root .. "/" .. arg
-        if ctx.is_dir(direct) then
-            return direct
-        end
-    end
-
-    -- 3. Проверяем в apps_root
+    -- 2. Проекты (по языковым каталогам projects_root) и приложения (apps_root) — общий поиск модуля project
     local apps_root = utils.get_apps_root(ctx)
-    if apps_root and ctx.exists(apps_root) then
-        local app_cand = apps_root .. "/" .. arg
-        if ctx.is_dir(app_cand) then
-            return app_cand
-        end
+    local extra = (apps_root and apps_root ~= "") and { apps_root } or nil
+    local path = require("project").find_project(arg, { exact = true, extra_roots = extra })
+    if path then
+        return path
     end
 
     return nil
 end
 
---- Определение основного файла исходного кода по языку
+--- Определение основного файла исходного кода по языку (общая логика в utils)
 local function get_entry_file_for_lang(lang, app_dir)
-    local map = {
-        python = "main.py",
-        java   = "src/Main.java",
-        rust   = "src/main.rs",
-        lua    = "main.lua",
-        bash   = "main.sh",
-        fish   = "main.fish",
-        cpp    = "src/main.cpp",
-    }
-    local cand = map[(lang or "python"):lower()] or "main.py"
-    if app_dir and ctx.exists(app_dir .. "/" .. cand) then
-        return cand
-    end
-    local fallbacks = {
-        "main.py", "main.lua", "main.sh", "main.fish",
-        "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp",
-        "src/main.sh", "src/main.fish", "main.rs", "main.cpp", "Main.java",
-    }
-    for _, f in ipairs(fallbacks) do
-        if app_dir and ctx.exists(app_dir .. "/" .. f) then
-            return f
-        end
-    end
-    return cand
+    return utils.entry_file_for_lang(lang, app_dir)
 end
 
 --- Формирование блока требований для промпта ИИ-агента с учетом режима (Zero-Manifest или legacy app.lua)
@@ -986,9 +943,7 @@ local function run_dev(app_dir, prompt, app_name, lang, stack_plan, preferred_ag
             if ctx.exists(app_dir .. "/" .. entry_file) then table.insert(to_add, entry_file) end
             if ctx.exists(app_dir .. "/app.lua") then table.insert(to_add, "app.lua") end
             if #to_add > 0 then
-                local gcmd = { "git", "add", "-N" }
-                for _, f in ipairs(to_add) do table.insert(gcmd, f) end
-                ctx.capture(gcmd, app_dir)
+                require("git").add(app_dir, to_add, { intent = true })
             end
         end)
 
@@ -1003,8 +958,8 @@ end
 
 --- Получение корня каталога приложений
 local function get_apps_root()
-    local root = utils.get_apps_root(ctx)
-    if not ctx.exists(root) then
+    local root = utils.get_named_path("apps", (os.getenv("HOME") or "") .. "/.config/grime/apps", ctx)
+    if root ~= "" and not ctx.exists(root) then
         ctx.mkdir_p(root)
     end
     return root
@@ -1013,7 +968,7 @@ end
 local SCRIPT_SCAFFOLD_PROFILES = {
     python = {
         filename = "main.py",
-        shebang = "#!/usr/bin/env python3",
+        shebang = utils.SHEBANGS.python,
         comment = "#",
         body = [[def main():
     print("Hello from Python app!")
@@ -1025,7 +980,7 @@ if __name__ == "__main__":
     },
     lua = {
         filename = "main.lua",
-        shebang = "#!/usr/bin/env luajit",
+        shebang = utils.SHEBANGS.lua,
         comment = "--",
         body = [[local function main()
     print("Hello from LuaJIT app!")
@@ -1036,7 +991,7 @@ main()
     },
     bash = {
         filename = "main.sh",
-        shebang = "#!/usr/bin/env bash",
+        shebang = utils.SHEBANGS.bash,
         comment = "#",
         body = [[set -euo pipefail
 
@@ -1049,7 +1004,7 @@ main "$@"
     },
     fish = {
         filename = "main.fish",
-        shebang = "#!/usr/bin/env fish",
+        shebang = utils.SHEBANGS.fish,
         comment = "#",
         body = [[function main
     echo "Hello from Fish app!"
@@ -1143,42 +1098,85 @@ int main() {
         for _, p in ipairs(spec_deps) do
             table.insert(all_pkgs, p)
         end
-        local native_pkgs, lib_pkgs = utils.split_packages(all_pkgs, scanner)
-        local flake_content = utils.generate_flake_nix(app_name, native_pkgs, lib_pkgs)
-        local ff = io.open(flake_path, "w")
-        if ff then
-            ff:write(flake_content)
-            ff:close()
-        end
+        local native, libs = utils.split_packages(all_pkgs, scanner)
+        utils.write_flake(app_dir, app_name, native, libs, { ctx = ctx })
     end
 
-    if not ctx.exists(app_dir .. "/.git") then
-        ctx.capture({ "git", "init" }, app_dir)
-    end
-    ctx.capture({ "git", "add", "-N", "." }, app_dir)
+    -- git init идемпотентен; add -N без файлов индексирует весь каталог
+    local git = require("git")
+    git.init(app_dir)
+    git.add(app_dir, nil, { intent = true })
 end
 
---- Определение путей к каталогам модулей GRIME (репозиторий, конфиг и dotfiles)
+--- Домашний каталог пользователя без хардкода: $HOME, иначе вывод из каталога конфигурации GRIME
+local function home_dir()
+    local h = os.getenv("HOME")
+    if h and h ~= "" then return h end
+    local cfg = ctx.config_dir and ctx.config_dir() or nil
+    local derived = cfg and cfg:match("^(.-)/%.config/grime/?$")
+    if derived and derived ~= "" then return derived end
+    return nil
+end
+
+--- Определение путей к каталогам модулей GRIME (рабочий репозиторий, конфиг и каталог загрузки ядра).
+--- Репозиторий определяется из GRIME_MODULES / ctx.get_path("modules") / расположения самого модуля,
+--- без абсолютных путей конкретного пользователя.
 local function get_grime_modules_dirs()
-    local home = os.getenv("HOME") or "/home/danny"
-    local repo_dir = home .. "/Archive/_Programing_/rust/grime_pj/modules"
+    local home = home_dir() or ""
     local config_dir = ((ctx.config_dir and ctx.config_dir()) or (home .. "/.config/grime")) .. "/modules"
-    local dotfiles_dir = home .. "/dotfiles/grime/modules"
+
+    local repo_dir = nil
+    local candidates = {}
+    local env_mods = os.getenv("GRIME_MODULES")
+    if env_mods and env_mods ~= "" then
+        for part in env_mods:gmatch("[^:]+") do table.insert(candidates, part) end
+    end
+    if ctx.get_path then
+        local p = ctx.get_path("modules")
+        if p and p ~= "" then table.insert(candidates, p) end
+    end
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local self_dir = info and info.source and info.source:match("^@(.+)/[^/]+%.lua$")
+    if self_dir then table.insert(candidates, self_dir) end
+    for _, cand in ipairs(candidates) do
+        local norm = utils.normalize_path(cand)
+        if norm ~= "" and ctx.is_dir(norm) then
+            repo_dir = norm
+            break
+        end
+    end
+    repo_dir = repo_dir or config_dir
+
+    -- Дополнительный корень модулей: каталог, откуда ядро реально загрузило модули (если отличается)
+    local extra_dir = nil
+    if grime and grime.modules and grime.modules.list then
+        local okl, mods = pcall(grime.modules.list)
+        if okl and type(mods) == "table" then
+            for _, m in ipairs(mods) do
+                local d = type(m.path) == "string" and m.path:match("^(.+)/[^/]+%.lua$")
+                if d then
+                    d = utils.normalize_path(d)
+                    if d ~= repo_dir and d ~= config_dir and not d:find("/languages$") and not d:find("/agents$") then
+                        extra_dir = d
+                        break
+                    end
+                end
+            end
+        end
+    end
     local primary = ctx.exists(repo_dir) and repo_dir or config_dir
-    return primary, repo_dir, config_dir, dotfiles_dir
+    return primary, repo_dir, config_dir, extra_dir
 end
 
 --- Автораспознавание запроса на создание/доработку модуля GRIME из текста промпта
 local function detect_module_request(user_prompt, working_dir)
-    local _, repo_mods, config_mods, _ = get_grime_modules_dirs()
+    local _, repo_mods, config_mods, extra_mods = get_grime_modules_dirs()
     if working_dir then
         local norm_wd = utils.normalize_path(working_dir)
-        if norm_wd == repo_mods or norm_wd == config_mods
-            or norm_wd:find("/grime_pj/modules", 1, true)
-            or norm_wd:find("/%.config/grime/modules")
-            or norm_wd:find("/dotfiles/grime/modules", 1, true)
-        then
-            return true, nil
+        for _, root in ipairs({ repo_mods, config_mods, extra_mods }) do
+            if norm_wd == root or norm_wd:sub(1, #root + 1) == (root .. "/") then
+                return true, nil
+            end
         end
     end
 
@@ -1228,10 +1226,12 @@ local function scaffold_grime_module(mod_path, mod_name, prompt)
     if ctx.exists(mod_path) then
         return
     end
-    local clean_desc = (prompt and prompt ~= "") and prompt:gsub("\n", " "):gsub('"', '\\"') or ("Модуль расширения Grime: " .. mod_name)
-    local template = string.format([[-- Summary: %s
--- Description: %s
-description = %q
+    -- Описание попадает в комментарий `--@grime description:`, а не в строковый литерал: кавычки не экранируем
+    local clean_desc = (prompt and prompt ~= "") and (prompt:gsub("[\r\n]+", " ")) or ("Модуль расширения Grime: " .. mod_name)
+    -- Описание внутри генерируемой строки format/[[ ]]: защищаем '%' и закрывающие скобки
+    local help_desc = clean_desc:gsub("%%", "%%%%"):gsub("%]%]", "] ]")
+    clean_desc = clean_desc:gsub("%]%]", "] ]")
+    local template = string.format([[--@grime description: %s
 
 local utils = require("languages.utils")
 
@@ -1270,7 +1270,7 @@ local function print_help()
     ))
 end
 
-function main()
+local function main()
     local raw_args = ctx.args or {}
     for _, a in ipairs(raw_args) do
         if a == "-h" or a == "--help" or a == "-help" or a == "help" then
@@ -1311,9 +1311,8 @@ end
 
 return {
     main = main,
-    description = description,
 }
-]], clean_desc, clean_desc, clean_desc, mod_name, clean_desc, mod_name, mod_name)
+]], clean_desc, mod_name, help_desc, mod_name, mod_name)
 
     local f = io.open(mod_path, "w")
     if f then
@@ -1321,6 +1320,31 @@ return {
         f:close()
         ctx.log(string.format("Создан базовый каркас модуля Grime по стандарту: %s", mod_path))
     end
+end
+
+--- Время модификации файла (секунды Unix) через stat; nil, если файла нет
+local function file_mtime(path)
+    local res = ctx.capture({ "stat", "-c", "%Y", path })
+    if res and res.code == 0 then
+        return tonumber((res.stdout or ""):match("%d+"))
+    end
+    return nil
+end
+
+--- Копирование src -> dst без молчаливой перезаписи более нового целевого файла
+local function safe_sync_copy(src, dst)
+    if ctx.is_file(dst) then
+        local src_t, dst_t = file_mtime(src), file_mtime(dst)
+        if src_t and dst_t and dst_t > src_t then
+            ctx.warn(string.format("Синхронизация пропущена: целевой файл новее исходного (%s)", dst))
+            return false
+        end
+    end
+    local parent_dir = dst:match("^(.+)/[^/]+$")
+    if parent_dir and parent_dir ~= "" then
+        pcall(ctx.mkdir_p, parent_dir)
+    end
+    return pcall(ctx.copy, src, dst)
 end
 
 --- Синхронизация подпапки *.lua файлов (languages/, agents/) между каталогами модулей
@@ -1336,11 +1360,9 @@ local function sync_lua_subdir(subdir, source_root, target_roots)
             if ctx.is_file(src_file) then
                 for _, dst_root in ipairs(target_roots) do
                     if dst_root and ctx.exists(dst_root) then
-                        local dst_sub = utils.normalize_path(dst_root .. "/" .. subdir)
-                        local dst_file = utils.normalize_path(dst_sub .. "/" .. fname)
+                        local dst_file = utils.normalize_path(dst_root .. "/" .. subdir .. "/" .. fname)
                         if src_file ~= dst_file then
-                            pcall(ctx.mkdir_p, dst_sub)
-                            pcall(ctx.copy, src_file, dst_file)
+                            safe_sync_copy(src_file, dst_file)
                         end
                     end
                 end
@@ -1349,20 +1371,31 @@ local function sync_lua_subdir(subdir, source_root, target_roots)
     end
 end
 
---- Валидация байткода модуля через luajit -bl и синхронизация между репозиторием, ~/.config/grime/modules и ~/dotfiles/grime/modules
+--- Проверка синтаксиса Lua-модуля встроенным load() (рантайм GRIME — Lua 5.4), без выполнения кода
+local function check_lua_syntax(path)
+    local src = grime.fs.read(path)
+    if type(src) ~= "string" then
+        return false, "не удалось прочитать файл"
+    end
+    local chunk, err = load(src, "@" .. path)
+    if not chunk then
+        return false, tostring(err)
+    end
+    return true, nil
+end
+
+--- Валидация синтаксиса модуля (load) и синхронизация между репозиторием, ~/.config/grime/modules и dotfiles
 local function validate_and_sync_module(mod_path)
     if not mod_path or not ctx.is_file(mod_path) then return true end
-    if utils.has_binary("luajit", ctx) then
-        local vres = ctx.capture({ "luajit", "-bl", mod_path })
-        if vres.code ~= 0 then
-            ctx.warn(string.format("Предупреждение: ошибка синтаксиса LuaJIT в %s:\n%s", mod_path, vres.stderr or ""))
-            return false
-        end
-        ctx.log(string.format("✓ Синтаксис модуля '%s' успешно проверен (luajit -bl).", mod_path))
+    local syntax_ok, syntax_err = check_lua_syntax(mod_path)
+    if not syntax_ok then
+        ctx.warn(string.format("Предупреждение: ошибка синтаксиса Lua в %s:\n%s", mod_path, syntax_err or ""))
+        return false
     end
+    ctx.log(string.format("✓ Синтаксис модуля '%s' успешно проверен.", mod_path))
 
-    local primary_mods, repo_mods, config_mods, dotfiles_mods = get_grime_modules_dirs()
-    local target_roots = { repo_mods, config_mods, dotfiles_mods }
+    local primary_mods, repo_mods, config_mods, extra_mods = get_grime_modules_dirs()
+    local target_roots = { repo_mods, config_mods, extra_mods }
     local norm_src = utils.normalize_path(mod_path)
 
     -- Поддержка относительных путей внутри modules/ (включая agents/*.lua и languages/*.lua)
@@ -1372,11 +1405,7 @@ local function validate_and_sync_module(mod_path)
             if dst_root and ctx.exists(dst_root) then
                 local dst_target = utils.normalize_path(dst_root .. "/" .. rel)
                 if norm_src ~= dst_target then
-                    local parent_dir = dst_target:match("^(.+)/[^/]+$")
-                    if parent_dir and parent_dir ~= "" then
-                        pcall(ctx.mkdir_p, parent_dir)
-                    end
-                    pcall(ctx.copy, norm_src, dst_target)
+                    safe_sync_copy(norm_src, dst_target)
                 end
             end
         end
@@ -1389,84 +1418,332 @@ local function validate_and_sync_module(mod_path)
     return true
 end
 
---- Проверка безопасности команд перед исполнением
-local function validate_command_security(cmd_str, target_dir)
+--- Разбор shell-строки на простые команды и слова с учётом кавычек и экранирования.
+--- Возвращает список { words = {...}, redirs = {...} } либо nil, причина.
+--- Операторы ; | & ( ) и перевод строки разделяют команды; цели перенаправлений > < вынесены в redirs.
+local function shell_split(s)
+    local cmds, words, redirs = {}, {}, {}
+    local buf, in_word, redirect_next = {}, false, false
+
+    local function flush_word()
+        if not in_word then return end
+        local w = table.concat(buf)
+        buf, in_word = {}, false
+        if redirect_next then
+            table.insert(redirs, w)
+            redirect_next = false
+        else
+            table.insert(words, w)
+        end
+    end
+    local function flush_cmd()
+        flush_word()
+        if #words > 0 or #redirs > 0 then
+            table.insert(cmds, { words = words, redirs = redirs })
+        end
+        words, redirs, redirect_next = {}, {}, false
+    end
+
+    local i, n = 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == "'" then
+            local j = s:find("'", i + 1, true)
+            if not j then return nil, "незакрытая одинарная кавычка" end
+            table.insert(buf, s:sub(i + 1, j - 1))
+            in_word = true
+            i = j + 1
+        elseif c == '"' then
+            local j = i + 1
+            in_word = true
+            while true do
+                if j > n then return nil, "незакрытая двойная кавычка" end
+                local d = s:sub(j, j)
+                if d == '"' then break end
+                if d == "\\" and j < n then
+                    local nx = s:sub(j + 1, j + 1)
+                    if nx:find('^[$`"\\\n]') then
+                        if nx ~= "\n" then table.insert(buf, nx) end
+                        j = j + 2
+                    else
+                        table.insert(buf, d)
+                        j = j + 1
+                    end
+                else
+                    table.insert(buf, d)
+                    j = j + 1
+                end
+            end
+            i = j + 1
+        elseif c == "\\" then
+            if i < n then
+                local nx = s:sub(i + 1, i + 1)
+                if nx ~= "\n" then
+                    table.insert(buf, nx)
+                    in_word = true
+                end
+                i = i + 2
+            else
+                i = i + 1
+            end
+        elseif c == "$" and s:sub(i + 1, i + 1) == "'" then
+            return nil, "ANSI-C кавычки $'...' запрещены"
+        elseif c == "\n" or c == ";" or c == "|" or c == "&" or c == "(" or c == ")" then
+            flush_cmd()
+            i = i + 1
+        elseif c:find("^%s") then
+            flush_word()
+            i = i + 1
+        elseif c == "<" or c == ">" then
+            flush_word()
+            while i <= n and s:sub(i, i):find("^[<>]") do i = i + 1 end
+            if s:sub(i, i) == "&" then
+                -- дублирование дескриптора (2>&1, >&2): отдельной цели нет
+                i = i + 1
+                while i <= n and s:sub(i, i):find("^[%d%-]") do i = i + 1 end
+            else
+                redirect_next = true
+            end
+        else
+            table.insert(buf, c)
+            in_word = true
+            i = i + 1
+        end
+    end
+    flush_cmd()
+    return cmds
+end
+
+-- Команды, запрещённые безусловно (сравнивается basename слова в нижнем регистре):
+-- повышение привилегий, управление службами и разметка дисков
+local FORBIDDEN_COMMANDS = {
+    sudo = true, su = true, doas = true, pkexec = true, systemctl = true,
+    fdisk = true, parted = true,
+}
+local SYSTEM_DIRS = { "/etc", "/usr", "/var", "/boot", "/opt", "/root", "/nix", "/sys", "/proc", "/dev", "/bin", "/sbin", "/lib", "/lib64" }
+local SHELL_BINARIES = { sh = true, bash = true, dash = true, zsh = true, fish = true, ksh = true }
+local MAX_SHELL_NESTING = 3
+
+local function is_within(path, root)
+    return path == root or path:sub(1, #root + 1) == (root .. "/")
+end
+
+local function is_system_path(path)
+    for _, sdir in ipairs(SYSTEM_DIRS) do
+        if is_within(path, sdir) then return true end
+    end
+    return false
+end
+
+--- Раскрытие ~ и $HOME / ${HOME} в начале слова
+local function expand_home(w, home)
+    if w == "~" or w == "$HOME" or w == "${HOME}" then return home end
+    if w:sub(1, 2) == "~/" then return home .. w:sub(2) end
+    local rest = w:match("^%$HOME(/.*)$") or w:match("^%${HOME}(/.*)$")
+    if rest then return home .. rest end
+    return w
+end
+
+local function reject(reason)
+    return false, "[Grime Security] Команда отклонена: " .. reason
+end
+
+-- Ядро проверки безопасности (рекурсивно разбирает sh -c / eval до MAX_SHELL_NESTING уровней)
+local function check_command_string(cmd_str, target_dir, home, depth)
     if not cmd_str or cmd_str == "" then
-        return false, "[Grime Security] Команда отклонена: пустая команда."
+        return reject("пустая команда.")
     end
 
     -- Запрет subshell-инъекций $(...) и `...`
     if cmd_str:find("%$%(") or cmd_str:find("`") then
-        return false, "[Grime Security] Команда отклонена: инъекции подоболочек $(...) и `...` запрещены."
+        return reject("инъекции подоболочек $(...) и `...` запрещены.")
     end
 
-    local lower = " " .. cmd_str:lower() .. " "
-    local normalized = lower:gsub("[|&;()<>]", " ")
-
-    -- 1. БЕЗУСЛОВНЫЙ ЗАПРЕТ SUDO / ПОВЫШЕНИЯ ПРИВИЛЕГИЙ
-    if normalized:match("%s+sudo%s+")
-        or normalized:match("%s+su%s+")
-        or normalized:match("%s+doas%s+")
-        or normalized:match("%s+pkexec%s+")
-        or normalized:match("%s+chown%s+.*root")
-        or normalized:match("%s+chmod%s+.*%s+/")
-        or normalized:match("%s+chmod%s+777") then
-        return false, "[Grime Security] Команда отклонена: вызовы с правами суперпользователя (sudo) запрещены."
+    local cmds, split_err = shell_split(cmd_str)
+    if not cmds then
+        return reject("не удалось разобрать команду (" .. tostring(split_err) .. ").")
     end
 
-    -- 2. ЗАПРЕТ ОПАСНЫХ ШАБЛОНОВ
-    if normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+/%s*$")
-        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+/%*")
-        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+~")
-        or normalized:match("rm%s+.*%-[a-z]*r[a-z]*%s+%$home")
-        or normalized:match("%f[%a]mkfs%f[%A]")
-        or normalized:match("%f[%a]fdisk%f[%A]")
-        or normalized:match("%f[%a]parted%f[%A]")
-        or normalized:match("%f[%a]dd%s+.*of=%s*/dev/")
-        or lower:match(">+%s*/dev/[a-z0-9]") then
-        return false, "[Grime Security] Команда отклонена: обнаружен опасный деструктивный шаблон."
-    end
-
-    -- 3. БЕЗУСЛОВНЫЙ ЗАПРЕТ НА ИЗМЕНЕНИЕ СИСТЕМНЫХ ФАЙЛОВ И PATH TRAVERSAL
-    local home = os.getenv("HOME") or "/home/danny"
-    local sys_dirs = { "/etc", "/usr", "/var", "/boot", "/opt", "/root", "/nix", "/sys", "/proc", "/dev", "/bin", "/sbin", "/lib", "/lib64" }
-
+    -- Рабочая директория не должна быть системной
     local eff_cwd = utils.normalize_path(target_dir or (os.getenv("PWD") or home))
-    for _, sdir in ipairs(sys_dirs) do
-        if eff_cwd == "/" or eff_cwd == sdir or eff_cwd:sub(1, #sdir + 1) == (sdir .. "/") then
-            return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
-        end
+    if eff_cwd == "/" or is_system_path(eff_cwd) then
+        return reject("попытка модификации системных файлов за пределами домашней директории.")
     end
 
-    for token in cmd_str:gmatch("[^%s|;&()]+") do
-        local clean = token:gsub("^['\"]+", ""):gsub("['\"]+$", ""):gsub("^>+", "")
-        if clean:sub(1, 2) == "~/" then
-            clean = home .. clean:sub(2)
+    local function check_path(raw)
+        local p = expand_home(raw, home)
+        local resolved
+        local glob_at = p:find("[%*%?%[]")
+        local var_rest = p:match("^%${?[%a_][%w_]*}?(/.*)$")
+        if var_rest then
+            -- неизвестная переменная в начале пути: проверяем только системные каталоги
+            resolved = utils.normalize_path(var_rest)
+            if is_system_path(resolved) then
+                return reject("попытка модификации системных файлов за пределами домашней директории.")
+            end
+            return true
+        elseif p:sub(1, 1) == "/" then
+            if glob_at then
+                -- маска: статический каталог до первого спецсимвола обязан лежать в $HOME или /tmp
+                local dir = p:sub(1, glob_at - 1):match("^(.*)/[^/]*$") or ""
+                resolved = utils.normalize_path(dir == "" and "/" or dir)
+                if not (is_within(resolved, home) or is_within(resolved, "/tmp")) then
+                    return reject("маска пути вне домашней директории.")
+                end
+                return true
+            end
+            resolved = utils.normalize_path(p)
+        elseif p:find("..", 1, true) then
+            resolved = utils.normalize_path(eff_cwd .. "/" .. p)
+        else
+            return true
         end
-        local resolved_path = nil
-        if clean:sub(1, 1) == "/" then
-            resolved_path = utils.normalize_path(clean)
-        elseif clean:find("%.%.") then
-            resolved_path = utils.normalize_path(eff_cwd .. "/" .. clean)
+        if not (is_within(resolved, home) or is_within(resolved, "/tmp")) then
+            if resolved == "/" then
+                return reject("попытка доступа к корневой директории.")
+            end
+            if is_system_path(resolved) then
+                return reject("попытка модификации системных файлов за пределами домашней директории.")
+            end
+        end
+        return true
+    end
+
+    local function check_rm_target(arg)
+        if arg:sub(1, 1) == "~" or arg:find("^%$HOME") or arg:find("^%${HOME}") then
+            return reject("обнаружен опасный деструктивный шаблон (рекурсивное удаление домашнего каталога).")
+        end
+        if arg:find("%$") then
+            return reject("рекурсивное удаление по пути с переменной запрещено.")
+        end
+        local p = arg:sub(1, 1) == "/" and arg or (eff_cwd .. "/" .. arg)
+        -- отбрасываем компонент с маской и всё после него
+        p = p:gsub("/[^/]*[%*%?%[].*$", "")
+        local resolved = utils.normalize_path(p == "" and "/" or p)
+        if resolved == "/" or resolved == home or is_within(home, resolved) then
+            return reject("обнаружен опасный деструктивный шаблон (рекурсивное удаление корня или домашнего каталога).")
+        end
+        return true
+    end
+
+    for _, cmd in ipairs(cmds) do
+        local words = cmd.words
+
+        -- Слово в позиции команды (после присваиваний VAR=val) не должно быть переменной или маской
+        local first = 1
+        while words[first] and words[first]:match("^[%a_][%w_]*=") do first = first + 1 end
+        local head = words[first]
+        if head then
+            if (head:find("%$") and not (head:find("^%$HOME/") or head:find("^%${HOME}/")))
+                or head:find("[%*%?%[]") then
+                return reject("имя команды с переменной или маской запрещено.")
+            end
         end
 
-        if resolved_path then
-            local in_home = (resolved_path == home) or (resolved_path:sub(1, #home + 1) == (home .. "/"))
-            local in_tmp = (resolved_path == "/tmp") or (resolved_path:sub(1, 5) == "/tmp/")
-            if not in_home and not in_tmp then
-                if resolved_path == "/" then
-                    return false, "[Grime Security] Команда отклонена: попытка доступа к корневой директории."
-                end
-                for _, sdir in ipairs(sys_dirs) do
-                    if resolved_path == sdir or resolved_path:sub(1, #sdir + 1) == (sdir .. "/") then
-                        return false, "[Grime Security] Команда отклонена: попытка модификации системных файлов за пределами домашней директории."
+        for j, w in ipairs(words) do
+            local base = (w:match("([^/]+)/*$") or w):lower()
+
+            if FORBIDDEN_COMMANDS[base] then
+                return reject("вызовы с правами суперпользователя (sudo) или управление службами запрещены.")
+            end
+            if base:find("^mkfs") then
+                return reject("обнаружен опасный деструктивный шаблон.")
+            end
+
+            if base == "rm" then
+                local recursive = false
+                local targets = {}
+                for k = j + 1, #words do
+                    local a = words[k]
+                    if a == "--recursive" or a:find("^%-[^%-]*[rR]") then
+                        recursive = true
+                    elseif a:sub(1, 1) ~= "-" then
+                        table.insert(targets, a)
                     end
                 end
+                if recursive then
+                    for _, t in ipairs(targets) do
+                        local ok, err = check_rm_target(t)
+                        if not ok then return false, err end
+                    end
+                end
+            elseif base == "chown" then
+                for k = j + 1, #words do
+                    if words[k]:lower():find("root", 1, true) then
+                        return reject("смена владельца на root запрещена.")
+                    end
+                end
+            elseif base == "chmod" then
+                for k = j + 1, #words do
+                    local a = words[k]
+                    if a:find("^[0-7]?777$") or a:sub(1, 1) == "/" then
+                        return reject("опасное изменение прав доступа запрещено.")
+                    end
+                end
+            elseif base == "dd" then
+                for k = j + 1, #words do
+                    if words[k]:find("^of=/dev/") then
+                        return reject("обнаружен опасный деструктивный шаблон.")
+                    end
+                end
+            elseif base == "pacman" then
+                for k = j + 1, #words do
+                    if words[k]:find("^%-[%a]*[SRU]") then
+                        return reject("установка и удаление системных пакетов (pacman -S/-R/-U) запрещены.")
+                    end
+                end
+            elseif SHELL_BINARIES[base] or base == "eval" then
+                -- вложенная команда (sh -c "...", eval ...) проверяется теми же правилами
+                local nested
+                if base == "eval" then
+                    nested = table.concat(words, " ", j + 1)
+                else
+                    for k = j + 1, #words do
+                        if words[k]:find("^%-[%a]*c[%a]*$") and words[k + 1] then
+                            nested = words[k + 1]
+                            break
+                        end
+                    end
+                end
+                if nested and nested ~= "" then
+                    if depth >= MAX_SHELL_NESTING then
+                        return reject("слишком глубокая вложенность sh -c / eval.")
+                    end
+                    local ok, err = check_command_string(nested, target_dir, home, depth + 1)
+                    if not ok then return false, err end
+                end
             end
+
+            -- Проверка путей: само слово и значение после '=' (--out=/etc/x, of=/etc/x)
+            local ok, err = check_path(w)
+            if not ok then return false, err end
+            local val = w:match("^[^=]*=(.+)$")
+            if val then
+                ok, err = check_path(val)
+                if not ok then return false, err end
+            end
+        end
+
+        for _, target in ipairs(cmd.redirs) do
+            local expanded = expand_home(target, home)
+            if expanded:find("^/dev/[%w]") then
+                return reject("обнаружен опасный деструктивный шаблон.")
+            end
+            local ok, err = check_path(target)
+            if not ok then return false, err end
         end
     end
 
     return true, nil
+end
+
+--- Проверка безопасности команд перед исполнением (разбор по токенам с учётом shell-кавычек)
+local function validate_command_security(cmd_str, target_dir)
+    local home = home_dir()
+    if not home then
+        return reject("не удалось определить домашний каталог пользователя.")
+    end
+    return check_command_string(cmd_str, target_dir, home, 0)
 end
 
 --- Выполнение системного действия с информированием и валидацией безопасности
@@ -1510,16 +1787,16 @@ local function execute_ai_action(cmd_str, target_dir, _source_tag)
     io.stdout:write(string.format("\27[1;32m[Grime AI Execution] Выполняю действие: %s\27[0m\n", cmd_str))
     ctx.log(string.format("[Grime AI Execution] Выполняю действие: %s (cwd=%s)", cmd_str, target_dir or "."))
 
-    local home = os.getenv("HOME") or "/home/danny"
+    local home = home_dir() or ""
     local shell_cmd = cmd_str:gsub("~/", home .. "/")
 
+    -- ИИ часто пишет путь с именем текущей папки (app/main.py) при cwd=.../app: срезаем только
+    -- такой префикс в начале слова (не ../app/x и не ./app/x) и только если вложенной папки нет
     if target_dir then
-        local folder_name = target_dir:match("([^/]+)$")
-        if folder_name and folder_name ~= "" then
-            local prefix_pattern = "%f[%w]" .. folder_name .. "/"
-            if shell_cmd:find(prefix_pattern) then
-                shell_cmd = shell_cmd:gsub(prefix_pattern, "")
-            end
+        local folder_name = target_dir:match("([^/]+)/*$")
+        if folder_name and folder_name ~= "" and not ctx.is_dir(target_dir .. "/" .. folder_name) then
+            local prefix_pattern = "([%s'\"])" .. utils.escape_pattern(folder_name) .. "/"
+            shell_cmd = (" " .. shell_cmd):gsub(prefix_pattern, "%1"):sub(2)
         end
     end
 
@@ -1547,9 +1824,30 @@ local function execute_ai_action(cmd_str, target_dir, _source_tag)
     end
 end
 
+-- Модули, которые ИИ может порождать через <grime_spawn> (ai и cmd обрабатываются отдельно).
+-- Исключены pkg, box, host, daemon, bus и т.п.: они ставят пакеты, исполняют код в контейнерах
+-- или меняют состояние ядра; такие действия ИИ обязан запрашивать через <grime_exec> с проверкой.
+local SPAWN_ALLOWED_MODULES = {
+    ai = true, cmd = true, app = true, project = true, nix = true,
+    git = true, doctor = true, list = true, log = true,
+}
+-- Флаги разрушительных операций (без ведущих дефисов): для порождённых модулей запрещены
+local SPAWN_DENIED_FLAGS = {
+    rm = true, clear = true, rollback = true, gc = true, optimise = true, optimize = true,
+    force = true, f = true, reset = true, clean = true, delete = true, purge = true,
+    uninstall = true, remove = true, prune = true,
+}
+-- Максимальная глубина вложенности обработки тегов (субагент -> субагент -> ...)
+local MAX_TAG_DEPTH = 3
+
 --- Парсинг вывода ИИ-агента с поддержкой тегов <grime_bus>, <grime_spawn>, <grime_exec>/<grime_action> и <next_agent_prompt>
-local function parse_ai_tags(output, working_dir, _user_prompt)
+local function parse_ai_tags(output, working_dir, _user_prompt, depth)
+    depth = depth or 0
     if not output or output == "" then
+        return nil
+    end
+    if depth > MAX_TAG_DEPTH then
+        ctx.warn(string.format("Превышена максимальная глубина обработки тегов ИИ (%d), теги проигнорированы.", MAX_TAG_DEPTH))
         return nil
     end
 
@@ -1564,9 +1862,11 @@ local function parse_ai_tags(output, working_dir, _user_prompt)
             local raw_val = content:match("^%s*(.-)%s*$")
             local val = raw_val
             if b_type == "json" or raw_val:match("^[%[{]") then
-                local decoded = grime.json.decode(raw_val)
-                if decoded ~= nil then
+                local dok, decoded = pcall(grime.json.decode, raw_val)
+                if dok and decoded ~= nil then
                     val = decoded
+                elseif not dok then
+                    ctx.warn(string.format("Некорректный JSON в теге <grime_bus> по ключу '%s': значение сохранено как строка.", key))
                 end
             end
             if grime and grime.bus and grime.bus.set then
@@ -1605,31 +1905,63 @@ local function parse_ai_tags(output, working_dir, _user_prompt)
         if target_mod and target_mod ~= "" then
             target_cwd = ctx.normalize_path(target_cwd)
 
-            if target_mod == "cmd" then
+            -- Проверка имени модуля по белому списку и рабочей директории общими правилами безопасности
+            local spawn_ok, spawn_err
+            if not target_mod:match("^[%a][%w_%-]*$") or not SPAWN_ALLOWED_MODULES[target_mod] then
+                spawn_ok = false
+                spawn_err = string.format("[Grime Security] Порождение модуля '%s' отклонено: модуль не входит в белый список.", target_mod)
+            else
+                spawn_ok, spawn_err = validate_command_security("true", target_cwd)
+            end
+
+            if not spawn_ok then
+                ctx.warn(spawn_err)
+            elseif target_mod == "cmd" then
                 execute_ai_action(prompt, target_cwd, "grime_spawn")
             else
-                ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
-
                 local spawn_cmd = { grime_bin, target_mod }
                 if prompt ~= "" then
                     if target_mod == "ai" then
+                        -- промпт передаётся одним аргументом -m, shell не участвует
                         table.insert(spawn_cmd, "-m")
                         table.insert(spawn_cmd, prompt)
                     else
-                        for tok in prompt:gmatch("%S+") do
-                            table.insert(spawn_cmd, tok)
+                        -- аргументы разбираются как shell-слова; операторы и опасные флаги запрещены
+                        local sec_ok, sec_err = validate_command_security(target_mod .. " " .. prompt, target_cwd)
+                        local cmds = sec_ok and shell_split(prompt) or nil
+                        if sec_ok and (not cmds or #cmds > 1 or (cmds[1] and #cmds[1].redirs > 0)) then
+                            sec_ok = false
+                            sec_err = "[Grime Security] Порождение отклонено: операторы и перенаправления в аргументах запрещены."
+                        end
+                        if sec_ok and cmds and cmds[1] then
+                            for _, tok in ipairs(cmds[1].words) do
+                                local flag = tok:match("^%-%-?([^=]+)")
+                                if flag and SPAWN_DENIED_FLAGS[flag:lower()] then
+                                    sec_ok = false
+                                    sec_err = string.format("[Grime Security] Порождение отклонено: разрушительный флаг '%s' запрещён.", tok)
+                                    break
+                                end
+                                table.insert(spawn_cmd, tok)
+                            end
+                        end
+                        if not sec_ok then
+                            ctx.warn(sec_err)
+                            spawn_cmd = nil
                         end
                     end
                 end
 
-                local sres = ctx.capture(spawn_cmd, target_cwd)
-                if sres.code == 0 then
-                    ctx.log(string.format("✓ Субагент '%s' успешно завершил работу.", target_mod))
-                    if sres.stdout and sres.stdout ~= "" then
-                        parse_ai_tags(sres.stdout, target_cwd, prompt)
+                if spawn_cmd then
+                    ctx.log(string.format("Порождение субагента Grime: модуль '%s', cwd='%s'...", target_mod, target_cwd))
+                    local sres = ctx.capture(spawn_cmd, target_cwd)
+                    if sres.code == 0 then
+                        ctx.log(string.format("✓ Субагент '%s' успешно завершил работу.", target_mod))
+                        if sres.stdout and sres.stdout ~= "" then
+                            parse_ai_tags(sres.stdout, target_cwd, prompt, depth + 1)
+                        end
+                    else
+                        ctx.warn(string.format("Субагент '%s' завершился с кодом %d: %s", target_mod, sres.code, sres.stderr))
                     end
-                else
-                    ctx.warn(string.format("Субагент '%s' завершился с кодом %d: %s", target_mod, sres.code, sres.stderr))
                 end
             end
         end
@@ -1768,15 +2100,7 @@ local function print_help()
     ))
 end
 
-local LANG_ALIASES = utils.LANG_ALIASES or {
-    cpp = "cpp", ["c++"] = "cpp", cxx = "cpp", c = "cpp",
-    python = "python", py = "python", python3 = "python",
-    rust = "rust", rs = "rust",
-    java = "java", jav = "java",
-    lua = "lua", luajit = "lua",
-    bash = "bash", sh = "bash", shell = "bash",
-    fish = "fish",
-}
+local LANG_ALIASES = utils.LANG_ALIASES
 
 local function append_unique(list, seen, val)
     if type(val) == "string" and val ~= "" and not seen[val] then
@@ -1785,7 +2109,7 @@ local function append_unique(list, seen, val)
     end
 end
 
-function main()
+local function main()
     local raw_cli_args = {}
     for _, a in ipairs(ctx.args or {}) do
         table.insert(raw_cli_args, a)
@@ -1987,6 +2311,12 @@ function main()
             return
         end
 
+        local name_ok, name_err = utils.valid_name(app_name)
+        if not name_ok then
+            ctx.fail(string.format("Недопустимое имя приложения '%s': %s", app_name, name_err or ""))
+            return
+        end
+
         local apps_root = get_apps_root()
         app_dir = apps_root .. "/" .. app_name
         target_dir = app_dir
@@ -2149,16 +2479,9 @@ function main()
         or ctx.is_file(working_dir .. "/main.fish")
     ))) then
         -- Автоподключение файлов проекта/приложения по умолчанию
-        local entry_candidates = {
-            "main.py", "main.lua", "main.sh", "main.fish",
-            "src/main.py", "src/Main.java", "src/main.rs", "src/main.lua", "src/main.cpp",
-            "src/main.sh", "src/main.fish", "main.rs", "main.cpp", "Main.java",
-        }
-        for _, c in ipairs(entry_candidates) do
-            if ctx.exists(working_dir .. "/" .. c) then
-                append_unique(files, files_seen, c)
-                break
-            end
+        local entry_rel = utils.entry_file_for_lang(app_lang, working_dir)
+        if entry_rel and ctx.exists(working_dir .. "/" .. entry_rel) then
+            append_unique(files, files_seen, entry_rel)
         end
         if ctx.is_file(working_dir .. "/app.lua") then
             append_unique(files, files_seen, "app.lua")
@@ -2214,7 +2537,7 @@ function main()
     if explicit_git ~= nil then
         is_git = explicit_git
     else
-        is_git = is_git_repo(working_dir)
+        is_git = utils.is_git_repo(working_dir, ctx)
         if is_git then
             ctx.log("Обнаружен Git-репозиторий в " .. working_dir .. " -> стандартный контроль версий Git")
         else
@@ -2289,7 +2612,7 @@ function main()
         end
 
         if res.ok then
-            local extracted = parse_ai_tags(res.stdout, working_dir, user_message)
+            local extracted = parse_ai_tags(res.stdout, working_dir, user_message, 0)
             if not extracted or extracted == "" then
                 extracted = (disp_out or ""):match("^%s*(.-)%s*$")
             end
@@ -2314,31 +2637,41 @@ function main()
             ctx.fail(string.format("ИИ-агент '%s' завершился с кодом %s", agent.name, tostring(res.code)))
         end
     else
-        local tmp_term_file = nil
-        if terminal_context_block and active_term_dump then
-            tmp_term_file = string.format("/tmp/grime_term_context_%d_%d.md", os.time(), math.random(1000, 9999))
-            local f = io.open(tmp_term_file, "w")
-            if f then
-                f:write(terminal_context_block)
-                f:close()
-                opts.tmp_term_file = tmp_term_file
-                if agent.name == "claude" then
-                    opts.system_prompt = opts.system_prompt .. "\n" .. terminal_context_block
+        -- Для aider нет флага --system-prompt: правила GRIME и контекст терминала передаются
+        -- приватным (0600) временным файлом через --read; claude получает их через --append-system-prompt
+        local tmp_cleanup = nil
+        if terminal_context_block and active_term_dump and agent.name == "claude" then
+            opts.system_prompt = opts.system_prompt .. "\n" .. terminal_context_block
+        end
+        if agent.name == "aider" then
+            local ctx_text = system_prompt
+            if terminal_context_block then
+                ctx_text = ctx_text .. "\n" .. terminal_context_block
+            end
+            local tmp_path, cleanup_or_err = utils.make_tempfile(ctx_text, ctx)
+            if tmp_path then
+                tmp_cleanup = cleanup_or_err
+                opts.tmp_term_file = tmp_path
+                if terminal_context_block and active_term_dump then
+                    grime.ui.info(string.format("Подключен контекст терминала: '%s' (код %s)", active_term_dump.cmd or "", tostring(active_term_dump.status or 0)))
                 end
-                grime.ui.info(string.format("Подключен контекст терминала: '%s' (код %s)", active_term_dump.cmd or "", tostring(active_term_dump.status or 0)))
+            else
+                ctx.warn("Не удалось создать файл контекста для aider: " .. tostring(cleanup_or_err))
             end
+        elseif terminal_context_block and active_term_dump then
+            grime.ui.info(string.format("Подключен контекст терминала: '%s' (код %s)", active_term_dump.cmd or "", tostring(active_term_dump.status or 0)))
         end
 
+        -- cleanup регистрируется ядром (в т.ч. после main) на случай прерывания; удаление идемпотентно
         _G.cleanup = function()
-            if tmp_term_file and ctx.exists(tmp_term_file) then
-                pcall(ctx.delete, tmp_term_file, true)
-            end
+            if tmp_cleanup then pcall(tmp_cleanup) end
         end
 
-        local ret = agent:run_interactive(opts, ctx)
-
-        if tmp_term_file and ctx.exists(tmp_term_file) then
-            pcall(ctx.delete, tmp_term_file, true)
+        local run_ok, ret = pcall(agent.run_interactive, agent, opts, ctx)
+        if tmp_cleanup then pcall(tmp_cleanup) end
+        if not run_ok then
+            ctx.fail(string.format("Ошибка запуска ИИ-агента '%s': %s", agent.name, tostring(ret)))
+            return
         end
 
         if ret == 0 then
@@ -2361,7 +2694,6 @@ function main()
 end
 
 local M = {
-    description = description,
     main = main,
     extract_lang_from_prompt = extract_lang_from_prompt,
     classify_stack = classify_stack,

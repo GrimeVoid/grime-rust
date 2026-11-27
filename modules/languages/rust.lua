@@ -64,13 +64,13 @@ function RustAdapter:create_default_files(root, ctx, description)
     if not ctx.exists(cargo_file) then
         local content = string.format([[# Cargo configuration
 [package]
-name = "%s"
+name = %s
 version = "0.1.0"
 edition = "2021"
-description = %q
+description = %s
 
 [dependencies]
-]], clean_name, desc)
+]], utils.toml_string(clean_name), utils.toml_string(desc))
         local f = io.open(cargo_file, "w")
         if f then
             f:write(content)

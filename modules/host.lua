@@ -1,6 +1,7 @@
--- Summary: Информация о хост-системе и переключение в домашнюю директорию
--- Description: Информация о хост-системе и переключение в домашнюю директорию
-description = "Информация о хост-системе и переключение в домашнюю директорию"
+--@grime description: Информация о хост-системе и переключение в домашнюю директорию
+--@grime alias: exit-env, unhost, host-env
+--@grime boundary: true
+
 
 local ctx = grime.ctx
 
@@ -27,7 +28,7 @@ local function print_help()
     ))
 end
 
-function main()
+local function main()
     for _, a in ipairs(ctx.args or {}) do
         if type(a) == "string" and a:match("^%-") then
             local matched = grime.fuzzy and grime.fuzzy.match_flag(a, { "--help", "-h", "-help" }, 0.75) or a
@@ -79,5 +80,4 @@ end
 
 return {
     main = main,
-    description = description,
 }

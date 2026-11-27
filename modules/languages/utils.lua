@@ -57,46 +57,60 @@ function utils.file_exists(p)
 end
 
 local binary_cache = {}
+local BINARY_CACHE_TTL = 30
 
---- Проверка доступности бинарной утилиты на хосте с кэшированием
-function utils.has_binary(bin, ctx)
-    if not bin or bin == "" then return false end
-    if binary_cache[bin] ~= nil then
-        return binary_cache[bin]
-    end
-    if grime and grime.process and grime.process.which then
-        local p = grime.process.which(bin)
-        if p and #p > 0 then
-            binary_cache[bin] = true
-            return true
-        end
-    end
-    local c = ctx or (grime and grime.ctx)
-    if c and c.capture then
-        local res = c.capture({ "which", bin })
-        local exists = (res.code == 0 and res.stdout and res.stdout:match("%S") ~= nil) or false
-        binary_cache[bin] = exists
-        return exists
-    end
-    return false
+--- Текущее время в секундах (для TTL кэша)
+local function now_sec()
+    return os.time()
 end
 
---- Определение, выполняется ли команда от суперпользователя root
-function utils.is_root_user(ctx)
-    if os.getenv("USER") == "root" or os.getenv("SUDO_USER") ~= nil then
+--- Проверка доступности бинарной утилиты на хосте с кэшированием
+--- (положительные результаты кэшируются на TTL, отрицательные не кэшируются)
+function utils.has_binary(bin, ctx)
+    if not bin or bin == "" then return false end
+    local cached = binary_cache[bin]
+    if cached and (now_sec() - cached) < BINARY_CACHE_TTL then
         return true
     end
+    binary_cache[bin] = nil
+    local found = false
+    local native_which = grime and grime.process and grime.process.which
+    if native_which then
+        -- Нативный поиск по $PATH без порождения процессов: ответ окончательный
+        local p = native_which(bin)
+        found = (p ~= nil and #p > 0)
+    else
+        -- Запасной путь только для окружений без grime.process.which
+        local c = ctx or (grime and grime.ctx)
+        if c and c.capture then
+            local res = c.capture({ "which", bin })
+            found = (res.code == 0 and res.stdout and res.stdout:match("%S") ~= nil) or false
+        end
+    end
+    if found then binary_cache[bin] = now_sec() end
+    return found
+end
+
+local root_cache = nil
+
+--- Определение, выполняется ли команда от суперпользователя root (id -u == 0, кэш на процесс)
+function utils.is_root_user(ctx)
+    if root_cache ~= nil then return root_cache end
     local c = ctx or (grime and grime.ctx)
     if c and c.capture then
         local res = c.capture({ "id", "-u" })
-        return res.code == 0 and res.stdout and res.stdout:match("^0%s*$") ~= nil
+        if res.code == 0 and res.stdout then
+            root_cache = (res.stdout:match("^%s*0%s*$") ~= nil)
+            return root_cache
+        end
     end
-    return false
+    return os.getenv("USER") == "root"
 end
 
 --- Экранирование строкового аргумента для передачи в shell
 function utils.shell_escape(arg)
-    return "'" .. tostring(arg or ""):gsub("'", "'\\''") .. "'"
+    local escaped = tostring(arg or ""):gsub("'", "'\\''")
+    return "'" .. escaped .. "'"
 end
 
 --- Нормализация пути файловой системы с раскрытием ~ и относительных сегментов . и ..
@@ -267,7 +281,11 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
     local native_lines = {}
     for _, p in ipairs(native_pkgs or {}) do
         local clean = p:gsub("^pkgs%.", "")
-        table.insert(native_lines, "            " .. clean)
+        if utils.valid_pkg_name(clean) then
+            table.insert(native_lines, "            " .. clean)
+        else
+            utils.warn_invalid_pkg(clean)
+        end
     end
     if #native_lines == 0 then
         table.insert(native_lines, "            bashInteractive")
@@ -277,8 +295,12 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
     local lib_lines = {}
     for _, p in ipairs(lib_pkgs or {}) do
         local clean = p:gsub("^pkgs%.", "")
-        table.insert(clean_libs, clean)
-        table.insert(lib_lines, "            " .. clean)
+        if utils.valid_pkg_name(clean) then
+            table.insert(clean_libs, clean)
+            table.insert(lib_lines, "            " .. clean)
+        else
+            utils.warn_invalid_pkg(clean)
+        end
     end
 
     local safe_name = tostring(name):gsub("''", "'''"):gsub('[\\"$`]', "\\%0")
@@ -329,102 +351,6 @@ function utils.generate_flake_nix(name, native_pkgs, lib_pkgs, desc)
 ]], desc, table.concat(native_lines, "\n"), build_inputs_block, table.concat(hook_lines, "\n            "))
 end
 
---- Универсальный генератор манифеста app.lua для всех поддерживаемых языков
-function utils.generate_app_manifest(name, lang, desc, opts)
-    name = name or "app"
-    lang = (lang or "cpp"):lower()
-    local clean_desc = (desc and desc ~= "") and desc:gsub("\n", " ") or ("Приложение " .. name)
-    local snake_name = (grime and grime.str and grime.str.to_snake_case)
-        and grime.str.to_snake_case(name)
-        or name:lower():gsub("[%s%-]", "_")
-
-    opts = opts or {}
-    local spec_deps = opts.special_dependencies or {}
-    if type(spec_deps) == "string" then
-        local t = {}
-        for s in spec_deps:gmatch("[%w%_%-%.]+") do table.insert(t, s) end
-        spec_deps = t
-    end
-
-    local profiles = {
-        cpp = {
-            artifact = "build/" .. name,
-            build = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
-            run = "build/" .. name,
-        },
-        rust = {
-            artifact = "target/release/" .. snake_name,
-            build = "cargo build --release",
-            run = "target/release/" .. snake_name,
-        },
-        python = {
-            artifact = "src/main.py",
-            build = "python3 -m py_compile src/main.py",
-            run = "python3 src/main.py",
-        },
-        java = {
-            artifact = "build/" .. name .. ".jar",
-            build = string.format(
-                "mkdir -p build/classes && javac -encoding UTF-8 -d build/classes $(find src -name '*.java') && jar --create --file build/%s.jar --main-class Main -C build/classes .",
-                name
-            ),
-            run = "java -jar build/" .. name .. ".jar",
-        },
-        lua = {
-            artifact = "main.lua",
-            build = "luajit -bl main.lua >/dev/null",
-            run = "luajit main.lua",
-        },
-        bash = {
-            artifact = "main.sh",
-            build = "bash -n main.sh",
-            run = "bash main.sh",
-        },
-        fish = {
-            artifact = "main.fish",
-            build = "fish -n main.fish",
-            run = "fish main.fish",
-        },
-    }
-
-    local p = profiles[lang] or {
-        artifact = "src/main.lua",
-        run = "luajit src/main.lua",
-    }
-
-    local build_cmd = (opts.build and opts.build ~= "" and opts.build ~= "auto") and opts.build or p.build
-    local run_cmd = (opts.run and opts.run ~= "" and opts.run ~= "auto") and opts.run or p.run
-    local test_cmd = (opts.test and opts.test ~= "" and opts.test ~= "auto") and opts.test or nil
-
-    local lines = {
-        "return {",
-        string.format("    name = %q,", name),
-        string.format("    description = %q,", clean_desc),
-        string.format("    type = %q,", lang),
-        string.format("    artifact = %q,", p.artifact),
-    }
-    if build_cmd then
-        table.insert(lines, string.format("    build = %q,", build_cmd))
-    end
-    table.insert(lines, string.format("    run = %q,", run_cmd))
-    if test_cmd then
-        table.insert(lines, string.format("    test = %q,", test_cmd))
-    end
-
-    if #spec_deps > 0 then
-        local formatted = {}
-        for _, dep in ipairs(spec_deps) do
-            table.insert(formatted, string.format("%q", dep))
-        end
-        table.insert(lines, string.format("    special_dependencies = { %s },", table.concat(formatted, ", ")))
-    else
-        table.insert(lines, "    special_dependencies = {},")
-    end
-    table.insert(lines, string.format("    detached = %s,", opts.detached and "true" or "false"))
-    table.insert(lines, "}")
-    return table.concat(lines, "\n") .. "\n"
-end
-
 --- Формирование обертки запуска с авто-детектом nixGL (GPU/OpenGL/Vulkan) и sudo
 function utils.build_nixgl_wrapper(cmd, args, use_sudo)
     local escaped_args = {}
@@ -435,50 +361,60 @@ function utils.build_nixgl_wrapper(cmd, args, use_sudo)
     local sudo_prefix = use_sudo and "sudo -E " or ""
 
     return string.format(
-        'c=%q; b=$(command -v "$c" 2>/dev/null); ' ..
+        'c=%s; b=$(command -v "$c" 2>/dev/null); ' ..
         'if [ -z "$b" ]; then b=$(find $(echo "$PATH" | tr ":" " ") -maxdepth 1 -iname "$c" 2>/dev/null | head -n 1); fi; ' ..
         'if [ -z "$b" ]; then b="$c"; fi; ' ..
         'r="$b"; [ -f "$(dirname "$b")/.$(basename "$b")-wrapped" ] && r="$(dirname "$b")/.$(basename "$b")-wrapped"; ' ..
-        'g="$HOME/.local/share/grime/nixGL/bin/nixGL"; [ ! -x "$g" ] && g=$(ls -d /nix/store/*-nixGL/bin/nixGL 2>/dev/null | tail -n 1); ' ..
+        'k="$HOME/.local/share/grime/nixgl_path"; g=$(cat "$k" 2>/dev/null); ' ..
+        '[ ! -x "$g" ] && g="$HOME/.local/share/grime/nixGL/bin/nixGL"; ' ..
+        '[ ! -x "$g" ] && g=$(ls -d /nix/store/*-nixGL/bin/nixGL 2>/dev/null | tail -n 1); ' ..
         'if [ ! -x "$g" ]; then mkdir -p "$HOME/.local/share/grime" && nix build --impure github:nix-community/nixGL#nixGLDefault --out-link "$HOME/.local/share/grime/nixGL" >/dev/null 2>&1 && g="$HOME/.local/share/grime/nixGL/bin/nixGL"; fi; ' ..
+        '[ -x "$g" ] && { mkdir -p "$HOME/.local/share/grime"; printf %%s "$g" > "$k" 2>/dev/null; }; ' ..
         'w=""; ' ..
         'if [ -x "$g" ] && command -v readelf >/dev/null 2>&1 && [ -f "$r" ] && readelf -d "$r" 2>/dev/null | grep -Eiq "libGL|libvulkan|libEGL|libX11|libwayland|libglvnd"; then w="$g"; fi; ' ..
         'exec %s$w "$b"%s',
-        cmd, sudo_prefix, args_str
+        utils.shell_escape(cmd), sudo_prefix, args_str
     )
+end
+
+--- Единое разрешение именованного пути GRIME (ctx.paths / ctx.get_path) с нормализацией
+function utils.get_named_path(name, fallback, ctx)
+    local c = ctx or (grime and grime.ctx)
+    local root = (c and c.paths and c.paths[name])
+        or (c and c.get_path and c.get_path(name))
+    if not root or root == "" then root = fallback end
+    if not root or root == "" then return "" end
+    if c and c.normalize_path then
+        root = c.normalize_path(root)
+    else
+        root = utils.normalize_path(root)
+    end
+    return root
 end
 
 --- Определение корня каталога Grime Apps
 function utils.get_apps_root(ctx)
-    local c = ctx or (grime and grime.ctx)
-    local root = (c and c.paths and c.paths.apps)
-        or (c and c.get_path and c.get_path("apps"))
-        or (c and c.apps_root and c.apps_root())
-        or ((os.getenv("HOME") or "") .. "/.config/grime/apps")
-    if c and c.normalize_path then
-        root = c.normalize_path(root)
-    else
-        root = utils.normalize_path(root)
+    return utils.get_named_path("apps", (os.getenv("HOME") or "") .. "/.config/grime/apps", ctx)
+end
+
+--- Определение корня каталога проектов GRIME
+--- Без настроенного пути (конфиг/аннотация `--@grime path.projects`) возвращает nil и сообщение об ошибке.
+function utils.get_projects_root(ctx)
+    local root = utils.get_named_path("projects", nil, ctx)
+    if root == "" then
+        return nil, "не настроен путь к проектам: задайте path.projects в конфиге GRIME (GRIME_CONFIG)"
     end
     return root
 end
 
---- Определение корня каталога проектов GRIME
-function utils.get_projects_root(ctx)
-    local c = ctx or (grime and grime.ctx)
-    local root = (c and c.paths and c.paths.projects)
-        or (c and c.get_path and c.get_path("projects"))
-        or (c and c.projects_root and c.projects_root())
-    if not root or root == "" then
-        local home = os.getenv("HOME") or ""
-        root = (home ~= "" and (home .. "/Projects")) or "./projects"
+--- Путь к текущему исполняемому файлу grime (для самозапуска в том же окружении).
+--- Для запуска внутри другой среды (box/nix) используйте имя "grime".
+function utils.self_exe()
+    if grime and grime.process and grime.process.exe_path then
+        local ok, p = pcall(grime.process.exe_path)
+        if ok and type(p) == "string" and p ~= "" then return p end
     end
-    if c and c.normalize_path then
-        root = c.normalize_path(root)
-    else
-        root = utils.normalize_path(root)
-    end
-    return root
+    return "grime"
 end
 
 utils.LANG_ALIASES = {
@@ -490,6 +426,43 @@ utils.LANG_ALIASES = {
     bash = "bash", sh = "bash", shell = "bash",
     fish = "fish",
 }
+
+--- Единая таблица каталогов-«корзин» языков в корне проектов: канонический язык -> варианты имён каталога
+--- (первый элемент — предпочтительное имя для создания, остальные — исторические варианты регистра).
+utils.LANG_BUCKETS = {
+    cpp    = { "cpp", "C++", "c++", "Cpp", "CPP" },
+    rust   = { "rust", "Rust", "RUST" },
+    python = { "python", "Python", "PYTHON" },
+    java   = { "java", "Java", "JAVA" },
+    lua    = { "lua", "Lua", "LUA" },
+    bash   = { "bash", "Bash", "BASH" },
+    fish   = { "fish", "Fish", "FISH" },
+}
+
+--- Канонический порядок языков для обхода корзин
+utils.LANG_ORDER = { "cpp", "rust", "python", "java", "lua", "bash", "fish" }
+
+--- Имена каталогов-корзин: для языка (алиасы допустимы) — его варианты; без аргумента —
+--- плоский список всех вариантов всех языков в каноническом порядке (без дублей).
+function utils.lang_dir_names(lang)
+    if lang ~= nil then
+        local canon = utils.LANG_ALIASES[tostring(lang):lower()] or tostring(lang):lower()
+        local list = utils.LANG_BUCKETS[canon] or {}
+        local out = {}
+        for i, n in ipairs(list) do out[i] = n end
+        return out
+    end
+    local out, seen = {}, {}
+    for _, l in ipairs(utils.LANG_ORDER) do
+        for _, n in ipairs(utils.LANG_BUCKETS[l]) do
+            if not seen[n] then
+                seen[n] = true
+                out[#out + 1] = n
+            end
+        end
+    end
+    return out
+end
 
 local SHEBANG_LANG_MAP = {
     python = "python", python3 = "python", python2 = "python",
@@ -633,6 +606,573 @@ function utils.read_app_link_meta(app_dir)
         end
     end
     return nil
+end
+
+-- ============================================================================
+-- Общие хелперы (используются project/git/log/bus/daemon/ai/app/pkg)
+-- ============================================================================
+
+--- Экранирование спецсимволов Lua-паттерна
+function utils.escape_pattern(s)
+    return (tostring(s or ""):gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
+--- Корректная TOML-строка (basic string) с экранированием \\, ", управляющих символов
+function utils.toml_string(s)
+    s = tostring(s or "")
+    s = s:gsub("[%c\\\"]", function(ch)
+        local map = { ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+        return map[ch] or string.format("\\u%04X", ch:byte())
+    end)
+    return '"' .. s .. '"'
+end
+
+--- Валидация имени приложения/проекта: возвращает true либо false, сообщение
+function utils.valid_name(name)
+    if type(name) ~= "string" or name == "" then
+        return false, "имя не может быть пустым"
+    end
+    if name:sub(1, 1) == "." then
+        return false, "имя не может начинаться с '.' (включая '.' и '..')"
+    end
+    if name:find("..", 1, true) then
+        return false, "имя не может содержать '..'"
+    end
+    if name:find("[/\\]") then
+        return false, "имя не может содержать '/' или '\\'"
+    end
+    if name:sub(1, 1) == "-" then
+        return false, "имя не может начинаться с '-'"
+    end
+    if name:find("[%c]") then
+        return false, "имя не может содержать управляющие символы"
+    end
+    return true, nil
+end
+
+--- Валидация имени nix-пакета (с необязательным префиксом pkgs.)
+--- Стоп-слова: имена каталогов/команд, которые не являются nix-пакетами
+--- (принимаются только при явном объявлении в deps: explicit == true)
+utils.PKG_STOPWORDS = {
+    build = true, src = true, lib = true, bin = true, test = true, tests = true,
+    docs = true, doc = true, include = true, dist = true, out = true, target = true,
+    obj = true, examples = true, example = true, scripts = true, tools = true,
+}
+
+function utils.valid_pkg_name(name, explicit)
+    if type(name) ~= "string" or name == "" then return false end
+    if name:match("^[%w_%-%.+]+$") == nil then return false end
+    if not explicit and utils.PKG_STOPWORDS[name:lower()] then return false end
+    return true
+end
+
+--- Предупреждение об отброшенном невалидном имени пакета
+function utils.warn_invalid_pkg(name)
+    local msg = string.format("Пропущено недопустимое имя nix-пакета: '%s'", tostring(name))
+    if grime and grime.ctx and grime.ctx.warn then
+        grime.ctx.warn(msg)
+    elseif grime and grime.ui and grime.ui.warn then
+        grime.ui.warn(msg)
+    else
+        io.stderr:write(msg .. "\n")
+    end
+end
+
+--- Проверка, что каталог находится в git-репозитории (.git или git rev-parse)
+function utils.is_git_repo(dir, ctx)
+    if not dir or dir == "" then return false end
+    if utils.file_exists(dir .. "/.git") then return true end
+    local c = ctx or (grime and grime.ctx)
+    if c and c.capture then
+        local res = c.capture({ "git", "-C", dir, "rev-parse", "--is-inside-work-tree" })
+        return res.code == 0 and res.stdout ~= nil and res.stdout:match("true") ~= nil
+    end
+    return false
+end
+
+--- Создание приватного (0600) временного файла. Возвращает path, cleanup_fn (либо nil, err)
+function utils.make_tempfile(content, ctx)
+    local c = ctx or (grime and grime.ctx)
+    local path
+    if grime and grime.ephemeral and grime.ephemeral.file then
+        -- Файл создаётся ядром (0600) и удаляется автоматически в конце конвейера
+        local ok, p = pcall(grime.ephemeral.file, content or "")
+        if not ok or not p or p == "" then return nil, "не удалось создать временный файл" end
+        path = p
+    else
+        -- Запасной вариант без grime.ephemeral: mktemp
+        if not (c and c.capture) then return nil, "ctx.capture недоступен" end
+        local res = c.capture({ "mktemp", "-t", "grime.XXXXXXXX" })
+        path = res.code == 0 and res.stdout and res.stdout:match("^%s*(.-)%s*$") or nil
+        if not path or path == "" then return nil, "не удалось создать временный файл" end
+        local f = io.open(path, "wb")
+        if not f then
+            c.capture({ "rm", "-f", path })
+            return nil, "не удалось открыть временный файл на запись"
+        end
+        f:write(content or "")
+        f:close()
+    end
+    local cleaned = false
+    return path, function()
+        if not cleaned then
+            cleaned = true
+            os.remove(path)
+        end
+    end
+end
+
+--- Выполнение fn(path) с приватным временным файлом; файл удаляется всегда (pcall-обёртка)
+function utils.with_tempfile(content, fn, ctx)
+    local path, cleanup = utils.make_tempfile(content, ctx)
+    if not path then return nil, cleanup end
+    local ok, res = pcall(fn, path)
+    cleanup()
+    if not ok then error(res, 0) end
+    return res
+end
+
+--- Путь сокета демона GRIME: единый источник правды — ядро (grime.process.daemon_socket,
+--- src/daemon.rs get_socket_path). Резерв ниже нужен только для окружений без этой функции.
+function utils.daemon_socket_path(ctx)
+    local native = grime and grime.process and grime.process.daemon_socket
+    if native then return native() end
+    local c = ctx or (grime and grime.ctx)
+    local xdg = os.getenv("XDG_RUNTIME_DIR")
+    if xdg and #xdg > 0 then
+        return xdg .. "/grime.sock"
+    end
+    local uid = "default"
+    local res = c and c.capture and c.capture({ "id", "-u" })
+    if res and res.code == 0 and res.stdout then
+        local u = res.stdout:match("%d+")
+        if u and #u > 0 then uid = u end
+    end
+    if c and c.exists and c.exists("/run/user/" .. uid) then
+        return "/run/user/" .. uid .. "/grime.sock"
+    end
+    return "/tmp/grime-" .. uid .. ".sock"
+end
+
+--- Единый фоновый запуск через nohup setsid. tokens — массив аргументов (или готовая строка);
+--- возвращает pid (число-строка) либо nil
+function utils.spawn_background(tokens, cwd, logfile, env, ctx)
+    local c = ctx or (grime and grime.ctx)
+    if not (c and c.capture) then return nil end
+    local cmd_str
+    if type(tokens) == "table" then
+        local parts = {}
+        for _, t in ipairs(tokens) do table.insert(parts, utils.shell_escape(t)) end
+        cmd_str = table.concat(parts, " ")
+    else
+        cmd_str = tostring(tokens or "")
+    end
+    if cmd_str == "" then return nil end
+    local out = (logfile and logfile ~= "") and utils.shell_escape(logfile) or "/dev/null"
+    local res = c.capture(
+        string.format("nohup setsid %s > %s 2>&1 < /dev/null & echo $!", cmd_str, out), cwd, env)
+    return res.stdout and res.stdout:match("%d+") or nil
+end
+
+--- Проверка, жив ли процесс (через /proc, без shell; зомби считается мёртвым)
+function utils.is_pid_alive(pid)
+    pid = tostring(pid or "")
+    if not pid:match("^%d+$") then return false end
+    local f = io.open("/proc/" .. pid .. "/stat", "r")
+    if not f then return false end
+    local stat = f:read("*l") or ""
+    f:close()
+    local state = stat:match("^%d+ %(.*%) (%a)")
+    return state ~= nil and state ~= "Z" and state ~= "X"
+end
+
+--- Единый CMake-генератор (адаптер cpp и генерируемый app.lua должны использовать одно и то же)
+utils.CMAKE_GENERATOR = "Ninja"
+
+--- Команда конфигурации CMake с единым генератором
+function utils.cmake_configure_cmd()
+    return "cmake -G " .. utils.CMAKE_GENERATOR .. " -B build -DCMAKE_BUILD_TYPE=Release"
+end
+
+--- Shebang-строки по языку
+utils.SHEBANGS = {
+    python = "#!/usr/bin/env python3",
+    lua    = "#!/usr/bin/env luajit",
+    bash   = "#!/usr/bin/env bash",
+    fish   = "#!/usr/bin/env fish",
+    nodejs = "#!/usr/bin/env node",
+}
+
+--- Соответствие расширений файлов языкам
+utils.EXT_TO_LANG = {
+    [".py"] = "python", [".lua"] = "lua",
+    [".sh"] = "bash", [".bash"] = "bash", [".fish"] = "fish",
+    [".rs"] = "rust",
+    [".cpp"] = "cpp", [".cc"] = "cpp", [".cxx"] = "cpp", [".c"] = "cpp",
+    [".java"] = "java", [".go"] = "go",
+    [".js"] = "nodejs", [".ts"] = "nodejs",
+}
+
+--- Сборочные манифесты и их языки
+utils.BUILD_MANIFEST_LANG = {
+    ["Cargo.toml"] = "rust", ["CMakeLists.txt"] = "cpp", ["Makefile"] = "cpp",
+    ["meson.build"] = "cpp", ["pom.xml"] = "java", ["build.gradle"] = "java",
+    ["build.gradle.kts"] = "java", ["pyproject.toml"] = "python",
+    ["go.mod"] = "go", ["build.zig"] = "zig",
+}
+
+--- Служебные файлы, которые не могут быть точкой входа
+utils.IGNORED_ENTRY_FILES = {
+    ["app.lua"] = true, ["flake.nix"] = true, ["flake.lock"] = true,
+    ["app.log"] = true, ["app.pid"] = true, ["app.sock"] = true,
+    ["README.md"] = true, ["readme.md"] = true, ["grime.json"] = true,
+    ["meta.json"] = true, ["Cargo.lock"] = true, [".gitignore"] = true,
+    [".grime_app.json"] = true, [".grime_link.json"] = true,
+}
+
+--- Кандидаты точки входа по языку
+utils.ENTRY_CANDIDATES = {
+    python = { "main.py", "src/main.py" },
+    lua    = { "main.lua", "src/main.lua" },
+    fish   = { "main.fish", "src/main.fish" },
+    bash   = { "main.sh", "main.bash", "src/main.sh", "src/main.bash" },
+    rust   = { "src/main.rs", "main.rs" },
+    cpp    = { "src/main.cpp", "main.cpp", "main.c", "src/main.c" },
+    java   = { "src/Main.java", "Main.java" },
+    go     = { "main.go" },
+}
+
+-- Общий порядок кандидатов (без привязки к языку)
+local ENTRY_ORDER = {
+    "main.py", "main.lua", "main.fish", "main.sh", "main.bash",
+    "main.rs", "main.cpp", "main.c", "Main.java", "main.go",
+    "src/main.py", "src/main.lua", "src/main.fish", "src/main.sh", "src/main.bash",
+    "src/main.rs", "src/main.cpp", "src/main.c", "src/Main.java",
+}
+
+--- Поиск главного файла приложения.
+--- opts: { app_name = "...", explicit_entry = "относительный путь" }.
+--- Возвращает rel_path, is_binary, найденный_сборочный_манифест
+function utils.find_main_entry(dir, lang, opts)
+    opts = opts or {}
+    if not dir or not utils.file_exists(dir) then return nil, false, nil end
+
+    -- io.open успешно открывает и каталоги; различаем через попытку чтения
+    local function is_regular(p)
+        local f = io.open(p, "rb")
+        if not f then return false end
+        local _, err = f:read(1)
+        f:close()
+        return err == nil
+    end
+
+    local explicit = opts.explicit_entry
+    if explicit and explicit ~= "" then
+        local rel = explicit
+        local base = dir:gsub("/+$", "") .. "/"
+        if rel:sub(1, #base) == base then rel = rel:sub(#base + 1) end
+        if is_regular(dir .. "/" .. rel) then
+            local _, is_bin = utils.parse_script_header(dir .. "/" .. rel)
+            return rel, is_bin, nil
+        end
+    end
+
+    local order = {}
+    local seen = {}
+    local function push(rel)
+        if not seen[rel] then seen[rel] = true; table.insert(order, rel) end
+    end
+    local l = (lang or ""):lower()
+    for _, rel in ipairs(utils.ENTRY_CANDIDATES[l] or {}) do push(rel) end
+    for _, rel in ipairs(ENTRY_ORDER) do push(rel) end
+    local app_name = opts.app_name
+    if app_name and app_name ~= "" then
+        for _, ext in ipairs({ ".py", ".lua", ".fish", ".sh", ".bash", ".rs", ".cpp", ".c", ".go", "" }) do
+            push(app_name .. ext)
+            push("src/" .. app_name .. ext)
+        end
+    end
+    for _, rel in ipairs(order) do
+        local full = dir .. "/" .. rel
+        if is_regular(full) then
+            local _, is_bin = utils.parse_script_header(full)
+            return rel, is_bin, nil
+        end
+    end
+
+    local found_build = nil
+    for _, bname in ipairs({ "Cargo.toml", "CMakeLists.txt", "meson.build", "Makefile", "build.zig", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "pyproject.toml" }) do
+        if is_regular(dir .. "/" .. bname) then found_build = bname; break end
+    end
+
+    local scan_dirs = { { dir = dir, prefix = "" }, { dir = dir .. "/src", prefix = "src/" } }
+    for _, sd in ipairs(scan_dirs) do
+        local items = (grime and grime.fs and grime.fs.list and grime.fs.list(sd.dir)) or {}
+        table.sort(items)
+        for _, item in ipairs(items) do
+            if not item:match("^%.") and not utils.IGNORED_ENTRY_FILES[item] and not utils.BUILD_MANIFEST_LANG[item] then
+                local full = sd.dir .. "/" .. item
+                if is_regular(full) then
+                    local ext = item:match("(%.[%a%d_]+)$")
+                    if ext and utils.EXT_TO_LANG[ext:lower()] then
+                        return sd.prefix .. item, false, found_build
+                    end
+                    local hdr, is_bin = utils.parse_script_header(full)
+                    if is_bin or (hdr and hdr.shebang) then
+                        return sd.prefix .. item, is_bin, found_build
+                    end
+                end
+            end
+        end
+    end
+    return nil, false, found_build
+end
+
+--- Основной файл по языку (для промптов/шаблонов): первый существующий кандидат либо дефолт языка
+function utils.entry_file_for_lang(lang, dir)
+    local defaults = {
+        python = "main.py", java = "src/Main.java", rust = "src/main.rs",
+        lua = "main.lua", bash = "main.sh", fish = "main.fish", cpp = "src/main.cpp",
+    }
+    local cand = defaults[(lang or "python"):lower()] or "main.py"
+    if dir and utils.file_exists(dir .. "/" .. cand) then return cand end
+    for _, rel in ipairs(ENTRY_ORDER) do
+        if dir and utils.file_exists(dir .. "/" .. rel) then return rel end
+    end
+    return cand
+end
+
+--- Признак файла-скрипта/исходника, у которого имеет смысл читать shebang и заголовки deps/nix
+function utils.is_script_file(fname)
+    if not fname or fname == "" then return false end
+    local ext = fname:match("(%.[%a%d_]+)$")
+    if ext then return utils.EXT_TO_LANG[ext:lower()] ~= nil end
+    return not utils.IGNORED_ENTRY_FILES[fname] and not fname:match("^%.")
+end
+
+--- Генерация flake.nix по плоскому списку пакетов.
+--- opts: { name, packages = {...}, desc, scanner }. Невалидные имена отбрасываются с предупреждением
+function utils.generate_flake(opts)
+    opts = opts or {}
+    local native, libs = utils.split_packages(opts.packages or {}, opts.scanner)
+    return utils.generate_flake_nix(opts.name, native, libs, opts.desc)
+end
+
+-- ============================================================================
+-- Общие функции для app/nix/ai/project/list/pkg (замена локальных дублей)
+-- ============================================================================
+
+--- Хеш djb2 строки в виде 8 hex-символов (стабильный ключ кэша эфемерных flake)
+function utils.djb2_hex(s)
+    s = tostring(s or "")
+    local h = 5381
+    for i = 1, #s do
+        h = ((h * 33) + s:byte(i)) % 4294967296
+    end
+    return string.format("%08x", h)
+end
+
+--- Корень каталога шаблонов (ctx.paths.templates / ctx.get_path) с запасным ~/.config/grime/templates
+function utils.templates_root(ctx)
+    local home = os.getenv("HOME") or ""
+    local fallback = (home ~= "") and (home .. "/.config/grime/templates") or "./templates"
+    return utils.get_named_path("templates", fallback, ctx)
+end
+
+--- Единая точка записи flake.nix через generate_flake_nix.
+--- opts: { desc = строка описания, mkdir = true (создать dir), git_add = true (git add -N flake.nix), ctx = ctx }.
+--- Возвращает true, flake_path либо false, сообщение об ошибке.
+function utils.write_flake(dir, name, native, libs, opts)
+    opts = opts or {}
+    if not dir or dir == "" then return false, "не указан каталог flake" end
+    local c = opts.ctx or (grime and grime.ctx)
+    if opts.mkdir and c and c.mkdir_p then
+        c.mkdir_p(dir)
+    end
+    local path = dir .. "/flake.nix"
+    local content = utils.generate_flake_nix(name, native, libs, opts.desc)
+    local f, err = io.open(path, "w")
+    if not f then return false, "не удалось записать " .. path .. ": " .. tostring(err) end
+    f:write(content)
+    f:close()
+    if opts.git_add and c and c.capture then
+        pcall(function() c.capture({ "git", "add", "-N", "flake.nix" }, dir) end)
+    end
+    return true, path
+end
+
+--- Гарантирует shebang (#!) в первой строке скрипта; ctx нужен только для лога (необязателен).
+--- Бинарные файлы пропускаются, UTF-8 BOM удаляется. Возвращает true, если shebang есть/добавлен.
+function utils.ensure_shebang(path, lang, ctx)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local content = f:read("*a") or ""
+    f:close()
+
+    if content:sub(1, 4) == "\127ELF" or content:sub(1, 512):find("\0", 1, true) then
+        return false
+    end
+
+    local bom_stripped = false
+    if content:sub(1, 3) == "\239\187\191" then
+        content = content:sub(4)
+        bom_stripped = true
+    end
+
+    if content:sub(1, 2) == "#!" then
+        if bom_stripped then
+            local wf = io.open(path, "wb")
+            if wf then wf:write(content); wf:close() end
+        end
+        return true
+    end
+
+    local ext = path:match("(%.[%a%d_]+)$")
+    local inferred = (ext and utils.EXT_TO_LANG[ext:lower()]) or lang
+    local sb = utils.SHEBANGS[(inferred or ""):lower()]
+    if not sb then return false end
+
+    local wf = io.open(path, "wb")
+    if not wf then return false end
+    wf:write(sb .. "\n" .. content)
+    wf:close()
+    local c = ctx or (grime and grime.ctx)
+    if c and c.log then
+        c.log(string.format("Добавлен shebang '%s' в %s", sb, path))
+    end
+    return true
+end
+
+--- Результат хука `wraps: pipeline`: { args = { "-run", <target_args...>, "--", <rest_argv...> } }.
+--- target_args — токены между "-run" и "--" (для box — имя контейнера; для nix — пусто/nil).
+--- Возвращает nil, если подконвейер пуст.
+function utils.wrap_pipeline_run(rest_argv, target_args)
+    if type(rest_argv) ~= "table" or #rest_argv == 0 then return nil end
+    local res = { "-run" }
+    for _, t in ipairs(target_args or {}) do res[#res + 1] = t end
+    res[#res + 1] = "--"
+    for _, t in ipairs(rest_argv) do res[#res + 1] = t end
+    return { args = res }
+end
+
+--- Безопасная загрузка манифеста app.lua (каталог приложения или путь к файлу) в ограниченном окружении.
+--- Доступно в манифесте: os.getenv (только эта функция os), string, table, math, type, tostring, tonumber,
+--- pairs, ipairs, select. НЕДОСТУПНО: io, require, load/loadfile/dofile, остальной os, debug, grime.
+--- Только текстовые чанки; число инструкций ограничено хуком (защита от бесконечных циклов).
+--- Возвращает таблицу манифеста либо nil, сообщение об ошибке.
+function utils.load_manifest_sandboxed(dir_or_file)
+    if type(dir_or_file) ~= "string" or dir_or_file == "" then
+        return nil, "не указан путь к манифесту"
+    end
+    local path = dir_or_file
+    if not path:match("%.lua$") then path = path:gsub("/+$", "") .. "/app.lua" end
+    if not utils.file_exists(path) then return nil, "манифест не найден: " .. path end
+
+    local env = {
+        os = { getenv = os.getenv },
+        string = string, table = table, math = math,
+        type = type, tostring = tostring, tonumber = tonumber,
+        pairs = pairs, ipairs = ipairs, select = select,
+    }
+    local chunk, err = loadfile(path, "t", env)
+    if not chunk then return nil, tostring(err) end
+
+    -- Глобал `debug` в рантайме ядра отсутствует (безопасный набор stdlib), поэтому лимит инструкций
+    -- включается только там, где он есть (обычный lua5.4, тесты). В ядре от бесконечного цикла
+    -- защищает хук отмены (Ctrl+C / watchdog), который срабатывает каждые 10 000 инструкций.
+    local limit_hit = false
+    local has_hook = type(debug) == "table" and type(debug.sethook) == "function"
+    if has_hook then
+        debug.sethook(function() limit_hit = true; error("превышен лимит инструкций манифеста", 0) end, "", 5000000)
+    end
+    local ok, m = pcall(chunk)
+    if has_hook then debug.sethook() end
+    if not ok then return nil, tostring(m) end
+    if limit_hit then return nil, "превышен лимит инструкций манифеста" end
+    if type(m) ~= "table" then return nil, "манифест должен возвращать таблицу" end
+    return m
+end
+
+--- Сбор nix-пакетов проекта: toolchain + special_dependencies сканера + зависимости манифеста + user_packages.
+--- manifest: таблица либо nil (тогда читается <dir>/app.lua в песочнице, если он есть);
+--- scan: результат scanner.scan_project либо nil (будет выполнен скан); ctx нужен только для скана.
+--- Невалидные имена отбрасываются с предупреждением, префикс `pkgs.` снимается, дубли убираются.
+--- Возвращает { native = {...}, libs = {...}, user = {...} }, где user — валидные пакеты манифеста и user_packages.
+function utils.collect_nix_packages(dir, manifest, scan, user_packages, ctx)
+    if scan == nil then
+        local ok, scanner = pcall(require, "languages.scanner")
+        if ok and scanner and scanner.scan_project then
+            scan = scanner.scan_project(dir, ctx or (grime and grime.ctx))
+        end
+    end
+    scan = scan or {}
+    if manifest == nil and dir and utils.file_exists(dir .. "/app.lua") then
+        manifest = utils.load_manifest_sandboxed(dir)
+    end
+
+    local seen, all, user = {}, {}, {}
+    local function add(p, is_user, explicit)
+        if type(p) ~= "string" or p == "" then return end
+        local clean = p:gsub("^pkgs%.", "")
+        if not utils.valid_pkg_name(clean, explicit) then
+            utils.warn_invalid_pkg(clean)
+            return
+        end
+        if is_user and not user[clean] then
+            user[clean] = true
+            user[#user + 1] = clean
+        end
+        if not seen[clean] then
+            seen[clean] = true
+            all[#all + 1] = clean
+        end
+    end
+    local function add_list(list, is_user)
+        if type(list) == "table" then
+            for _, v in ipairs(list) do add(v, is_user, is_user == true) end
+        elseif type(list) == "string" then
+            for s in list:gmatch("%S+") do add(s, is_user, is_user == true) end
+        end
+    end
+
+    add_list(scan.toolchain)
+    add_list(scan.special_dependencies)
+    if type(manifest) == "table" then
+        add_list(manifest.special_dependencies, true)
+        add_list(manifest.dependencies, true)
+        add_list(manifest.extra_packages, true)
+        if type(manifest.nix) == "table" then
+            add_list(manifest.nix.special_dependencies, true)
+            add_list(manifest.nix.dependencies, true)
+            add_list(manifest.nix.packages, true)
+        elseif type(manifest.nix) == "string" then
+            add_list(manifest.nix, true)
+        end
+    end
+    add_list(user_packages, "cli") -- CLI-токены: не явная аннотация, стоп-слова отфильтровываются
+
+    local native, libs = utils.split_packages(all)
+    -- служебная хеш-часть списка user не нужна потребителям
+    local user_list = {}
+    for i, v in ipairs(user) do user_list[i] = v end
+    return { native = native, libs = libs, user = user_list }
+end
+
+--- Токены команды `nix develop [path:<dir>] --command <cmd...>`.
+--- dir_or_flake: каталог (получит префикс path:), готовая flake-ссылка (содержит ':' или '#') либо nil.
+--- opts: { impure = true } добавляет --impure.
+function utils.develop_cmd(dir_or_flake, cmd_tokens, opts)
+    opts = opts or {}
+    local t = { "nix", "develop" }
+    if dir_or_flake and dir_or_flake ~= "" then
+        local ref = dir_or_flake
+        if not ref:find("[:#]") then ref = "path:" .. ref:gsub("/+$", "") end
+        t[#t + 1] = ref
+    end
+    if opts.impure then t[#t + 1] = "--impure" end
+    t[#t + 1] = "--command"
+    for _, tok in ipairs(cmd_tokens or {}) do t[#t + 1] = tostring(tok) end
+    return t
 end
 
 return utils

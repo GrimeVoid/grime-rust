@@ -1,21 +1,45 @@
--- Summary: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
--- Description: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
-description = "Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox"
+--@grime description: Унифицированный менеджер пакетов хоста, Nix, Flatpak, Cargo и Distrobox
+--@grime requires: module:box?, module:app?
+
 
 local utils = require("languages.utils")
 
 -- Модульные переменные file-scope
 local ctx = grime.ctx
-local ui = grime.ui
-local str = grime.str
 local fs = grime.fs
 local HOME = os.getenv("HOME") or ""
-local ANSI = utils.ANSI
+local pad_utf8 = utils.pad_utf8
 
 local has_binary = function(bin) return utils.has_binary(bin, ctx) end
-local get_apps_root = function() return utils.get_apps_root(ctx) end
-local utf8_len = utils.utf8_len
-local pad_utf8 = utils.pad_utf8
+local get_apps_root = function() return utils.get_named_path("apps", HOME .. "/.config/grime/apps", ctx) end
+local is_root_user = function() return utils.is_root_user(ctx) end
+
+-- Флаги выбора GPU, которые не относятся к запускаемой утилите
+local GPU_FLAGS = {
+    ["--nv"] = true, ["--prime"] = true, ["--nvidia"] = true,
+    ["--gl"] = true, ["--gpu"] = true, ["--no-gpu"] = true,
+}
+
+--- Копия списка токенов без GPU-флагов
+local function strip_gpu_flags(tokens)
+    local out = {}
+    for _, t in ipairs(tokens or {}) do
+        if not GPU_FLAGS[t] then table.insert(out, t) end
+    end
+    return out
+end
+
+-- Менеджеры, опрашиваемые в сводке и сквозном поиске (порядок вывода)
+local SCAN_MANAGERS = { "pacman", "yay", "dnf", "apt", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
+
+-- Кэши результатов в пределах одного вызова (сбрасываются в начале main/handle_not_found)
+local pkg_cache = {}
+local distrobox_cache = nil
+
+local function reset_caches()
+    pkg_cache = {}
+    distrobox_cache = nil
+end
 
 local ACTIONS = {
     ["-list"] = "list", ["--list"] = "list", ["-ls"] = "list", ["--ls"] = "list", ["-l"] = "list",
@@ -132,7 +156,7 @@ local function resolve_manager(query)
     -- 2. Префикс среди канонических
     if #q >= 2 then
         for _, mgr in ipairs(CANONICAL_MANAGERS) do
-            if mgr:find("^" .. q) then
+            if mgr:sub(1, #q) == q then
                 return mgr
             end
         end
@@ -191,6 +215,8 @@ end
 -- Сбор пакетов: flatpak
 local function get_flatpak_packages(all_mode)
     if not has_binary("flatpak") then return nil, "flatpak не установлен" end
+    local cache_key = "flatpak:" .. (all_mode and "all" or "user")
+    if pkg_cache[cache_key] then return pkg_cache[cache_key] end
     local args = { "flatpak", "list" }
     if not all_mode then
         table.insert(args, "--app")
@@ -212,6 +238,7 @@ local function get_flatpak_packages(all_mode)
             })
         end
     end
+    pkg_cache[cache_key] = list
     return list
 end
 
@@ -299,33 +326,54 @@ local function get_nix_packages(all_mode)
     end
 end
 
--- Определение активного контейнера Distrobox
-local function get_distrobox_target()
-    if not has_binary("distrobox") then return nil end
-    local res = ctx.capture({ "distrobox", "list", "--no-color" })
-    if res.code ~= 0 or not res.stdout then return nil end
-    local lines = {}
-    for line in res.stdout:gmatch("[^\r\n]+") do table.insert(lines, line) end
-    local target_box = nil
-    for i = 2, #lines do
-        local line = lines[i]:match("^%s*(.-)%s*$")
-        if line ~= "" then
-            local parts = {}
-            for part in line:gmatch("[^|]+") do
-                table.insert(parts, part:match("^%s*(.-)%s*$"))
-            end
-            if #parts >= 3 and parts[1] ~= "ID" then
-                local bname = parts[2]
-                local bstatus = parts[3]
-                if not target_box then target_box = bname end
-                if bstatus:match("Up") or bname == "fedora-box" then
-                    target_box = bname
-                    break
-                end
-            end
+-- Модуль box (экспорт get_containers/get_default_box/get_current_container/exec); nil, если недоступен
+local function box_module()
+    local ok, m = pcall(require, "box")
+    if ok and type(m) == "table" then return m end
+    return nil
+end
+
+-- Информация об активном контейнере Distrobox: { name, running }. Один `distrobox list` на вызов
+local function get_distrobox_info()
+    if distrobox_cache ~= nil then return distrobox_cache or nil end
+    distrobox_cache = false
+    local bx = box_module()
+    if not bx then return nil end
+    if not (has_binary("distrobox") or has_binary("distrobox-host-exec")) then return nil end
+    local containers = bx.get_containers()
+    local name = bx.get_default_box(containers)
+    if not name then return nil end
+    for _, c in ipairs(containers) do
+        if c.name == name then
+            local st = string.lower(c.status or "")
+            distrobox_cache = { name = name, running = (st:find("up") or st:find("running")) ~= nil }
+            return distrobox_cache
         end
     end
-    return target_box
+    return nil
+end
+
+-- Выполнение shell-команды в контейнере с захватом вывода: изнутри этого же контейнера — напрямую,
+-- иначе через distrobox enter (при отсутствии distrobox в контейнере — через distrobox-host-exec)
+local function box_capture(box_name, argv)
+    local bx = box_module()
+    local current = bx and bx.get_current_container() or nil
+    if current ~= nil and current == box_name then
+        return ctx.capture(argv)
+    end
+    local full = {}
+    if current ~= nil and not has_binary("distrobox") and has_binary("distrobox-host-exec") then
+        full[#full + 1] = "distrobox-host-exec"
+    end
+    for _, t in ipairs({ "distrobox", "enter", box_name, "--" }) do full[#full + 1] = t end
+    for _, t in ipairs(argv) do full[#full + 1] = t end
+    return ctx.capture(full)
+end
+
+-- Определение активного контейнера Distrobox
+local function get_distrobox_target()
+    local info = get_distrobox_info()
+    return info and info.name or nil
 end
 
 -- Сбор пакетов: distrobox
@@ -353,7 +401,7 @@ local function get_distrobox_packages(box_name, all_mode)
                'pacman -Q 2>/dev/null || ' ..
                'dpkg-query -f "${Package} ${Version}\n" -W 2>/dev/null'
     end
-    local res = ctx.capture({ "distrobox", "enter", box_name, "--", "sh", "-c", qcmd })
+    local res = box_capture(box_name, { "sh", "-c", qcmd })
     if res.code ~= 0 or not res.stdout then return nil, "Ошибка получения пакетов из " .. box_name end
     local list = {}
     for line in res.stdout:gmatch("[^\r\n]+") do
@@ -375,41 +423,25 @@ end
 local function get_apps_packages(_all_mode)
     local apps_root = get_apps_root()
     if not ctx.exists(apps_root) then return {} end
+    local ok_app, app_mod = pcall(require, "app")
+    if not ok_app or type(app_mod) ~= "table" or type(app_mod.collect_apps) ~= "function" then return {} end
     local list = {}
-    local ok_ls, items = pcall(fs.list, apps_root)
-    if ok_ls and type(items) == "table" then
-        for _, item in ipairs(items) do
-            local app_dir = apps_root .. "/" .. item
-            if item ~= "" and not item:match("^%.") and ctx.is_dir(app_dir) then
-                local has_flake = ctx.exists(app_dir .. "/flake.nix")
-                local has_manifest = ctx.exists(app_dir .. "/app.lua")
-                local desc = ""
-                local ver = has_flake and "flake" or "local"
-                local loaded_m = nil
-                local ok, app_mod = pcall(require, "app")
-                if ok and app_mod and app_mod.load_manifest then
-                    loaded_m = app_mod.load_manifest(app_dir, item)
-                    if loaded_m then
-                        desc = loaded_m.description or ""
-                        if loaded_m.version then
-                            ver = loaded_m.version
-                        elseif not has_flake and loaded_m.type and loaded_m.type ~= "generic" then
-                            ver = loaded_m.type
-                        end
-                    end
-                end
-                if has_manifest or has_flake or loaded_m then
-                    table.insert(list, {
-                        name = item,
-                        version = ver,
-                        details = desc,
-                        path = app_dir
-                    })
-                end
+    for _, a in ipairs(app_mod.collect_apps(apps_root)) do
+        local has_flake = ctx.exists(a.path .. "/flake.nix")
+        local desc = ""
+        local ver = has_flake and "flake" or "local"
+        local m = a.m
+        if m then
+            desc = m.description or ""
+            if m.version then
+                ver = m.version
+            elseif not has_flake and m.type and m.type ~= "generic" then
+                ver = m.type
             end
         end
+        table.insert(list, { name = a.name, version = ver, details = desc, path = a.path })
     end
-    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    table.sort(list, function(x, y) return x.name:lower() < y.name:lower() end)
     return list
 end
 
@@ -476,8 +508,8 @@ local function get_apt_packages(all_mode)
     return list
 end
 
--- Обобщенный диспетчер получения пакетов
-local function get_packages_for_manager(mgr, all_mode)
+-- Обобщенный диспетчер получения пакетов (без кэша)
+local function fetch_packages_for_manager(mgr, all_mode)
     if mgr == "pacman" then
         return get_pacman_packages(all_mode)
     elseif mgr == "yay" then
@@ -508,6 +540,42 @@ local function get_packages_for_manager(mgr, all_mode)
     return nil, "Неизвестный менеджер: " .. tostring(mgr)
 end
 
+-- Диспетчер получения пакетов с кэшем результата в пределах вызова
+local function get_packages_for_manager(mgr, all_mode)
+    local key = "mgr:" .. tostring(mgr) .. ":" .. (all_mode and "all" or "user")
+    local hit = pkg_cache[key]
+    if hit then return hit.list, hit.extra end
+    local list, extra = fetch_packages_for_manager(mgr, all_mode)
+    if list then pkg_cache[key] = { list = list, extra = extra } end
+    return list, extra
+end
+
+--- Нечёткий фильтр списка пакетов по запросу (имя и детали) с сортировкой по релевантности.
+--- Возвращает массив { pkg, score }
+local function fuzzy_filter(pkgs, query)
+    local matches = {}
+    for _, pkg in ipairs(pkgs) do
+        local m1, s1 = fuzzy_match(query, pkg.name)
+        local m2, s2 = fuzzy_match(query, pkg.details or "")
+        if m1 or m2 then
+            table.insert(matches, { pkg = pkg, score = math.max(s1 or 0, s2 or 0) })
+        end
+    end
+    table.sort(matches, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.pkg.name:lower() < b.pkg.name:lower()
+    end)
+    return matches
+end
+
+--- Нужно ли опрашивать менеджер без явного запроса: distrobox только если контейнер уже запущен
+--- (иначе `distrobox enter` запустит контейнер ради сводки/поиска)
+local function should_scan_manager(mgr, explicit)
+    if mgr ~= "distrobox" or explicit then return true end
+    local info = get_distrobox_info()
+    return info ~= nil and info.running
+end
+
 -- 1. Сводная таблица активных пакетных менеджеров
 local function handle_summary(all_mode, show_all_managers)
     local mode_badge = all_mode and "\27[33m[ВСЕ ПАКЕТЫ И ЗАВИСИМОСТИ]\27[0m" or "\27[32m[ПОЛЬЗОВАТЕЛЬСКИЕ]\27[0m"
@@ -523,11 +591,10 @@ local function handle_summary(all_mode, show_all_managers)
         "ПРЕВЬЮ"))
     io.stdout:write(string.rep("─", 80) .. "\n")
 
-    local managers = { "pacman", "yay", "dnf", "apt", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local active_count = 0
     local shown_managers = {}
 
-    for _, mgr in ipairs(managers) do
+    for _, mgr in ipairs(SCAN_MANAGERS) do
         local bin = MANAGER_BINARIES[mgr]
         local is_installed = true
         if bin then
@@ -544,6 +611,12 @@ local function handle_summary(all_mode, show_all_managers)
             if not is_installed then
                 status_raw = "Не установлен"
                 status_color = "\27[90m"
+            elseif not should_scan_manager(mgr, show_all_managers) then
+                -- Контейнер не запущен: не стартуем его ради сводки
+                status_raw = "Остановлен"
+                status_color = "\27[33m"
+                preview_str = "\27[90mgrime pkg box (или -v) — запросить явно\27[0m"
+                table.insert(shown_managers, mgr)
             else
                 local pkgs, extra = get_packages_for_manager(mgr, all_mode)
                 if pkgs then
@@ -610,22 +683,11 @@ local function handle_detailed_list(mgr, filter_tokens, all_mode)
     end
 
     local filter_query = (filter_tokens and #filter_tokens > 0) and table.concat(filter_tokens, " ") or nil
-    local display_pkgs = {}
-
+    local display_pkgs
     if filter_query and filter_query ~= "" then
-        for _, pkg in ipairs(pkgs) do
-            local m1, s1 = fuzzy_match(filter_query, pkg.name)
-            local m2, s2 = fuzzy_match(filter_query, pkg.details or "")
-            if m1 or m2 then
-                local best_s = math.max(s1 or 0, s2 or 0)
-                table.insert(display_pkgs, { pkg = pkg, score = best_s })
-            end
-        end
-        table.sort(display_pkgs, function(a, b)
-            if a.score ~= b.score then return a.score > b.score end
-            return a.pkg.name:lower() < b.pkg.name:lower()
-        end)
+        display_pkgs = fuzzy_filter(pkgs, filter_query)
     else
+        display_pkgs = {}
         for _, pkg in ipairs(pkgs) do
             table.insert(display_pkgs, { pkg = pkg, score = 0 })
         end
@@ -696,36 +758,26 @@ local function handle_search(query_tokens, all_mode)
     io.stdout:write(string.format("\n\27[1m🔍 Сквозной нечеткий поиск пакета '\27[33m%s\27[0m\27[1m' %s:\27[0m\n", query, mode_label))
     io.stdout:write(string.rep("─", 80) .. "\n")
 
-    local managers = { "pacman", "yay", "dnf", "apt", "flatpak", "nix", "distrobox", "apps", "cargo", "pipx" }
     local total_found = 0
     local managers_found = 0
     local all_matched_names = {}
+    local skipped_distrobox = false
 
-    for _, mgr in ipairs(managers) do
+    for _, mgr in ipairs(SCAN_MANAGERS) do
         local bin = MANAGER_BINARIES[mgr]
         local is_installed = true
         if bin then
             is_installed = has_binary(bin)
         end
 
-        if is_installed then
+        if is_installed and not should_scan_manager(mgr, false) then
+            skipped_distrobox = true
+        elseif is_installed then
             local pkgs, extra = get_packages_for_manager(mgr, all_mode)
             if pkgs and #pkgs > 0 then
-                local matches = {}
-                for _, pkg in ipairs(pkgs) do
-                    local m1, s1 = fuzzy_match(query, pkg.name)
-                    local m2, s2 = fuzzy_match(query, pkg.details or "")
-                    if m1 or m2 then
-                        local best_s = math.max(s1 or 0, s2 or 0)
-                        table.insert(matches, { pkg = pkg, score = best_s })
-                    end
-                end
+                local matches = fuzzy_filter(pkgs, query)
 
                 if #matches > 0 then
-                    table.sort(matches, function(a, b)
-                        if a.score ~= b.score then return a.score > b.score end
-                        return a.pkg.name:lower() < b.pkg.name:lower()
-                    end)
 
                     local mgr_label = mgr
                     if mgr == "distrobox" and extra then
@@ -756,6 +808,9 @@ local function handle_search(query_tokens, all_mode)
     end
 
     io.stdout:write("\n" .. string.rep("─", 80) .. "\n")
+    if skipped_distrobox then
+        io.stdout:write("  \27[90mDistrobox пропущен (контейнер не запущен). Поиск в нём: grime pkg box " .. query .. "\27[0m\n")
+    end
     if total_found == 0 then
         io.stdout:write(string.format("  \27[31m❌ Пакеты по запросу '%s' не найдены ни в одном из активных менеджеров.\27[0m\n", query))
         if not all_mode then
@@ -773,6 +828,14 @@ local function handle_search(query_tokens, all_mode)
     if ctx.has_next_step then
         ctx.module_return(table.concat(all_matched_names, "\n"))
     end
+end
+
+-- Системный менеджер хоста по умолчанию для `-i <pkg>`
+local function default_host_manager()
+    for _, mgr in ipairs({ "pacman", "dnf", "apt" }) do
+        if has_binary(mgr) then return mgr end
+    end
+    return "pacman"
 end
 
 -- 4. Установка пакетов
@@ -834,88 +897,125 @@ local function handle_install(manager, packages)
     end
 end
 
+--- Интерактивный запуск команды с контролем кода возврата: при ошибке вызывает ctx.fail (ненулевой итоговый код)
+local function run_checked(cmd, what)
+    local ret = ctx.run_interactive(cmd)
+    if ret ~= 0 then
+        ctx.fail(string.format("%s завершилось с ошибкой (код %s)", what, tostring(ret)))
+    end
+    return ret
+end
+
+--- Копия базовой команды с добавленными аргументами
+local function with_args(base, args)
+    local cmd = {}
+    for _, t in ipairs(base) do table.insert(cmd, t) end
+    for _, a in ipairs(args or {}) do table.insert(cmd, a) end
+    return cmd
+end
+
+--- Баннер этапа обновления
+local function banner(color, title, text)
+    io.stdout:write(string.format("\n\27[%sm[%s]\27[0m \27[1m%s\27[0m\n", color, title, text))
+    io.stdout:flush()
+end
+
+local CARGO_UPDATE_HINT = {
+    "  \27[33mℹ Для автообновления всех бинарников Cargo требуется cargo-install-update.\27[0m\n",
+    "  \27[90mУстановить: grime pkg yay install cargo-update (или cargo install cargo-update)\27[0m\n",
+}
+
+local function has_cargo_install_update()
+    if has_binary("cargo-install-update") then return true end
+    return ctx.capture({ "cargo", "install-update", "--version" }).code == 0
+end
+
+-- 4.1. Сквозное обновление всех активных менеджеров с учётом кодов возврата каждого этапа
+local function handle_update_all()
+    io.stdout:write("\n\27[1;32m🔄 Сквозное обновление активных пакетных менеджеров системы...\27[0m\n")
+    io.stdout:write(string.rep("═", 80) .. "\n")
+
+    local failures = {}
+    local function step(cmd, label)
+        local ret = ctx.run_interactive(cmd)
+        if ret ~= 0 then
+            table.insert(failures, string.format("%s (код %s)", label, tostring(ret)))
+        end
+        return ret
+    end
+
+    -- 1. Системные пакеты хоста: Yay (приоритет на Arch) -> Pacman -> DNF -> APT
+    if has_binary("yay") then
+        banner("1;35", "Yay / AUR", "Обновление системных и AUR пакетов Arch Linux...")
+        step({ "yay", "-Syu" }, "yay")
+    elseif has_binary("pacman") then
+        banner("1;32", "Pacman", "Обновление системных пакетов Arch Linux...")
+        io.stdout:write("\27[90mЗапуск sudo pacman -Syu с интерактивным терминалом...\27[0m\n")
+        io.stdout:flush()
+        step({ "sudo", "pacman", "-Syu" }, "pacman")
+    elseif has_binary("dnf") then
+        banner("1;34", "DNF", "Обновление системных пакетов Fedora...")
+        step({ "sudo", "dnf", "upgrade", "-y" }, "dnf")
+    elseif has_binary("apt") then
+        banner("1;31", "APT", "Обновление системных пакетов Debian/Ubuntu...")
+        if step({ "sudo", "apt", "update" }, "apt update") == 0 then
+            step({ "sudo", "apt", "upgrade", "-y" }, "apt upgrade")
+        end
+    end
+
+    -- 2. Flatpak
+    if has_binary("flatpak") then
+        banner("1;34", "Flatpak", "Обновление Flatpak-приложений и runtime...")
+        step({ "flatpak", "update", "-y" }, "flatpak")
+    end
+
+    -- 3. Nix
+    if has_binary("nix") then
+        banner("1;36", "Nix", "Обновление пакетов Nix-профиля...")
+        step({ "nix", "profile", "upgrade", ".*" }, "nix")
+    end
+
+    -- 4. Distrobox
+    if has_binary("distrobox") then
+        local target_box = get_distrobox_target()
+        if target_box then
+            banner("1;35", "Distrobox: " .. target_box, "Обновление пакетов контейнера...")
+            step({ "distrobox", "enter", target_box, "--", "sudo", "dnf", "upgrade", "-y" }, "distrobox:" .. target_box)
+        end
+    end
+
+    -- 5. Pipx
+    if has_binary("pipx") then
+        banner("1;33", "Pipx", "Обновление Python CLI пакетов (pipx)...")
+        step({ "pipx", "upgrade-all" }, "pipx")
+    end
+
+    -- 6. Cargo
+    if has_binary("cargo") then
+        banner("1;31", "Cargo", "Обновление установленных Rust бинарников...")
+        if has_cargo_install_update() then
+            step({ "cargo", "install-update", "-a" }, "cargo")
+        else
+            for _, line in ipairs(CARGO_UPDATE_HINT) do io.stdout:write(line) end
+            io.stdout:flush()
+        end
+    end
+
+    io.stdout:write("\n" .. string.rep("═", 80) .. "\n")
+    if #failures == 0 then
+        io.stdout:write("\27[1;32m✔ Сквозное обновление завершено.\27[0m\n\n")
+    else
+        io.stdout:write(string.format("\27[1;31m✘ Сквозное обновление завершено с ошибками: %s\27[0m\n\n", table.concat(failures, ", ")))
+        ctx.fail("Обновление завершилось с ошибками: " .. table.concat(failures, ", "))
+    end
+end
+
 -- 4.1. Обновление пакетов
 local function handle_update(manager, args)
     args = args or {}
 
-    -- Сквозное обновление всех активных менеджеров системы
     if not manager or manager == "all" then
-        io.stdout:write(string.format("\n\27[1;32m🔄 Сквозное обновление активных пакетных менеджеров системы...\27[0m\n"))
-        io.stdout:write(string.rep("═", 80) .. "\n")
-
-        -- 1. Системные пакеты хоста: Yay (приоритет на Arch) -> Pacman -> DNF -> APT
-        if has_binary("yay") then
-            io.stdout:write(string.format("\n\27[1;35m[Yay / AUR]\27[0m \27[1mОбновление системных и AUR пакетов Arch Linux...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "yay", "-Syu" })
-        elseif has_binary("pacman") then
-            io.stdout:write(string.format("\n\27[1;32m[Pacman]\27[0m \27[1mОбновление системных пакетов Arch Linux...\27[0m\n"))
-            io.stdout:write("\27[90mЗапуск sudo pacman -Syu с интерактивным терминалом...\27[0m\n")
-            io.stdout:flush()
-            ctx.run_interactive({ "sudo", "pacman", "-Syu" })
-        elseif has_binary("dnf") then
-            io.stdout:write(string.format("\n\27[1;34m[DNF]\27[0m \27[1mОбновление системных пакетов Fedora...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "sudo", "dnf", "upgrade", "-y" })
-        elseif has_binary("apt") then
-            io.stdout:write(string.format("\n\27[1;31m[APT]\27[0m \27[1mОбновление системных пакетов Debian/Ubuntu...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "sudo", "apt", "update" })
-            ctx.run_interactive({ "sudo", "apt", "upgrade", "-y" })
-        end
-
-        -- 2. Flatpak
-        if has_binary("flatpak") then
-            io.stdout:write(string.format("\n\27[1;34m[Flatpak]\27[0m \27[1mОбновление Flatpak-приложений и runtime...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "flatpak", "update", "-y" })
-        end
-
-        -- 3. Nix
-        if has_binary("nix") then
-            io.stdout:write(string.format("\n\27[1;36m[Nix]\27[0m \27[1mОбновление пакетов Nix-профиля...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "nix", "profile", "upgrade", ".*" })
-        end
-
-        -- 4. Distrobox
-        if has_binary("distrobox") then
-            local target_box = get_distrobox_target()
-            if target_box then
-                io.stdout:write(string.format("\n\27[1;35m[Distrobox: %s]\27[0m \27[1mОбновление пакетов контейнера...\27[0m\n", target_box))
-                io.stdout:flush()
-                ctx.run_interactive({ "distrobox", "enter", target_box, "--", "sudo", "dnf", "upgrade", "-y" })
-            end
-        end
-
-        -- 5. Pipx
-        if has_binary("pipx") then
-            io.stdout:write(string.format("\n\27[1;33m[Pipx]\27[0m \27[1mОбновление Python CLI пакетов (pipx)...\27[0m\n"))
-            io.stdout:flush()
-            ctx.run_interactive({ "pipx", "upgrade-all" })
-        end
-
-        -- 6. Cargo
-        if has_binary("cargo") then
-            io.stdout:write(string.format("\n\27[1;31m[Cargo]\27[0m \27[1mОбновление установленных Rust бинарников...\27[0m\n"))
-            io.stdout:flush()
-            local has_cargo_update = has_binary("cargo-install-update")
-            if not has_cargo_update then
-                local chk = ctx.capture({ "cargo", "install-update", "--version" })
-                if chk.code == 0 then has_cargo_update = true end
-            end
-            if has_cargo_update then
-                ctx.run_interactive({ "cargo", "install-update", "-a" })
-            else
-                io.stdout:write("  \27[33mℹ Для автообновления всех бинарников Cargo требуется cargo-install-update.\27[0m\n")
-                io.stdout:write("  \27[90mУстановить: grime pkg yay install cargo-update (или cargo install cargo-update)\27[0m\n")
-                io.stdout:flush()
-            end
-        end
-
-        io.stdout:write("\n" .. string.rep("═", 80) .. "\n")
-        io.stdout:write("\27[1;32m✔ Сквозное обновление завершено.\27[0m\n\n")
-        return
+        return handle_update_all()
     end
 
     -- Обновление конкретного менеджера
@@ -924,58 +1024,31 @@ local function handle_update(manager, args)
             ctx.fail("Flatpak не установлен в системе")
             return
         end
-        local cmd = { "flatpak", "update", "-y" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        io.stdout:write(string.format("\n\27[1;34m[Flatpak]\27[0m \27[1mОбновление пакетов Flatpak...\27[0m\n"))
-        io.stdout:flush()
-        local ret = ctx.run_interactive(cmd)
-        if ret ~= 0 then
-            ctx.fail(string.format("Обновление Flatpak завершилось с ошибкой (код %d)", ret))
-        end
+        banner("1;34", "Flatpak", "Обновление пакетов Flatpak...")
+        run_checked(with_args({ "flatpak", "update", "-y" }, args), "Обновление Flatpak")
     elseif manager == "yay" then
         if not has_binary("yay") then
             ctx.fail("yay не установлен в системе")
             return
         end
-        local cmd = { "yay", "-Syu" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        io.stdout:write(string.format("\n\27[1;35m[Yay / AUR]\27[0m \27[1mОбновление системных и AUR пакетов Arch Linux...\27[0m\n"))
-        io.stdout:flush()
-        local ret = ctx.run_interactive(cmd)
-        if ret ~= 0 then
-            ctx.fail(string.format("Обновление через yay завершилось с ошибкой (код %d)", ret))
-        end
+        banner("1;35", "Yay / AUR", "Обновление системных и AUR пакетов Arch Linux...")
+        run_checked(with_args({ "yay", "-Syu" }, args), "Обновление через yay")
     elseif manager == "pacman" or manager == "host" then
         if not has_binary("pacman") then
             ctx.fail("pacman не установлен в системе")
             return
         end
-        local cmd = { "sudo", "pacman", "-Syu" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        io.stdout:write(string.format("\n\27[1;32m[Pacman]\27[0m \27[1mОбновление системных пакетов Arch Linux...\27[0m\n"))
+        banner("1;32", "Pacman", "Обновление системных пакетов Arch Linux...")
         io.stdout:write("\27[90mЗапуск sudo pacman -Syu с интерактивным терминалом...\27[0m\n")
         io.stdout:flush()
-        local ret = ctx.run_interactive(cmd)
-        if ret ~= 0 then
-            ctx.fail(string.format("Обновление pacman завершилось с ошибкой (код %d)", ret))
-        end
+        run_checked(with_args({ "sudo", "pacman", "-Syu" }, args), "Обновление pacman")
     elseif manager == "nix" then
         if not has_binary("nix") then
             ctx.fail("Nix не установлен в системе")
             return
         end
-        local cmd = { "nix", "profile", "upgrade" }
-        if #args > 0 then
-            for _, p in ipairs(args) do table.insert(cmd, p) end
-        else
-            table.insert(cmd, ".*")
-        end
-        io.stdout:write(string.format("\n\27[1;36m[Nix]\27[0m \27[1mОбновление пакетов Nix-профиля...\27[0m\n"))
-        io.stdout:flush()
-        local ret = ctx.run_interactive(cmd)
-        if ret ~= 0 then
-            ctx.fail(string.format("Обновление Nix-профиля завершилось с ошибкой (код %d)", ret))
-        end
+        banner("1;36", "Nix", "Обновление пакетов Nix-профиля...")
+        run_checked(with_args({ "nix", "profile", "upgrade" }, #args > 0 and args or { ".*" }), "Обновление Nix-профиля")
     elseif manager == "distrobox" or manager == "box" then
         if not has_binary("distrobox") then
             ctx.fail("distrobox не установлен в системе")
@@ -986,14 +1059,8 @@ local function handle_update(manager, args)
             ctx.fail("Активный контейнер Distrobox не найден")
             return
         end
-        local cmd = { "distrobox", "enter", target_box, "--", "sudo", "dnf", "upgrade", "-y" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        io.stdout:write(string.format("\n\27[1;35m[Distrobox: %s]\27[0m \27[1mОбновление пакетов контейнера...\27[0m\n", target_box))
-        io.stdout:flush()
-        local ret = ctx.run_interactive(cmd)
-        if ret ~= 0 then
-            ctx.fail(string.format("Обновление в Distrobox завершилось с ошибкой (код %d)", ret))
-        end
+        banner("1;35", "Distrobox: " .. target_box, "Обновление пакетов контейнера...")
+        run_checked(with_args({ "distrobox", "enter", target_box, "--", "sudo", "dnf", "upgrade", "-y" }, args), "Обновление в Distrobox")
     elseif manager == "pipx" then
         if not has_binary("pipx") then
             ctx.fail("pipx не установлен в системе")
@@ -1001,54 +1068,34 @@ local function handle_update(manager, args)
         end
         if #args > 0 then
             for _, p in ipairs(args) do
-                io.stdout:write(string.format("\n\27[1;33m[Pipx]\27[0m \27[1mОбновление %s...\27[0m\n", p))
-                ctx.run_interactive({ "pipx", "upgrade", p })
+                banner("1;33", "Pipx", "Обновление " .. p .. "...")
+                run_checked({ "pipx", "upgrade", p }, "Обновление pipx (" .. p .. ")")
             end
         else
-            io.stdout:write(string.format("\n\27[1;33m[Pipx]\27[0m \27[1mОбновление всех пакетов pipx...\27[0m\n"))
-            local ret = ctx.run_interactive({ "pipx", "upgrade-all" })
-            if ret ~= 0 then
-                ctx.fail(string.format("Обновление pipx завершилось с ошибкой (код %d)", ret))
-            end
+            banner("1;33", "Pipx", "Обновление всех пакетов pipx...")
+            run_checked({ "pipx", "upgrade-all" }, "Обновление pipx")
         end
     elseif manager == "cargo" then
         if not has_binary("cargo") then
             ctx.fail("Cargo не установлен в системе")
             return
         end
-        local has_cargo_update = has_binary("cargo-install-update")
-        if not has_cargo_update then
-            local chk = ctx.capture({ "cargo", "install-update", "--version" })
-            if chk.code == 0 then has_cargo_update = true end
-        end
+        local has_cargo_update = has_cargo_install_update()
         if #args > 0 then
-            if has_cargo_update then
-                local cmd = { "cargo", "install-update" }
-                for _, p in ipairs(args) do table.insert(cmd, p) end
-                ctx.run_interactive(cmd)
-            else
-                local cmd = { "cargo", "install" }
-                for _, p in ipairs(args) do table.insert(cmd, p) end
-                ctx.run_interactive(cmd)
-            end
+            local base = has_cargo_update and { "cargo", "install-update" } or { "cargo", "install" }
+            run_checked(with_args(base, args), "Обновление Cargo")
+        elseif has_cargo_update then
+            run_checked({ "cargo", "install-update", "-a" }, "Обновление Cargo")
         else
-            if has_cargo_update then
-                ctx.run_interactive({ "cargo", "install-update", "-a" })
-            else
-                io.stdout:write("  \27[33mℹ Для автообновления всех бинарников Cargo требуется cargo-install-update.\27[0m\n")
-                io.stdout:write("  \27[90mУстановить: grime pkg yay install cargo-update (или cargo install cargo-update)\27[0m\n")
-                io.stdout:flush()
-            end
+            for _, line in ipairs(CARGO_UPDATE_HINT) do io.stdout:write(line) end
+            io.stdout:flush()
         end
     elseif manager == "dnf" then
-        local cmd = { "sudo", "dnf", "upgrade", "-y" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        ctx.run_interactive(cmd)
+        run_checked(with_args({ "sudo", "dnf", "upgrade", "-y" }, args), "Обновление dnf")
     elseif manager == "apt" then
-        ctx.run_interactive({ "sudo", "apt", "update" })
-        local cmd = { "sudo", "apt", "upgrade", "-y" }
-        for _, p in ipairs(args) do table.insert(cmd, p) end
-        ctx.run_interactive(cmd)
+        if run_checked({ "sudo", "apt", "update" }, "apt update") == 0 then
+            run_checked(with_args({ "sudo", "apt", "upgrade", "-y" }, args), "Обновление apt")
+        end
     elseif manager == "apps" or manager == "app" then
         io.stdout:write("  \27[33mℹ Локальные микросервисы Grime Apps (~/.config/grime/apps) управляются через Git и Flakes.\27[0m\n")
         io.stdout:write("  \27[90mДля обновления используйте: grime nix update или grime git pull\27[0m\n")
@@ -1216,7 +1263,9 @@ local function find_flatpak_app(target_name)
     for _, item in ipairs(pkgs) do
         local app_id = item.details or ""
         local name = item.name or ""
-        if app_id:lower():match("%." .. t_lower .. "$") or app_id:lower():match("%." .. t_lower .. "%..*") then
+        local id_lower = app_id:lower()
+        local dotted = "." .. t_lower
+        if id_lower:sub(-#dotted) == dotted or id_lower:find(dotted .. ".", 1, true) then
             return app_id, name
         end
     end
@@ -1271,10 +1320,10 @@ end
 
 -- Поиск утилиты в активном или указанном контейнере Distrobox
 local function find_distrobox_binary(cmd, box_name)
-    if not cmd or cmd == "" or not has_binary("distrobox") then return nil, nil end
+    if not cmd or cmd == "" or not (has_binary("distrobox") or has_binary("distrobox-host-exec")) then return nil, nil end
     local target_box = box_name or get_distrobox_target()
     if not target_box then return nil, nil end
-    local res = ctx.capture({ "distrobox", "enter", target_box, "--", "sh", "-c", "command -v " .. utils.shell_escape(cmd) })
+    local res = box_capture(target_box, { "sh", "-c", "command -v " .. utils.shell_escape(cmd) })
     if res.code == 0 and res.stdout and res.stdout:match("%S") then
         local found = res.stdout:match("^%s*(.-)%s*$")
         if found and #found > 0 then
@@ -1300,6 +1349,10 @@ end
 
 -- Запуск локального микросервиса Grime App
 local function run_grime_app(target_name, run_args)
+    local name_ok, name_why = utils.valid_name(target_name)
+    if not name_ok then
+        return false, string.format("Недопустимое имя приложения '%s': %s", tostring(target_name), name_why)
+    end
     local apps_root = get_apps_root()
     local app_dir = apps_root .. "/" .. target_name
     if not ctx.exists(app_dir) or not ctx.is_dir(app_dir) then
@@ -1312,13 +1365,14 @@ local function run_grime_app(target_name, run_args)
         if not m then
             return false, err or ("Не удалось загрузить манифест приложения: " .. target_name)
         end
+        if app_mod.reset_failed then app_mod.reset_failed() end
         local ret = app_mod.run_app(target_name, m, app_dir, run_args, false)
         if ret ~= 0 then
             return false, string.format("Приложение '%s' завершилось с ошибкой (код %d)", target_name, ret)
         end
         return true
     else
-        local proc = { "grime", "app", target_name }
+        local proc = { utils.self_exe(), "app", target_name }
         for _, a in ipairs(run_args) do
             table.insert(proc, a)
         end
@@ -1330,11 +1384,7 @@ local function run_grime_app(target_name, run_args)
     end
 end
 
-local FORBIDDEN_HOST_ROOTS = utils.FORBIDDEN_HOST_ROOTS
-local normalize_path = function(path, cwd) return utils.normalize_path(path, cwd, ctx) end
-local is_path_forbidden = utils.is_path_forbidden
 local classify_paths = function(cmd, args) return utils.classify_paths(cmd, args, nil, ctx) end
-local is_root_user = function() return utils.is_root_user(ctx) end
 local build_nix_shell_command = utils.build_nixgl_wrapper
 
 -- Утилиты, требующие повышенных привилегий (root / CAP_NET_RAW / прямой доступ к оборудованию) по умолчанию
@@ -1494,7 +1544,7 @@ local function find_locally_installed(cmd)
     -- 1. Grime Apps (~/.config/grime/apps/<cmd>)
     local apps_root = get_apps_root()
     local app_dir = apps_root .. "/" .. cmd
-    if ctx.exists(app_dir) and ctx.is_dir(app_dir) then
+    if utils.valid_name(cmd) and ctx.exists(app_dir) and ctx.is_dir(app_dir) then
         return { type = "app", name = cmd, dir = app_dir }
     end
 
@@ -1531,33 +1581,41 @@ local function find_locally_installed(cmd)
     return nil
 end
 
--- Унифицированное исполнение найденной локальной утилиты
+-- Унифицированное исполнение найденной (или явно выбранной) утилиты.
+-- Возвращает код возврата и признак того, что ошибка уже сообщена через fail
 local function execute_local_target(target, run_args, is_sudo, run_ctx)
     local c = run_ctx or ctx
+    run_args = run_args or {}
     local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
+    local sudo_label = is_sudo and " (sudo -E)" or ""
+
+    --- Запуск команды: argv = [sudo -E] binary args...
+    local function run_binary(binary)
+        local proc = is_sudo and { "sudo", "-E", binary } or { binary }
+        for _, a in ipairs(run_args) do table.insert(proc, a) end
+        return c.run_interactive(proc)
+    end
 
     if target.type == "app" then
         local ok, err = run_grime_app(target.name, run_args)
         if not ok and err then
             c.fail(err)
-            return 1
+            return 1, true
         end
         return 0
     elseif target.type == "host" then
-        c.log(string.format("[Grime Pkg] Запуск системной утилиты [хост%s]: %s%s...", is_sudo and " (sudo -E)" or "", target.binary, args_str))
-        local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
-        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
-        return c.run_interactive(proc)
+        c.log(string.format("[Grime Pkg] Запуск системной утилиты [хост%s]: %s%s...", sudo_label, target.binary, args_str))
+        return run_binary(target.binary)
     elseif target.type == "flatpak" then
         c.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", target.id, target.id, args_str))
         local proc = is_sudo and { "sudo", "-E", "flatpak", "run", target.id } or { "flatpak", "run", target.id }
-        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
+        for _, a in ipairs(run_args) do table.insert(proc, a) end
         return c.run_interactive(proc)
     elseif target.type == "nix_profile" then
         local allowed, reason = classify_paths(target.binary, run_args)
         if not allowed then
             c.fail(string.format("[Grime Pkg] Отказ: %s", reason))
-            return 1
+            return 1, true
         end
         local use_sudo = is_sudo or is_root_user()
         local shell_cmd = build_nix_shell_command(target.binary, run_args, use_sudo)
@@ -1565,16 +1623,43 @@ local function execute_local_target(target, run_args, is_sudo, run_ctx)
         return c.run_interactive({ "sh", "-c", shell_cmd })
     elseif target.type == "distrobox" then
         c.log(string.format("[Grime Pkg] Запуск утилиты в Distrobox [%s]: %s%s...", target.box, target.binary, args_str))
-        local proc = { "distrobox", "enter", target.box, "--", target.binary }
-        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
-        return c.run_interactive(proc)
+        local proc = { target.binary }
+        for _, a in ipairs(run_args) do table.insert(proc, a) end
+        local bx = box_module()
+        if bx then return bx.exec(target.box, proc) end
+        return c.run_interactive({ "distrobox", "enter", target.box, "--", table.unpack(proc) })
     else
         -- cargo, local, go
-        c.log(string.format("[Grime Pkg] Запуск утилиты [%s%s]: %s%s...", target.type, is_sudo and " (sudo -E)" or "", target.binary, args_str))
-        local proc = is_sudo and { "sudo", "-E", target.binary } or { target.binary }
-        for _, a in ipairs(run_args or {}) do table.insert(proc, a) end
-        return c.run_interactive(proc)
+        c.log(string.format("[Grime Pkg] Запуск утилиты [%s%s]: %s%s...", target.type, sudo_label, target.binary, args_str))
+        return run_binary(target.binary)
     end
+end
+
+--- Цель запуска для явно указанного менеджера. Возвращает target либо nil, сообщение об ошибке.
+--- Для nix без бинарника в профиле возвращает nil без сообщения (запуск через nix shell).
+local function explicit_target(manager, name)
+    if manager == "flatpak" then
+        return { type = "flatpak", id = (find_flatpak_app(name)) or name }
+    elseif manager == "apps" or manager == "app" then
+        return { type = "app", name = name }
+    elseif manager == "pacman" or manager == "host" then
+        return { type = "host", binary = name }
+    elseif manager == "nix" then
+        local nix_bin = find_nix_profile_binary(name)
+        if nix_bin then return { type = "nix_profile", binary = nix_bin } end
+        return nil
+    elseif manager == "cargo" then
+        local cargo_bin = HOME .. "/.cargo/bin/" .. name
+        local local_bin = HOME .. "/.local/bin/" .. name
+        local bin = ctx.exists(cargo_bin) and cargo_bin or (ctx.exists(local_bin) and local_bin or nil)
+        if bin then return { type = "cargo", binary = bin } end
+        return nil, string.format("Утилита Cargo '%s' не найдена в ~/.cargo/bin или ~/.local/bin", name)
+    elseif manager == "distrobox" or manager == "box" then
+        local box = get_distrobox_target()
+        if not box then return nil, "Активный контейнер Distrobox не найден" end
+        return { type = "distrobox", box = box, binary = name }
+    end
+    return nil, "Неизвестный менеджер для запуска: " .. tostring(manager)
 end
 
 -- Справка по запуску утилит
@@ -1626,23 +1711,10 @@ end
 
 -- 5. Мультипакетный запуск утилит и приложений
 local function handle_run(manager, packages, command_tokens)
-    local filtered_packages = {}
-    for _, p in ipairs(packages or {}) do
-        if p ~= "--nv" and p ~= "--prime" and p ~= "--nvidia" and p ~= "--gl" and p ~= "--gpu" and p ~= "--no-gpu" then
-            table.insert(filtered_packages, p)
-        end
-    end
-    packages = filtered_packages
+    packages = strip_gpu_flags(packages)
+    command_tokens = strip_gpu_flags(command_tokens)
 
-    local filtered_cmd = {}
-    for _, ct in ipairs(command_tokens or {}) do
-        if ct ~= "--nv" and ct ~= "--prime" and ct ~= "--nvidia" and ct ~= "--gl" and ct ~= "--gpu" and ct ~= "--no-gpu" then
-            table.insert(filtered_cmd, ct)
-        end
-    end
-    command_tokens = filtered_cmd
-
-    if not packages or #packages == 0 then
+    if #packages == 0 then
         ctx.fail("Укажите имя пакета или приложения для запуска\nИспользование: grime pkg run [менеджер] <утилита> [аргументы...]\nДля подробной справки: grime pkg run --help")
         return
     end
@@ -1652,7 +1724,7 @@ local function handle_run(manager, packages, command_tokens)
     for i = 2, #packages do
         table.insert(run_args, packages[i])
     end
-    for _, ct in ipairs(command_tokens or {}) do
+    for _, ct in ipairs(command_tokens) do
         table.insert(run_args, ct)
     end
 
@@ -1678,103 +1750,30 @@ local function handle_run(manager, packages, command_tokens)
         ctx.log(string.format("[Grime Pkg] Утилита '%s' требует повышенных привилегий (RAW-сокеты/доступ к оборудованию). Запуск через sudo -E...", target_name))
     end
 
-    -- Если менеджер явно указан
+    -- Менеджер указан явно
     if manager then
-        if manager == "flatpak" then
-            local flatpak_id = find_flatpak_app(target_name) or target_name
-            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-            ctx.log(string.format("[Grime Pkg] Запуск Flatpak-приложения [%s]: %s%s...", flatpak_id, flatpak_id, args_str))
-            local proc = is_sudo and { "sudo", "-E", "flatpak", "run", flatpak_id } or { "flatpak", "run", flatpak_id }
-            for _, a in ipairs(run_args) do
-                table.insert(proc, a)
-            end
-            local ret = ctx.run_process(proc)
-            if ret ~= 0 then
-                ctx.fail(string.format("Flatpak-приложение '%s' завершилось с ошибкой (код %d)", flatpak_id, ret))
-            end
-            return
-        elseif manager == "apps" or manager == "app" then
-            local ok, err = run_grime_app(target_name, run_args)
-            if not ok then
+        local target, err = explicit_target(manager, target_name)
+        if not target then
+            if err then
                 ctx.fail(err)
-            end
-            return
-        elseif manager == "pacman" or manager == "host" then
-            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-            ctx.log(string.format("[Grime Pkg] Запуск системной утилиты [хост%s]: %s%s...", is_sudo and " (sudo -E)" or "", target_name, args_str))
-            local proc = is_sudo and { "sudo", "-E", target_name } or { target_name }
-            for _, a in ipairs(run_args) do
-                table.insert(proc, a)
-            end
-            local ret = ctx.run_process(proc)
-            if ret ~= 0 then
-                ctx.fail(string.format("Системная утилита '%s' завершилась с ошибкой (код %d)", target_name, ret))
-            end
-            return
-        elseif manager == "nix" then
-            local nix_bin = find_nix_profile_binary(target_name)
-            if nix_bin then
-                local use_sudo = is_sudo or is_root_user()
-                local shell_cmd = build_nix_shell_command(target_name, run_args, use_sudo)
-                ctx.log(string.format("[Grime Pkg] Запуск из Nix-профиля [%s%s]: %s...", nix_bin, use_sudo and " (sudo -E)" or "", target_name))
-                local ret = ctx.run_process({ "sh", "-c", shell_cmd })
-                if ret ~= 0 then
-                    ctx.fail(string.format("Утилита Nix '%s' завершилась с ошибкой (код %d)", target_name, ret))
-                end
-                return
             else
                 run_nix_shell(target_name, run_args, is_sudo)
-                return
             end
-        elseif manager == "cargo" then
-            local cargo_bin = (os.getenv("HOME") or "") .. "/.cargo/bin/" .. target_name
-            local local_bin = (os.getenv("HOME") or "") .. "/.local/bin/" .. target_name
-            local target_bin = ctx.exists(cargo_bin) and cargo_bin or (ctx.exists(local_bin) and local_bin or nil)
-            if target_bin then
-                local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-                ctx.log(string.format("[Grime Pkg] Запуск утилиты Cargo [%s%s]: %s%s...", target_bin, is_sudo and " (sudo -E)" or "", target_name, args_str))
-                local proc = is_sudo and { "sudo", "-E", target_bin } or { target_bin }
-                for _, a in ipairs(run_args) do
-                    table.insert(proc, a)
-                end
-                local ret = ctx.run_process(proc)
-                if ret ~= 0 then
-                    ctx.fail(string.format("Утилита '%s' завершилась с ошибкой (код %d)", target_name, ret))
-                end
-                return
-            else
-                ctx.fail(string.format("Утилита Cargo '%s' не найдена в ~/.cargo/bin или ~/.local/bin", target_name))
-                return
-            end
-        elseif manager == "distrobox" or manager == "box" then
-            local target_box = get_distrobox_target()
-            if not target_box then
-                ctx.fail("Активный контейнер Distrobox не найден")
-                return
-            end
-            local args_str = #run_args > 0 and (" " .. table.concat(run_args, " ")) or ""
-            ctx.log(string.format("[Grime Pkg] Запуск утилиты в Distrobox [%s]: %s%s...", target_box, target_name, args_str))
-            local proc = { "distrobox", "enter", target_box, "--", target_name }
-            for _, a in ipairs(run_args) do
-                table.insert(proc, a)
-            end
-            local ret = ctx.run_process(proc)
-            if ret ~= 0 then
-                ctx.fail(string.format("Выполнение утилиты '%s' в Distrobox завершилось с ошибкой (код %d)", target_name, ret))
-            end
-            return
-        else
-            ctx.fail("Неизвестный менеджер для запуска: " .. tostring(manager))
             return
         end
+        local ret, reported = execute_local_target(target, run_args, is_sudo, ctx)
+        if ret ~= 0 and not reported then
+            ctx.fail(string.format("Запуск '%s' через %s завершился с ошибкой (код %s)", target_name, manager, tostring(ret)))
+        end
+        return
     end
 
     -- Менеджер НЕ указан: сквозной опрос ВСЕХ локальных окружений хоста и контейнеров
     local local_target = find_locally_installed(target_name)
     if local_target then
-        local ret = execute_local_target(local_target, run_args, is_sudo, ctx)
-        if ret ~= 0 then
-            ctx.fail(string.format("Выполнение '%s' завершилось с кодом ошибки %d", target_name, ret))
+        local ret, reported = execute_local_target(local_target, run_args, is_sudo, ctx)
+        if ret ~= 0 and not reported then
+            ctx.fail(string.format("Выполнение '%s' завершилось с кодом ошибки %s", target_name, tostring(ret)))
         end
         return
     end
@@ -1790,6 +1789,7 @@ end
 
 local function handle_not_found(args, run_ctx)
     local context = run_ctx or ctx
+    reset_caches()
     if not args or #args == 0 then
         context.fail("Не указана команда для поиска (код 127)")
         return
@@ -1847,8 +1847,8 @@ local function handle_not_found(args, run_ctx)
     -- 3. СКВОЗНОЙ ОПРОС ВСЕХ ЛОКАЛЬНЫХ СРЕД И КОНТЕЙНЕРОВ
     local local_target = find_locally_installed(cmd)
     if local_target then
-        local code = execute_local_target(local_target, cmd_args, is_sudo, context)
-        if code and code ~= 0 then
+        local code, reported = execute_local_target(local_target, cmd_args, is_sudo, context)
+        if code and code ~= 0 and not reported then
             context.fail(string.format("Команда '%s' завершилась с кодом %d", cmd, code))
         end
         return
@@ -1906,19 +1906,28 @@ local function handle_not_found(args, run_ctx)
 
     -- 4. Нечеткий поиск опечаток (fuzzy did-you-mean) по установленным утилитам
     local candidates = {}
+    local seen_dirs, seen_names = {}, {}
+    local function add_candidate(name)
+        if name and name ~= "" and not seen_names[name] then
+            seen_names[name] = true
+            table.insert(candidates, name)
+        end
+    end
     local path_env = os.getenv("PATH") or ""
     for dir in path_env:gmatch("[^:]+") do
-        local ok, files = pcall(fs.list, dir)
-        if ok and type(files) == "table" then
-            for _, f in ipairs(files) do table.insert(candidates, f) end
+        if not seen_dirs[dir] then
+            seen_dirs[dir] = true
+            local ok, files = pcall(fs.list, dir)
+            if ok and type(files) == "table" then
+                for _, f in ipairs(files) do add_candidate(f) end
+            end
         end
     end
     local flatpaks = get_flatpak_packages(false)
     if flatpaks then
         for _, f in ipairs(flatpaks) do
-            table.insert(candidates, f.name)
-            local app_tail = f.details:match("%.([^%.]+)$")
-            if app_tail then table.insert(candidates, app_tail) end
+            add_candidate(f.name)
+            add_candidate(f.details:match("%.([^%.]+)$"))
         end
     end
 
@@ -2001,7 +2010,8 @@ local function lookup_pkg_action(tok)
     return nil
 end
 
-function main()
+local function main()
+    reset_caches()
     local raw_args = ctx.args or {}
 
     -- Проверка явного вызова общей справки: grime pkg -h, grime pkg --help, grime pkg -flatpak --help
@@ -2053,13 +2063,7 @@ function main()
             local run_tokens, cmd_tokens = grime.args.split_passthrough(raw_slice)
 
             -- Очистка от устаревших флагов при необходимости (только до разделителя)
-            local clean_run_tokens = {}
-            for _, t in ipairs(run_tokens) do
-                if t ~= "--nv" and t ~= "--prime" and t ~= "--nvidia" and t ~= "--gl" and t ~= "--gpu" and t ~= "--no-gpu" then
-                    table.insert(clean_run_tokens, t)
-                end
-            end
-            run_tokens = clean_run_tokens
+            run_tokens = strip_gpu_flags(run_tokens)
 
             -- Проверяем, является ли первый токен именем менеджера СО ЗНАКОМ МИНУС (-nix, -pacman, -flatpak, -box)
             -- Без знака минус токены (например python, cargo, man) считаются именем бинарника!
@@ -2196,12 +2200,14 @@ function main()
     end
 
     if action == "install" then
+        -- Форматы: `-i <pkg...>` (менеджер хоста по умолчанию) и `-i <менеджер> <pkg...>`.
+        -- Первый токен считается менеджером только при наличии пакетов после него.
         local mgr = cat_mgr
-        if not mgr then
-            local first_tok = table.remove(raw_tokens, 1)
-            mgr = resolve_manager(first_tok) or first_tok or "pacman"
+        if not mgr and #raw_tokens >= 2 then
+            mgr = resolve_manager(raw_tokens[1])
+            if mgr then table.remove(raw_tokens, 1) end
         end
-        handle_install(mgr, raw_tokens)
+        handle_install(mgr or default_host_manager(), raw_tokens)
         return
     end
 
@@ -2219,7 +2225,7 @@ function main()
     end
 
     if action == "init" then
-        ctx.run_process({ "grime", "nix", "init" }, ctx.target_dir or ".")
+        ctx.run_process({ utils.self_exe(), "nix", "init" }, ctx.target_dir or ".")
         return
     end
 
@@ -2267,5 +2273,4 @@ end
 
 return {
     main = main,
-    description = description,
 }

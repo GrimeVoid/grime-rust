@@ -1,6 +1,6 @@
--- Summary: Выполнение внешних команд в контексте целевой директории конвейера
--- Description: Выполнение внешних команд в контексте целевой директории конвейера
-description = "Выполнение внешних команд в контексте целевой директории конвейера"
+--@grime description: Выполнение внешних команд в контексте целевой директории конвейера
+--@grime alias: exec
+
 
 local ctx = grime.ctx
 
@@ -35,7 +35,7 @@ local function print_help()
     ))
 end
 
-function main()
+local function main()
     local raw_args = ctx.args or {}
     local tokens_before, command_tokens, has_sep = grime.args.split_passthrough(raw_args)
     local args = {}
@@ -136,5 +136,4 @@ end
 
 return {
     main = main,
-    description = description,
 }

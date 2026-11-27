@@ -1,7 +1,7 @@
--- Summary: Централизованный сбор, хранение и фильтрация логов системы
--- Description: Централизованный сбор, хранение и фильтрация логов системы
+--@grime description: Централизованный сбор, хранение и фильтрация логов системы
+--@grime requires: module:git
+
 -- Описание: Управление логами (кольцевой буфер StateBus, grime.jsonl, фильтрация ошибок, интеграция с Git)
-description = "Централизованный сбор, хранение и фильтрация логов системы"
 
 local ctx = grime.ctx
 local git = require("git")
@@ -19,7 +19,6 @@ local ANSI = {
 }
 
 local M = {}
-M.description = description
 
 local MAX_RING_BUFFER = 100
 
@@ -73,63 +72,93 @@ local function print_help()
     ))
 end
 
+-- Ротация grime.jsonl: при превышении порога остаются последние строки
+local MAX_LOG_BYTES = 1024 * 1024
+local KEEP_LOG_LINES = 1000
+-- Максимальный объём хвоста файла, читаемый за один раз
+local TAIL_BYTES = 256 * 1024
+
+local function is_error_level(entry)
+    local lvl = tostring(entry.level or ""):upper()
+    return lvl == "ERROR" or lvl == "WARN" or lvl == "FAIL"
+end
+
+--- Последние n элементов массива (копия), либо сам массив, если он короче
+local function tail_slice(list, n)
+    if #list <= n then return list end
+    local sliced = {}
+    for i = #list - n + 1, #list do
+        table.insert(sliced, list[i])
+    end
+    return sliced
+end
+
+--- Чтение хвоста файла (не более max_bytes) и разбор строк JSON Lines
+local function read_tail_entries(lfile, max_bytes)
+    local f = io.open(lfile, "r")
+    if not f then return {} end
+    local size = f:seek("end") or 0
+    local truncated = size > max_bytes
+    if truncated then f:seek("set", size - max_bytes) else f:seek("set", 0) end
+    local content = f:read("*a") or ""
+    f:close()
+
+    local entries = {}
+    local first = true
+    for line in content:gmatch("[^\r\n]+") do
+        -- первая строка усечённого хвоста может быть оборвана
+        if not (first and truncated) then
+            local ok, item = pcall(grime.json.decode, line)
+            if ok and type(item) == "table" then
+                table.insert(entries, item)
+            end
+        end
+        first = false
+    end
+    return entries
+end
+
 --- Загрузка записей из файла на диске (последние N записей)
 local function load_disk_entries(limit)
     local lfile = get_log_file()
     if not ctx.exists(lfile) then
         return {}
     end
-
-    local content = grime.fs.read(lfile)
-    if not content or #content == 0 then
-        return {}
-    end
-
-    local raw_lines = grime.str.split(content, "\n")
-    local entries = {}
-    for _, line in ipairs(raw_lines) do
-        local l = grime.str.trim(line)
-        if #l > 0 then
-            local ok, item = pcall(grime.json.decode, l)
-            if ok and type(item) == "table" then
-                table.insert(entries, item)
-            end
-        end
-    end
-
-    if limit and #entries > limit then
-        local sliced = {}
-        for i = #entries - limit + 1, #entries do
-            table.insert(sliced, entries[i])
-        end
-        return sliced
-    end
-
-    return entries
+    return tail_slice(read_tail_entries(lfile, TAIL_BYTES), limit or math.huge)
 end
 
---- Синхронизация истории в StateBus
+--- Ротация журнала на диске: оставляем последние KEEP_LOG_LINES строк
+local function rotate_log_if_needed(lfile)
+    local f = io.open(lfile, "r")
+    if not f then return end
+    local size = f:seek("end") or 0
+    f:close()
+    if size <= MAX_LOG_BYTES then return end
+
+    local f_in = io.open(lfile, "r")
+    if not f_in then return end
+    f_in:seek("set", math.max(0, size - TAIL_BYTES))
+    local content = f_in:read("*a") or ""
+    f_in:close()
+
+    local lines = {}
+    for line in content:gmatch("[^\r\n]+") do table.insert(lines, line) end
+    -- первая строка могла быть оборвана при смещении чтения
+    if size > TAIL_BYTES then table.remove(lines, 1) end
+    lines = tail_slice(lines, KEEP_LOG_LINES)
+
+    local f_out = io.open(lfile, "w")
+    if f_out then
+        f_out:write(table.concat(lines, "\n"), "\n")
+        f_out:close()
+    end
+end
+
+--- Запись полной истории (не более MAX_RING_BUFFER) в StateBus одним вызовом.
+--- Ошибки выводятся из истории при чтении (log.errors/log.latest отдельно не пишутся).
 local function sync_to_state_bus(entries)
     if not (grime and grime.bus) then return end
-
-    local bus_entries = {}
-    local errors = {}
-    local max_count = math.min(#entries, MAX_RING_BUFFER)
-    local start_idx = #entries - max_count + 1
-
-    for i = start_idx, #entries do
-        table.insert(bus_entries, entries[i])
-        local lvl = (entries[i].level or ""):upper()
-        if lvl == "ERROR" or lvl == "WARN" or lvl == "FAIL" then
-            table.insert(errors, entries[i])
-        end
-    end
-
-    pcall(grime.bus.set, "log.history", bus_entries)
-    if #bus_entries > 0 then
-        pcall(grime.bus.set, "log.latest", bus_entries[#bus_entries])
-    end
-    pcall(grime.bus.set, "log.errors", errors)
+    pcall(grime.bus.set, "log.history", tail_slice(entries, MAX_RING_BUFFER))
 end
 
 --- Добавление записи в лог (программный API и ядро)
@@ -147,29 +176,30 @@ function M.add(level, message, source, details)
         details = details or {},
     }
 
-    -- 1. Запись на диск в формате JSON Lines
+    -- 1. Запись на диск в формате JSON Lines (с ротацией)
     local lfile = get_log_file()
-    local json_str = grime.json.encode(entry)
     local f = io.open(lfile, "a")
     if f then
-        f:write(json_str .. "\n")
+        f:write(grime.json.encode(entry) .. "\n")
         f:close()
+        rotate_log_if_needed(lfile)
     end
 
-    -- 2. Обновление шины состояния
-    local current_history = {}
+    -- 2. Обновление кольцевого буфера в шине: одна запись истории на событие
+    local current_history
     local ok, bus_history = pcall(grime.bus.get, "log.history")
     if ok and type(bus_history) == "table" then
         current_history = bus_history
     else
         current_history = load_disk_entries(MAX_RING_BUFFER)
+        -- запись уже на диске: убираем её дубль из загруженного хвоста
+        local last = current_history[#current_history]
+        if last and last.timestamp == timestamp and last.message == msg and last.source == src then
+            current_history[#current_history] = nil
+        end
     end
 
     table.insert(current_history, entry)
-    while #current_history > MAX_RING_BUFFER do
-        table.remove(current_history, 1)
-    end
-
     sync_to_state_bus(current_history)
     return entry
 end
@@ -186,56 +216,29 @@ function M.error(message, source, details)
     return M.add("ERROR", message, source, details)
 end
 
---- Получение всей истории логов
-function M.get_history(limit)
-    local n = limit or 20
+--- Полная история (до MAX_RING_BUFFER записей): из шины, иначе с диска с восстановлением шины
+local function load_full_history()
     local ok, bus_history = pcall(grime.bus.get, "log.history")
     if ok and type(bus_history) == "table" and #bus_history > 0 then
-        if #bus_history <= n then return bus_history end
-        local sliced = {}
-        for i = #bus_history - n + 1, #bus_history do
-            table.insert(sliced, bus_history[i])
-        end
-        return sliced
+        return bus_history
     end
-
-    local disk = load_disk_entries(n)
-    sync_to_state_bus(disk)
+    local disk = load_disk_entries(MAX_RING_BUFFER)
+    if #disk > 0 then sync_to_state_bus(disk) end
     return disk
+end
+
+--- Получение последних limit записей истории (шина не урезается)
+function M.get_history(limit)
+    return tail_slice(load_full_history(), limit or 20)
 end
 
 --- Получение списка ошибок
 function M.get_errors(limit)
-    local n = limit or 10
-    local ok, bus_errs = pcall(grime.bus.get, "log.errors")
-    if ok and type(bus_errs) == "table" and #bus_errs > 0 then
-        if #bus_errs <= n then return bus_errs end
-        local sliced = {}
-        for i = #bus_errs - n + 1, #bus_errs do
-            table.insert(sliced, bus_errs[i])
-        end
-        return sliced
-    end
-
-    local all = load_disk_entries(MAX_RING_BUFFER)
     local errors = {}
-    for _, e in ipairs(all) do
-        local lvl = (e.level or ""):upper()
-        if lvl == "ERROR" or lvl == "WARN" or lvl == "FAIL" then
-            table.insert(errors, e)
-        end
+    for _, e in ipairs(load_full_history()) do
+        if is_error_level(e) then table.insert(errors, e) end
     end
-
-    sync_to_state_bus(all)
-
-    if #errors > n then
-        local sliced = {}
-        for i = #errors - n + 1, #errors do
-            table.insert(sliced, errors[i])
-        end
-        return sliced
-    end
-    return errors
+    return tail_slice(errors, limit or 10)
 end
 
 --- Очистка логов
@@ -247,8 +250,11 @@ function M.clear()
     end
     if grime and grime.bus then
         pcall(grime.bus.set, "log.history", {})
-        pcall(grime.bus.set, "log.latest", nil)
-        pcall(grime.bus.set, "log.errors", {})
+        -- устаревшие ключи прежних версий
+        if grime.bus.delete then
+            pcall(grime.bus.delete, "log.latest")
+            pcall(grime.bus.delete, "log.errors")
+        end
     end
     return true
 end
@@ -479,10 +485,6 @@ function M.main()
     else
         ctx.success(tostring(#entries))
     end
-end
-
-function main()
-    M.main()
 end
 
 return M

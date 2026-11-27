@@ -23,7 +23,7 @@ local function print_help()
 
 %sИСПОЛЬЗОВАНИЕ:%s
     grime doctor [help|-h|--help]
-    grime doctor -fix [--dry|-n] [--yes|-y] [описание проблемы…]
+    grime doctor -fix [-dry|-n] [-yes|-y] [описание проблемы…]
 
 %sОПИСАНИЕ:%s
     Проверяет доступность ключевых утилит (git, nix, distrobox, cargo, claude, aider),
@@ -35,12 +35,12 @@ local function print_help()
     journalctl, упавшие юниты, состояние pacman), маскирует секреты, показывает сводку
     и после подтверждения отправляет агенту. Агент даёт диагноз и скрипт <grime_fix>.
     Скрипт показывается целиком с SHA-256, списком строк sudo и рисками; запуск —
-    только после явного «y» (флаг --yes на запуск НЕ распространяется), в окне терминала,
+    только после явного «y» (флаг -yes на запуск НЕ распространяется), в окне терминала,
     где sudo сам запрашивает пароль (grime пароль не видит и не хранит). Скрипт
     эфемерный и удаляется после закрытия окна.
       -fix            включить режим ИИ-ремонта; остальные слова — описание проблемы
-      --dry, -n       ничего не отправлять и не запускать: показать сводку и промпт
-      --yes, -y       пропустить подтверждение ОТПРАВКИ контекста (не запуска скрипта)
+      -dry, -n        ничего не отправлять и не запускать: показать только сводку
+      -yes, -y        пропустить подтверждение ОТПРАВКИ контекста (не запуска скрипта)
     Настройки: ключ конфига doctor_agent (затем ai_agent, иначе claude);
     терминал берётся из $TERMINAL, по умолчанию ghostty (без дисплея — текущий TTY).
 ]],
@@ -605,9 +605,9 @@ local function parse_fix_args(args)
     for _, a in ipairs(args or {}) do
         if a == "-fix" or a == "--fix" then
             o.fix = true
-        elseif a == "--dry" or a == "-n" then
+        elseif a == "-dry" or a == "--dry" or a == "-n" then
             o.dry = true
-        elseif a == "--yes" or a == "-y" then
+        elseif a == "-yes" or a == "--yes" or a == "-y" then
             o.yes = true
         else
             words[#words + 1] = a
@@ -643,15 +643,14 @@ local function run_fix(opts)
     print(string.format("  Итого контекста: %d Б из %d Б (секреты замаскированы), промпт: %d Б\n", total, FIX_CONTEXT_LIMIT, #prompt))
 
     if opts.dry then
-        print(string.format("%s--dry: ничего не отправляется и не запускается. Промпт:%s\n", ANSI.DIM, ANSI.RESET))
-        print(prompt)
-        ctx.success("doctor_fix_dry")
+        print(string.format("%s-dry: ничего не отправляется и не запускается.%s", ANSI.DIM, ANSI.RESET))
+        ctx.success("")
         return
     end
 
     if not opts.yes then
         if not has_tty() then
-            ctx.fail("Отправка данных агенту требует подтверждения: в неинтерактивном режиме добавьте --yes (-y)")
+            ctx.fail("Отправка данных агенту требует подтверждения: в неинтерактивном режиме добавьте -yes (-y)")
             return
         end
         if not ask_yes("Отправить этот контекст ИИ-агенту?") then
@@ -850,7 +849,7 @@ local function main()
     if all_ok and #recent_errors == 0 then
         grime.ui.success("Диагностика Grime Doctor завершена: окружение и журнал ошибок в идеальном порядке!")
         log.info("Диагностика Doctor завершена успешно: все компоненты в порядке", "doctor")
-        ctx.success("doctor_ok")
+        ctx.success("")
     elseif all_ok and #recent_errors > 0 then
         grime.ui.warn(string.format("Диагностика компонентов пройдена, но в журнале зафиксировано %d сбоев.", #recent_errors))
         log.warn(string.format("Диагностика Doctor: обнаружены недавние сбои (%d)", #recent_errors), "doctor")

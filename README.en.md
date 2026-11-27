@@ -282,15 +282,15 @@ grime daemon -restart
 #### Diagnostics and AI repair (`doctor`)
 `grime doctor` checks for key tools (git, nix, distrobox, cargo, claude, aider), configured paths, the state of the log, and recent failures.
 
-`grime doctor -fix [--dry] [--yes] [problem description…]` — AI repair:
+`grime doctor -fix [-dry] [-yes] [problem description…]` — AI repair:
 
 1. Context is collected (the doctor report, log errors, the last failed command, `journalctl`, failed units, `pacman` state) and **secrets are masked**.
 2. You see a summary; after confirmation the context is sent to the agent (the `doctor_agent` key, then `ai_agent`, otherwise `claude`).
 3. The agent returns a diagnosis and a `<grime_fix>` script. The script is shown **in full**, with its SHA-256, the lines that escalate privileges, and the risks.
-4. It runs **only after an explicit interactive "y"** (the `--yes` flag does not extend to running the script), in a terminal window taken from `$TERMINAL` (default `ghostty`; without a display, the current TTY). The password for plain `sudo` is requested by the system itself: GRIME never sees or stores it.
+4. It runs **only after an explicit interactive "y"** (the `-yes` flag does not extend to running the script), in a terminal window taken from `$TERMINAL` (default `ghostty`; without a display, the current TTY). The password for plain `sudo` is requested by the system itself: GRIME never sees or stores it.
 5. The script lives in an ephemeral directory (0700) and is removed by a `trap` after the window closes.
 
-`--dry` sends and runs nothing — it only shows the summary and the prompt; `--yes` skips only the confirmation of **sending** the context.
+`-dry` sends and runs nothing — it only shows the summary; `-yes` skips only the confirmation of **sending** the context.
 
 ---
 

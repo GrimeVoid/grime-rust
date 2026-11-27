@@ -93,7 +93,7 @@ Runs an arbitrary command in the pipeline's working directory: `grime project My
 - `grime log -list [n] | -errors [n] | -git | -clear | -add <level> <msg>`.
 - `grime bus -get|-set|-has|-rm|-list|-emit` — shared state; keys need a namespace (`build.ready`).
 - `grime daemon -status|-ping|-start|-stop|-restart|-feed|-dump|-clear`.
-- `grime doctor` — diagnostics; `grime doctor -fix [--dry] [--yes]` — AI repair (the script is shown in full with SHA-256 and runs only after an interactive "y").
+- `grime doctor` — diagnostics; `grime doctor -fix [-dry] [-yes]` — AI repair (the script is shown in full with SHA-256 and runs only after an interactive "y").
 
 ### `ai`
 Orchestrates the **Claude Code** and **Aider** agents (adapters in `modules/agents/`).

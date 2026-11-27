@@ -101,7 +101,7 @@ function main()
         end
     end
 
-    local is_interactive_target = (program == "nvim" or program == "vim" or program == "nano" or program == "yazi" or program == "fzf" or program == "aider")
+    local is_interactive_target = (program == "nvim" or program == "vim" or program == "nano" or program == "yazi" or program == "fzf" or program == "aider" or program == "claude")
     local should_stream = (input ~= nil and #input > 0) or ctx.has_next_step
 
     if should_stream and not is_interactive_target then

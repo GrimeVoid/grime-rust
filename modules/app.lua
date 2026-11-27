@@ -5,7 +5,7 @@ description = "Управление жизненным циклом локаль
 local utils = require("languages.utils")
 local BaseAdapter = require("languages.base")
 local scanner = require("languages.scanner")
-local aider = require("aider")
+local ai = require("ai")
 local git = require("git")
 local log = require("log")
 
@@ -1379,15 +1379,15 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
     -- Комплексное архитектурное проектирование стека и библиотек Nixpkgs:
     -- Язык из промпта или флага -lang имеет приоритет, но Архитектор ОБЯЗАН определить
     -- библиотеки Nixpkgs (special_dependencies) и параметры сборки/запуска
-    local prompt_lang = (user_prompt ~= "" and aider.extract_lang_from_prompt) and aider.extract_lang_from_prompt(user_prompt) or nil
-    local name_lang = (aider.extract_lang_from_prompt and app_name) and aider.extract_lang_from_prompt(app_name) or nil
+    local prompt_lang = (user_prompt ~= "" and ai.extract_lang_from_prompt) and ai.extract_lang_from_prompt(user_prompt) or nil
+    local name_lang = (ai.extract_lang_from_prompt and app_name) and ai.extract_lang_from_prompt(app_name) or nil
     local explicit = prompt_lang or explicit_lang or name_lang
 
     local stack_plan = nil
-    if aider.plan_app_stack and user_prompt ~= "" then
-        stack_plan = aider.plan_app_stack(user_prompt, explicit, app_name)
-    elseif aider.classify_stack and user_prompt ~= "" then
-        local l, sp = aider.classify_stack(user_prompt, explicit)
+    if ai.plan_app_stack and user_prompt ~= "" then
+        stack_plan = ai.plan_app_stack(user_prompt, explicit, app_name)
+    elseif ai.classify_stack and user_prompt ~= "" then
+        local l, sp = ai.classify_stack(user_prompt, explicit)
         stack_plan = sp or { lang = l, special_dependencies = {} }
     else
         stack_plan = { lang = explicit or "python", special_dependencies = {} }
@@ -1403,8 +1403,8 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
         ctx.log(string.format("Архитектор подключил зависимости Nix: %s", table.concat(stack_plan.special_dependencies, ", ")))
     end
 
-    if aider.scaffold_app then
-        aider.scaffold_app(app_dir, app_name, lang, user_prompt, stack_plan)
+    if ai.scaffold_app then
+        ai.scaffold_app(app_dir, app_name, lang, user_prompt, stack_plan)
     else
         -- Минималистичный fallback скаффолдинга без app.lua
         ctx.mkdir_p(app_dir)
@@ -1430,7 +1430,7 @@ local function new_app(apps_root, args, explicit_lang_from_main, return_path_req
     log.info(string.format("Создано приложение '%s' (стек: %s) с инициализацией Git и flake scaffold", app_name, lang), "app")
 
     if user_prompt and user_prompt:match("%S") then
-        aider.run_dev(app_dir, user_prompt, app_name, lang, stack_plan)
+        ai.run_dev(app_dir, user_prompt, app_name, lang, stack_plan)
         -- Синхронизация метаданных и flake.nix после возможного добавления библиотек субагентом
         local updated_m = load_manifest(app_dir, app_name, { lang = lang })
         if updated_m then
@@ -2241,7 +2241,7 @@ local function print_help()
 %sПРИМЕРЫ НАВИГАЦИИ И КОНВЕЙЕРОВ В FISH:%s
     cd (grime app -path)               # Переход в корневой каталог приложений
     cd (grime app -path polyapp)       # Переход в директорию конкретного аппа (с fuzzy-поиском)
-    grime app -path MyApp : aider -m "Оптимизируй код"
+    grime app -path MyApp : ai -m "Оптимизируй код"
 ]],
     ANSI.BOLD, ANSI.GREEN, ANSI.RESET,
     ANSI.BOLD, ANSI.RESET,

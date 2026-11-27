@@ -316,11 +316,11 @@ async fn test_fuzzy_matching_entities_and_flags() {
 
         function main()
             -- 1. Тест нечеткого поиска названий модулей
-            local modules = { "project", "pkg", "app", "box", "nix", "aider", "cmd", "host" }
+            local modules = { "project", "pkg", "app", "box", "nix", "doctor", "cmd", "host" }
             assert(helper.find_best_match("pckg", modules, 0.75) == "pkg", "pckg -> pkg")
             assert(helper.find_best_match("ap", modules, 0.75) == "app", "ap -> app")
             assert(helper.find_best_match("nx", modules, 0.75) == "nix", "nx -> nix")
-            assert(helper.find_best_match("aidr", modules, 0.75) == "aider", "aidr -> aider")
+            assert(helper.find_best_match("doctr", modules, 0.75) == "doctor", "doctr -> doctor")
             assert(helper.find_best_match("proj", modules, 0.75) == "project", "proj -> project")
 
             -- Несвязанные имена модулей не должны давать ложных срабатываний

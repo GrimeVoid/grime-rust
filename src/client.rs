@@ -23,7 +23,7 @@ fn print_global_help(config: &crate::config::GrimeConfig) {
                 "app" => "Изолированные легковесные приложения",
                 "box" => "Оркестрация Distrobox-контейнеров",
                 "nix" => "Воспроизводимые Nix-окружения и Flakes",
-                "aider" => "AI-ассистент разработчика",
+                "ai" => "Универсальный ИИ-оркестратор агентов (Claude Code, Aider)",
                 "cmd" => "Выполнение системных команд и TUI-утилит",
                 "host" => "Модуль-рубеж возврата на хост-машину",
                 "list" => "Список всех доступных модулей (алиасы: ls, modules)",
@@ -198,7 +198,7 @@ pub async fn run_client(raw_args: &[String], modules_dir: Option<PathBuf>, confi
     }
 
     // 2. Client-First Architecture:
-    // Интерактивные TUI-приложения (Neovim, fzf, диалоговый режим Aider) и стандартный конвейер
+    // Интерактивные TUI-приложения (Neovim, fzf, диалоговые ИИ-агенты Claude Code/Aider) и стандартный конвейер
     // исполняются локально в процессе CLI-клиента с прямым доступом к нативным потокам (stdin/stdout/stderr)
     // и сигналам терминала.
     let orchestrator = match Orchestrator::new(modules_dir, config_path) {

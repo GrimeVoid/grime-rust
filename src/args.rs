@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_fuzzy_match_entity() {
-        let modules = &["project", "pkg", "app", "box", "nix", "aider", "cmd", "host"];
+        let modules = &["project", "pkg", "app", "box", "nix", "doctor", "cmd", "host"];
 
         // Успешные совпадения
         assert_eq!(fuzzy_match_entity("proj", modules, 0.75), Some("project"));
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(fuzzy_match_entity("ap", modules, 0.75), Some("app"));
         assert_eq!(fuzzy_match_entity("bx", modules, 0.75), Some("box"));
         assert_eq!(fuzzy_match_entity("nx", modules, 0.75), Some("nix"));
-        assert_eq!(fuzzy_match_entity("aidr", modules, 0.75), Some("aider"));
+        assert_eq!(fuzzy_match_entity("doctr", modules, 0.75), Some("doctor"));
 
         // Точные совпадения
         assert_eq!(fuzzy_match_entity("cmd", modules, 0.75), Some("cmd"));

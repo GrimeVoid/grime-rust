@@ -10,7 +10,7 @@
 [![Startup: 2.06 ms](https://img.shields.io/badge/Cold%20Start-2.06%20ms-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**GRIME** is a fast command-line orchestrator for Linux developers. It connects project management, isolated Nix Flake environments, Distrobox containers, system package managers, and the Aider AI assistant into a single, predictable CLI workflow.
+**GRIME** is a fast command-line orchestrator for Linux developers. It connects project management, isolated Nix Flake environments, Distrobox containers, system package managers, and a universal AI orchestrator (Claude Code, Aider) into a single, predictable CLI workflow.
 
 The main goal of GRIME is to keep your host system clean. Instead of installing dozens of compilers, libraries, and one-off tools directly onto your base OS, you build and run software inside reproducible environments with a single short command.
 
@@ -37,7 +37,7 @@ flowchart LR
     CLI["CLI (grime)"] -->|Unix Socket IPC| Daemon["Background Daemon (Rust + Tokio)"]
     Daemon --> Pool["LuaJIT VM Pool"]
     Daemon --> Bus["StateBus (Shared Memory + JSON)"]
-    Pool --> Modules["Modules (project, app, pkg, nix, box, git, aider...)"]
+    Pool --> Modules["Modules (project, app, pkg, nix, box, git, ai...)"]
     Modules --> Env["Execution Targets: Host / Nix Flake / Distrobox"]
 ```
 
@@ -101,7 +101,7 @@ grime project -list
 ### 2. Local Micro-Applications (`app`)
 Create, build, and supervise standalone local tools and services, each isolated in its own directory with an `app.lua` manifest and a dedicated `flake.nix`.
 
-When creating an application (`-new`), you can describe what you want in plain language: GRIME automatically extracts the target stack (`python`, `java`, `rust`, `lua`, `cpp`) from your prompt, scaffolds the template, and invokes Aider to implement the code.
+When creating an application (`-new`), you can describe what you want in plain language: GRIME automatically extracts the target stack (`python`, `java`, `rust`, `lua`, `cpp`) from your prompt, scaffolds the template, and invokes an AI coding agent (`grime ai`: Claude Code or Aider) to implement the code.
 
 ```bash
 # Create an app with automatic language detection from the prompt
@@ -161,21 +161,24 @@ grime pkg -run cmatrix
 grime pkg -run -y // ffmpeg -version
 ```
 
-### 4. AI Pair-Programming Assistant (`aider`)
-Integrates the Aider AI coding agent directly into GRIME workflows. It understands your project and app layouts, accepts pipeline output from previous steps, inspects recent terminal errors, and scaffolds or updates GRIME Lua modules following the project's architecture standard.
+### 4. Universal AI Orchestrator (`ai`)
+Unified integration of AI coding agents (**Claude Code** and **Aider**) through pluggable adapters in `modules/agents/` (`modules/agents/claude.lua` and `modules/agents/aider.lua`). It understands your project and app layouts, accepts pipeline output from previous steps, inspects recent terminal errors, and scaffolds or updates GRIME Lua modules following the project's architecture standard.
+
+Agent selection uses CLI flags (`-claude`, `-aider`, `-agent <name>`), StateBus (`grime bus -set modules.ai.agent <name>`), `ai_agent` in `gproj.conf`, or automatic fallback (`claude` -> `aider`).
 
 ```bash
-# Launch Aider in a project directory by name
-grime aider grime_pj "optimize argument parsing"
+# Launch the AI agent in a project directory by name
+grime ai grime_pj "optimize argument parsing"
+grime ai -claude grime_pj "add unit tests"
 
-# Pipe context from previous pipeline steps into Aider
-grime project -path grime_pj : git -diff : aider -m "review changes and suggest a commit message"
+# Pipe context from previous pipeline steps into the AI agent
+grime project -path grime_pj : git -diff : ai -aider -m "review changes and suggest a commit message"
 
-# Scaffold and implement a new Grime App with Aider
-grime aider -app JsonTool "build a Python CLI tool to format JSON"
+# Scaffold and implement a new Grime App (with automatic language detection)
+grime ai -app JsonTool "build a Python CLI tool to format JSON"
 
 # Create or update a GRIME Lua module using the built-in module standard
-grime aider -module netstat "module for inspecting open network ports"
+grime ai -module netstat "module for inspecting open network ports"
 ```
 
 ### 5. Nix Environments (`nix`) and Distrobox Containers (`box`)
@@ -245,7 +248,7 @@ Measured execution times on a live system (mean, min, and max across 15 runs per
 | **Fuzzy project path lookup (`grime project -path`)** | **6.62 ms** | 5.84 ms | 10.17 ms |
 | **Nix module help (`grime nix -h`)** | **6.65 ms** | 6.01 ms | 8.43 ms |
 | **Host boundary module (`grime host`)** | **6.96 ms** | 4.13 ms | 15.07 ms |
-| **Aider module help (`grime aider -h`)** | **7.16 ms** | 6.54 ms | 7.99 ms |
+| **AI module help (`grime ai -h`)** | **7.16 ms** | 6.54 ms | 7.99 ms |
 | **Full project list (`grime project -list`)** | **8.84 ms** | 5.59 ms | 13.23 ms |
 | **Modules registry (`grime list -modules`)** | **9.76 ms** | 8.89 ms | 10.92 ms |
 | **Apps root path (`grime app -path`)** | **10.27 ms** | 9.47 ms | 11.46 ms |

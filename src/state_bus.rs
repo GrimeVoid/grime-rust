@@ -544,7 +544,7 @@ mod tests {
         let tmp_state = std::env::temp_dir().join(format!("grime_state_test_{}.json", std::process::id()));
         let bus = Arc::new(StateBus::with_persistence_path(Some(tmp_state.clone())));
         bus.set("pipeline.test_val", json!({"score": 42})).unwrap();
-        bus.set("modules.aider.model", json!("gpt-4o")).unwrap();
+        bus.set("modules.ai.model", json!("gpt-4o")).unwrap();
 
         assert!(bus.has("pipeline.test_val"));
         assert_eq!(
@@ -562,7 +562,7 @@ mod tests {
         assert!(!bus.has("pipeline.temp"));
         assert!(!bus.has("pipeline.test_val"));
         // modules.* должен остаться
-        assert!(bus.has("modules.aider.model"));
+        assert!(bus.has("modules.ai.model"));
 
         let _ = fs::remove_file(&tmp_state);
     }

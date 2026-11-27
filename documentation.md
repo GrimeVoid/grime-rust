@@ -402,3 +402,22 @@ return {
     description = description,
 }
 ```
+
+---
+
+## 11. Универсальный ИИ-оркестратор (`modules/ai.lua`) и адаптеры (`modules/agents/`)
+
+Подсистема ИИ в GRIME разделена на оркестратор (`modules/ai.lua`) и подключаемые адаптеры CLI-агентов в каталоге `modules/agents/` (по аналогии с `modules/languages/`):
+
+- **`modules/agents/base.lua` (`BaseAgent`)** — базовый контракт адаптера (`resolve_binary`, `is_available`, `build_architect_cmd`, `build_headless_cmd`, `build_interactive_cmd`, `clean_output`, `run_headless`, `run_interactive`).
+- **`modules/agents/claude.lua`** — адаптер **Claude Code** (`claude`, алиасы `claude-code`, `cc`). Запускается без флага `--bare` (для сохранения OAuth `~/.claude/.credentials.json`), поддерживает `--append-system-prompt`, `--permission-mode`, `--allowedTools`, `--add-dir` и `--model`.
+- **`modules/agents/aider.lua`** — адаптер **Aider** (`aider`). Поддерживает `--no-git`, `--exit`, `--yes-always`, `--no-fancy-input`, `--no-pretty`, `--read`, `--model` и очистку сервисного шума вывода.
+- **`modules/agents/registry.lua`** — реестр и резолвер агентов с приоритетом: явный флаг (`-claude`, `-aider`, `-agent <name>`) $\rightarrow$ `grime.bus.get("modules.ai.agent")` $\rightarrow$ `ctx.get_config("ai_agent", "auto")` $\rightarrow$ автовыбор первого доступного в системе (`claude` $\rightarrow$ `aider`).
+
+### Конфигурация в `gproj.conf`
+```ini
+ai_agent=auto
+claude=auto
+aider=auto
+```
+

@@ -54,7 +54,7 @@ local function print_help()
     %shelp, -h, --help%s                Показать эту справку
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
-    grime log -errors 5 : aider
+    grime log -errors 5 : ai
     echo "Сборка завершена успешно" : grime log --info
     grime log -git 5
     grime doctor : grime log

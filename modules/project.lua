@@ -398,7 +398,7 @@ local function print_help()
 
 %sПРИМЕРЫ В КОНВЕЙЕРАХ:%s
     grime project MyGame -path : cmd nvim CMakeLists.txt
-    grime project MyTool -path : aider "Добавь тесты для парсера"
+    grime project MyTool -path : ai "Добавь тесты для парсера"
 ]],
     "\27[1m", "\27[32m", "\27[0m",
     "\27[1m", "\27[0m",

@@ -23,7 +23,7 @@ const SEPARATORS: &[&str] = &[":", "|"];
 use crate::args_engine::is_passthrough_separator;
 
 const BUILTIN_MODULE_NAMES: &[&str] = &[
-    "exec", "proj", "ls", "modules", "project", "pkg", "app", "box", "nix", "aider", "cmd",
+    "exec", "proj", "ls", "modules", "project", "pkg", "app", "box", "nix", "ai", "cmd",
     "host", "list", "doctor", "bus", "daemon", "git", "log",
 ];
 
@@ -439,14 +439,14 @@ mod tests {
     fn test_detach_flag_parsing() {
         let args = vec![
             "-d".to_string(),
-            "aider".to_string(),
+            "ai".to_string(),
             "--message".to_string(),
             "test".to_string(),
         ];
         let res = parse_pipeline_args(&args);
         assert!(res.detach);
         assert_eq!(res.steps.len(), 1);
-        assert_eq!(res.steps[0].module, "aider");
+        assert_eq!(res.steps[0].module, "ai");
         assert_eq!(res.steps[0].args, vec!["--message", "test"]);
 
         let args_long = vec![
@@ -461,9 +461,9 @@ mod tests {
     }
 
     #[test]
-    fn test_aider_unquoted_args_parsing() {
+    fn test_ai_unquoted_args_parsing() {
         let args = vec![
-            "aider".to_string(),
+            "ai".to_string(),
             "~/dotfiles".to_string(),
             "-m".to_string(),
             "что".to_string(),
@@ -475,7 +475,7 @@ mod tests {
         ];
         let res = parse_pipeline_args(&args);
         assert_eq!(res.steps.len(), 1);
-        assert_eq!(res.steps[0].module, "aider");
+        assert_eq!(res.steps[0].module, "ai");
         assert_eq!(
             res.steps[0].args,
             vec!["~/dotfiles", "-m", "что", "ты", "скажешь", "про", "конфиг", "niri?"]
@@ -483,9 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn test_aider_unquoted_pipeline() {
+    fn test_ai_unquoted_pipeline() {
         let args = vec![
-            "aider".to_string(),
+            "ai".to_string(),
             "~/dotfiles".to_string(),
             "что".to_string(),
             "ты".to_string(),
@@ -497,7 +497,7 @@ mod tests {
         ];
         let res = parse_pipeline_args(&args);
         assert_eq!(res.steps.len(), 2);
-        assert_eq!(res.steps[0].module, "aider");
+        assert_eq!(res.steps[0].module, "ai");
         assert_eq!(
             res.steps[0].args,
             vec!["~/dotfiles", "что", "ты", "скажешь"]
@@ -507,16 +507,16 @@ mod tests {
     }
 
     #[test]
-    fn test_aider_with_leading_path() {
+    fn test_ai_with_leading_path() {
         let args = vec![
             "/tmp".to_string(),
-            "aider".to_string(),
+            "ai".to_string(),
             "-m".to_string(),
             "привет".to_string(),
         ];
         let res = parse_pipeline_args(&args);
         assert_eq!(res.steps.len(), 1);
-        assert_eq!(res.steps[0].module, "aider");
+        assert_eq!(res.steps[0].module, "ai");
         assert_eq!(res.steps[0].args, vec!["-m", "привет"]);
         assert_eq!(res.work_path, Some(PathBuf::from("/tmp")));
 
@@ -524,13 +524,13 @@ mod tests {
         let args_colon = vec![
             "~/nonexistent_dir_xyz".to_string(),
             ":".to_string(),
-            "aider".to_string(),
+            "ai".to_string(),
             "-m".to_string(),
             "привет".to_string(),
         ];
         let res_colon = parse_pipeline_args(&args_colon);
         assert_eq!(res_colon.steps.len(), 1);
-        assert_eq!(res_colon.steps[0].module, "aider");
+        assert_eq!(res_colon.steps[0].module, "ai");
         assert!(res_colon.work_path.is_some());
     }
 
@@ -562,7 +562,7 @@ mod tests {
             "|".to_string(),
             "host".to_string(),
             ":".to_string(),
-            "aider".to_string(), "-m".to_string(), "review".to_string(),
+            "ai".to_string(), "-m".to_string(), "review".to_string(),
         ];
         let res = parse_pipeline_args(&args);
         assert_eq!(res.steps.len(), 4);
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(res.steps[1].module, "cmd");
         assert_eq!(res.steps[1].args, vec!["grep", "git"]);
         assert_eq!(res.steps[2].module, "host");
-        assert_eq!(res.steps[3].module, "aider");
+        assert_eq!(res.steps[3].module, "ai");
         assert_eq!(res.steps[3].args, vec!["-m", "review"]);
     }
 

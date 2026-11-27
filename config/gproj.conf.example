@@ -5,5 +5,7 @@ config=$HOME/.config/grime
 projects=$HOME/Projects
 templates=$HOME/.config/grime/templates
 apps=$HOME/.config/grime/apps
+ai_agent=auto
+claude=auto
 aider=auto
 distrobox_default=fedora-box

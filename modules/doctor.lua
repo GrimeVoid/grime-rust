@@ -24,7 +24,7 @@ local function print_help()
     grime doctor [help|-h|--help]
 
 %sОПИСАНИЕ:%s
-    Проверяет доступность ключевых утилит (git, nix, distrobox, aider, cargo),
+    Проверяет доступность ключевых утилит (git, nix, distrobox, cargo, claude, aider),
     корректность путей в реестре конфигурации, статус журнала логов и
     отображает недавние ошибки и сбои из централизованного хранилища StateBus.
 ]],
@@ -52,6 +52,7 @@ function main()
         { name = "nix", category = "Пакеты/Окружение" },
         { name = "distrobox", category = "Контейнеры" },
         { name = "cargo", category = "Сборка" },
+        { name = "claude", category = "ИИ/Разработка" },
         { name = "aider", category = "ИИ/Разработка" },
     }
 

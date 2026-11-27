@@ -1423,3 +1423,33 @@ fn test_ephemeral_removed_after_success_error_and_cancel() {
     let (d, f) = eph_paths(&orch);
     assert!(!d.exists() && !f.exists(), "отмена: {d:?}");
 }
+
+/// Регрессия гонки hot-reload: модуль создаётся ПОСЛЕ построения реестра и запускается сразу,
+/// без пауз; несуществующий модуль даёт ошибку.
+#[test]
+fn test_module_created_after_registry_runs_immediately() {
+    let tmp = TestTempDir::new("grime_fresh_mod");
+    let dir = tmp.path().join("modules");
+    fs::create_dir_all(&dir).unwrap();
+    // Похожий по имени модуль: нечёткий поиск не должен подменять свежесозданный
+    fs::write(dir.join("hrmod_0.lua"), "function main() grime.ctx.success('old') end\n").unwrap();
+    let orch = new_orch(Some(dir.clone()), None).unwrap();
+
+    for i in 1..=50 {
+        let name = format!("hrmod_{i}");
+        fs::write(
+            dir.join(format!("{name}.lua")),
+            format!("function main() grime.ctx.success('{name}') end\n"),
+        )
+        .unwrap();
+        let res = orch
+            .run_pipeline(&orch.parse_args(&args(&[&name])))
+            .unwrap_or_else(|e| panic!("итерация {i}: {e}"));
+        assert_eq!(res.as_deref(), Some(name.as_str()), "запущен не тот модуль");
+    }
+
+    let err = orch
+        .run_pipeline(&orch.parse_args(&args(&["no_such_module_xyz"])))
+        .expect_err("несуществующий модуль должен завершаться ошибкой");
+    assert!(err.contains("не найден"), "{err}");
+}

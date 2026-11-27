@@ -578,6 +578,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detached_new_module_succeeds_and_missing_fails() {
+        let tmp_dir = crate::test_support::TempDir::new("sup_fresh_test");
+        let supervisor = TaskSupervisor::new(30);
+        let config = Arc::new(GrimeConfig::load_or_default(Some(&tmp_dir.join("gproj.conf"))));
+        let registry = Arc::new(ModuleRegistry::scan(vec![tmp_dir.to_path_buf()]));
+
+        async fn wait_final(sup: &TaskSupervisor, id: &str) -> TaskStatus {
+            for _ in 0..200 {
+                match sup.get_task_status(id).await {
+                    Some(TaskStatus::Running) | None => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Some(s) => return s,
+                }
+            }
+            panic!("задача не завершилась");
+        }
+
+        for i in 0..50 {
+            let name = format!("detmod_{i}");
+            std::fs::write(tmp_dir.join(format!("{name}.lua")), "function main() grime.ctx.success('ok') end\n")
+                .unwrap();
+            let parsed = crate::pipeline::parse_pipeline_args(&[name], &registry);
+            let id = supervisor
+                .spawn_detached_pipeline(parsed, config.clone(), registry.clone(), None, None)
+                .await;
+            assert_eq!(wait_final(&supervisor, &id).await, TaskStatus::Succeeded, "итерация {i}");
+        }
+
+        let parsed = crate::pipeline::parse_pipeline_args(&["no_such_module_xyz".to_string()], &registry);
+        let id = supervisor
+            .spawn_detached_pipeline(parsed, config, registry, None, None)
+            .await;
+        assert!(matches!(wait_final(&supervisor, &id).await, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
     async fn test_supervisor_lock_poison_recovery() {
         let canceller = PipelineCanceller::new();
         let task = Arc::new(DetachedTask::new("poison_test".to_string(), "test".to_string(), canceller));

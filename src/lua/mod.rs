@@ -583,18 +583,14 @@ impl GrimeLuaEngine {
 
     /// Находит метаданные модуля: точное имя/алиас, затем нечёткое совпадение.
     fn locate_module(&self, module_name: &str) -> Result<ModuleMeta, String> {
-        if let Some(meta) = self.registry.get(module_name) {
+        // Промах: возможно, файл модуля появился после построения снимка реестра —
+        // get_fresh один раз принудительно перечитывает каталоги и повторяет поиск
+        if let Some(meta) = self.registry.get_fresh(module_name) {
             return Ok(meta);
-        }
-        // Редкий путь: возможно, файл модуля появился после построения снимка реестра
-        if self.registry.refresh_if_changed() {
-            if let Some(meta) = self.registry.get(module_name) {
-                return Ok(meta);
-            }
         }
         if let Some(meta) = self
             .registry
-            .resolve(module_name)
+            .resolve_fuzzy(module_name)
             .and_then(|canon| self.registry.get(&canon))
         {
             eprintln!(

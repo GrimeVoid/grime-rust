@@ -300,7 +300,10 @@ fn scan_dirs(dirs: &[PathBuf], known: &[IndexEntry]) -> Snapshot {
 
 /// Строит снимок: по индексу (stat каталогов и файлов без чтения содержимого), при несовпадении
 /// перечитывает только изменившиеся файлы либо пересканирует каталоги. Индекс обновляется при изменениях.
-fn build_snapshot(dirs: &[PathBuf], index_path: Option<&Path>) -> (Snapshot, Vec<Option<i64>>) {
+///
+/// `force` отключает быстрый путь «mtime каталогов не изменился»: mtime имеет грубую гранулярность
+/// (тик ядра, единицы мс), и файл, созданный в тот же тик, что и снимок, иначе остался бы невидимым.
+fn build_snapshot(dirs: &[PathBuf], index_path: Option<&Path>, force: bool) -> (Snapshot, Vec<Option<i64>>) {
     let dir_mtimes: Vec<Option<i64>> = dirs.iter().map(|d| dir_mtime_ns(d)).collect();
     let Some(index_path) = index_path else {
         return (scan_dirs(dirs, &[]), dir_mtimes);
@@ -309,7 +312,7 @@ fn build_snapshot(dirs: &[PathBuf], index_path: Option<&Path>) -> (Snapshot, Vec
 
     let mut known: Vec<IndexEntry> = Vec::new();
     if let Some(idx) = loaded {
-        if idx.dirs == dirs && idx.dir_mtimes == dir_mtimes {
+        if !force && idx.dirs == dirs && idx.dir_mtimes == dir_mtimes {
             // Каталоги не менялись: проверяем отпечатки файлов, перечитываем только изменившиеся
             let mut changed = false;
             let mut entries = Vec::with_capacity(idx.entries.len());
@@ -396,7 +399,7 @@ impl ModuleRegistry {
 
     /// То же, но со снимком, ускоренным дисковым индексом (`None` — индекс не используется).
     pub fn scan_with_index(dirs: Vec<PathBuf>, index_path: Option<PathBuf>) -> Self {
-        let (entries, dir_mtimes) = build_snapshot(&dirs, index_path.as_deref());
+        let (entries, dir_mtimes) = build_snapshot(&dirs, index_path.as_deref(), false);
         Self {
             dirs,
             index_path,
@@ -425,7 +428,16 @@ impl ModuleRegistry {
 
     /// Пересобирает снимок (через индекс: перечитываются только изменившиеся файлы).
     pub fn invalidate(&self) {
-        let (entries, dir_mtimes) = build_snapshot(&self.dirs, self.index_path.as_deref());
+        self.rebuild(false);
+    }
+
+    /// Принудительный пересбор: каталоги перечитываются всегда, даже если их mtime не изменился.
+    pub fn invalidate_force(&self) {
+        self.rebuild(true);
+    }
+
+    fn rebuild(&self, force: bool) {
+        let (entries, dir_mtimes) = build_snapshot(&self.dirs, self.index_path.as_deref(), force);
         *self.modules.write().unwrap_or_else(|e| e.into_inner()) = entries.into_iter().map(|e| e.meta).collect();
         *self.dir_mtimes.lock().unwrap_or_else(|e| e.into_inner()) = dir_mtimes;
     }
@@ -451,6 +463,20 @@ impl ModuleRegistry {
         self.with_snapshot(|mods| mods.to_vec())
     }
 
+    /// Как [`get`](Self::get), но при промахе один раз принудительно перечитывает каталоги
+    /// и повторяет поиск (модуль мог появиться после построения снимка, раньше hot-reload демона).
+    pub fn get_fresh(&self, name: &str) -> Option<ModuleMeta> {
+        if let Some(meta) = self.get(name) {
+            return Some(meta);
+        }
+        let lower = name.trim();
+        if lower.is_empty() || lower.starts_with('-') {
+            return None;
+        }
+        self.invalidate_force();
+        self.get(name)
+    }
+
     /// Модуль по точному имени или алиасу (без нечёткого поиска).
     pub fn get(&self, name: &str) -> Option<ModuleMeta> {
         let lower = name.trim().to_lowercase();
@@ -467,9 +493,14 @@ impl ModuleRegistry {
 
     /// Каноническое имя: точное имя → алиас → нечёткое совпадение (порог 0.75) → `None`.
     pub fn resolve(&self, name: &str) -> Option<String> {
-        if let Some(m) = self.get(name) {
+        if let Some(m) = self.get_fresh(name) {
             return Some(m.name);
         }
+        self.resolve_fuzzy(name)
+    }
+
+    /// Нечёткое совпадение имени (без обновления снимка).
+    pub fn resolve_fuzzy(&self, name: &str) -> Option<String> {
         let lower = name.trim().to_lowercase();
         if lower.is_empty() || lower.starts_with('-') {
             return None;
@@ -652,6 +683,21 @@ mod tests {
         fs::write(d1.join("newmod.lua"), "--@grime alias: nm\n").unwrap();
         reg.invalidate();
         assert_eq!(reg.resolve("nm").as_deref(), Some("newmod"));
+    }
+
+    #[test]
+    fn test_get_fresh_sees_new_file_without_pause_even_with_index() {
+        let d = temp_dir("fresh");
+        let cache = temp_dir("freshcache");
+        let idx = cache.join("grime").join("modules.idx");
+        fs::write(d.join("seed.lua"), "return {}").unwrap();
+        let reg = ModuleRegistry::scan_with_index(vec![d.to_path_buf()], Some(idx));
+        for i in 0..50 {
+            let name = format!("fresh{i}");
+            fs::write(d.join(format!("{name}.lua")), "return {}").unwrap();
+            assert_eq!(reg.resolve(&name).as_deref(), Some(name.as_str()), "итерация {i}");
+        }
+        assert!(reg.get_fresh("absent_zzz").is_none());
     }
 
     #[test]
